@@ -1,0 +1,17 @@
+RewriteEngine On
+
+# Block sensitive files
+<FilesMatch "\.(sqlite|sqlite3|db|sql|env|git|bak|htaccess|example)$">
+    Require all denied
+</FilesMatch>
+
+# Block config directory
+RewriteRule ^config/ - [F,L]
+
+# Block attachments directory direct access
+RewriteRule ^attachments/ - [F,L]
+
+# Front controller
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^ index.php [L,QSA]

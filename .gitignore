@@ -1,0 +1,16 @@
+# Database & Attachments
+*.db
+*.sqlite
+*.sqlite3
+*.bak
+attachments/
+
+# Environment
+.env
+
+# Misc
+*.pid
+.DS_Store
+
+# Docs and Plans
+# docs/plans/*.md (uncomment later)
