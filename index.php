@@ -1913,35 +1913,11 @@ function actionAuth(): void
 
     checkRateLimit($email, $ip);
 
-    $imapOk = false;
-    $imapError = '';
-    $imapFolders = [];
-    try {
-        $imap = new ImapClient($imapHost, $imapPort, $imapTls, $email, $password);
-        $imap->connect();
-        $imap->login();
-        $imapOk = true;
-        $imapFolders = $imap->listFolders();
-        $imap->logout();
-    } catch (Throwable $e) {
-        $imapError = $e->getMessage();
-    }
+    $result = testImapSmtp($imapHost, $imapPort, $imapTls, $smtpHost, $smtpPort, $smtpTls, $email, $password);
 
-    $smtpOk = false;
-    $smtpError = '';
-    try {
-        $smtp = new SmtpClient($smtpHost, $smtpPort, $smtpTls, $email, $password);
-        $smtp->connect();
-        $smtp->login();
-        $smtpOk = true;
-        $smtp->quit();
-    } catch (Throwable $e) {
-        $smtpError = $e->getMessage();
-    }
-
-    if (!$imapOk && !$smtpOk) {
+    if (!$result['imapOk'] && !$result['smtpOk']) {
         recordLoginFailure($email, $ip);
-        fail("IMAP: {$imapError}; SMTP: {$smtpError}");
+        fail("IMAP: {$result['imap']['error']}; SMTP: {$result['smtp']['error']}");
     }
 
     $pdo = db();
@@ -1968,8 +1944,8 @@ function actionAuth(): void
         'data' => [
             'account_id' => $accountId,
             'email' => $email,
-            'imap' => ['ok' => $imapOk, 'error' => $imapError, 'folders' => $imapFolders],
-            'smtp' => ['ok' => $smtpOk, 'error' => $smtpError],
+            'imap' => $result['imap'],
+            'smtp' => $result['smtp'],
         ],
     ]);
 }
@@ -2716,6 +2692,271 @@ function actionSearch(): void
     jsonResponse(['ok' => true, 'data' => ['messages' => $rows]]);
 }
 
+function validatePortAndTls(int $port, int $tls): void
+{
+    if ($port < 1 || $port > 65535) fail('Port must be between 1 and 65535.');
+    if ($tls < 0 || $tls > 2) fail('TLS mode must be 0 (none), 1 (SSL), or 2 (STARTTLS).');
+}
+
+function testImapSmtp(string $imapHost, int $imapPort, int $imapTls, string $smtpHost, int $smtpPort, int $smtpTls, string $email, string $password): array
+{
+    $imapOk = false;
+    $imapError = '';
+    $imapFolders = [];
+    try {
+        $imap = new ImapClient($imapHost, $imapPort, $imapTls, $email, $password);
+        $imap->connect();
+        $imap->login();
+        $imapOk = true;
+        $imapFolders = $imap->listFolders();
+        $imap->logout();
+    } catch (Throwable $e) {
+        $imapError = $e->getMessage();
+    }
+
+    $smtpOk = false;
+    $smtpError = '';
+    try {
+        $smtp = new SmtpClient($smtpHost, $smtpPort, $smtpTls, $email, $password);
+        $smtp->connect();
+        $smtp->login();
+        $smtpOk = true;
+        $smtp->quit();
+    } catch (Throwable $e) {
+        $smtpError = $e->getMessage();
+    }
+
+    return [
+        'imap' => ['ok' => $imapOk, 'error' => $imapError, 'folders' => $imapFolders],
+        'smtp' => ['ok' => $smtpOk, 'error' => $smtpError],
+        'imapOk' => $imapOk,
+        'smtpOk' => $smtpOk,
+    ];
+}
+
+function detectServersByEmail(string $email): array
+{
+    $domain = strtolower(trim(substr(strrchr($email, '@'), 1)));
+
+    $domainMap = [
+        'gmail.com' => 'gmail', 'googlemail.com' => 'gmail',
+        'yahoo.com' => 'yahoo', 'yahoo.co.uk' => 'yahoo', 'yahoo.co.jp' => 'yahoo', 'ymail.com' => 'yahoo',
+        'outlook.com' => 'outlook', 'hotmail.com' => 'outlook', 'live.com' => 'outlook', 'msn.com' => 'outlook',
+        'icloud.com' => 'icloud', 'me.com' => 'icloud', 'mac.com' => 'icloud',
+        'migadu.com' => 'migadu',
+    ];
+
+    $preset = $domainMap[$domain] ?? null;
+
+    if ($preset === null) {
+        $mxRecords = @dns_get_record($domain, DNS_MX);
+        if (is_array($mxRecords)) {
+            foreach ($mxRecords as $mx) {
+                $target = strtolower(rtrim($mx['target'] ?? '', '.'));
+                if (str_contains($target, 'google.com') || str_contains($target, 'googlemail.com')) { $preset = 'gmail'; break; }
+                if (str_contains($target, 'outlook.com') || str_contains($target, 'office365.com')) { $preset = 'outlook'; break; }
+                if (str_contains($target, 'yahoodns.net') || str_contains($target, 'yahoo.com')) { $preset = 'yahoo'; break; }
+                if (str_contains($target, 'migadu.com')) { $preset = 'migadu'; break; }
+            }
+        }
+    }
+
+    if ($preset !== null) {
+        $presets = getPresets();
+        $p = $presets[$preset];
+        return [
+            'detected' => true,
+            'preset' => $preset,
+            'imap_host' => $p['imap_host'], 'imap_port' => $p['imap_port'], 'imap_tls' => $p['imap_tls'],
+            'smtp_host' => $p['smtp_host'], 'smtp_port' => $p['smtp_port'], 'smtp_tls' => $p['smtp_tls'],
+        ];
+    }
+
+    return [
+        'detected' => false,
+        'preset' => null,
+        'imap_host' => 'imap.' . $domain, 'imap_port' => 993, 'imap_tls' => 1,
+        'smtp_host' => 'smtp.' . $domain, 'smtp_port' => 587, 'smtp_tls' => 2,
+    ];
+}
+
+function actionListAccounts(): void
+{
+    $pdo = db();
+    $accounts = fetchAll($pdo, 'SELECT id, email, display_name, imap_host, smtp_host, is_active, last_sync_at, created_at FROM accounts WHERE is_active = 1 ORDER BY created_at DESC, id DESC', []);
+
+    foreach ($accounts as &$acct) {
+        if (!empty($acct['last_sync_at'])) {
+            $acct['last_sync_at'] = str_replace(' ', 'T', $acct['last_sync_at']) . 'Z';
+        }
+        if (!empty($acct['created_at'])) {
+            $acct['created_at'] = str_replace(' ', 'T', $acct['created_at']) . 'Z';
+        }
+    }
+    unset($acct);
+
+    jsonResponse(['ok' => true, 'data' => ['accounts' => $accounts]]);
+}
+
+function actionAddAccount(): void
+{
+    $input = getInput();
+
+    if (empty($input['email']) || empty($input['password'])) {
+        fail('Missing required field: email, password');
+    }
+
+    $email = strtolower(trim($input['email']));
+    $password = $input['password'];
+    $ip = getClientIp();
+
+    if (!validateEmail($email)) {
+        fail('Invalid email address.');
+    }
+
+    if (!empty($input['preset'])) {
+        $presets = getPresets();
+        $preset = strtolower(trim($input['preset']));
+        if (!isset($presets[$preset])) {
+            fail("Unknown preset: {$preset}. Available: " . implode(', ', array_keys($presets)));
+        }
+        $p = $presets[$preset];
+        $imapHost = $p['imap_host']; $imapPort = $p['imap_port']; $imapTls = $p['imap_tls'];
+        $smtpHost = $p['smtp_host']; $smtpPort = $p['smtp_port']; $smtpTls = $p['smtp_tls'];
+    } else {
+        $required = ['imap_host', 'imap_port', 'imap_tls', 'smtp_host', 'smtp_port', 'smtp_tls'];
+        foreach ($required as $field) {
+            if (!isset($input[$field])) fail("Missing required field: {$field}");
+        }
+        $imapHost = $input['imap_host']; $imapPort = (int) $input['imap_port']; $imapTls = (int) $input['imap_tls'];
+        $smtpHost = $input['smtp_host']; $smtpPort = (int) $input['smtp_port']; $smtpTls = (int) $input['smtp_tls'];
+        validatePortAndTls($imapPort, $imapTls);
+        validatePortAndTls($smtpPort, $smtpTls);
+    }
+
+    checkRateLimit($email, $ip);
+
+    $result = testImapSmtp($imapHost, $imapPort, $imapTls, $smtpHost, $smtpPort, $smtpTls, $email, $password);
+
+    if (!$result['imapOk'] && !$result['smtpOk']) {
+        recordLoginFailure($email, $ip);
+        fail("IMAP: {$result['imap']['error']}; SMTP: {$result['smtp']['error']}");
+    }
+
+    $pdo = db();
+    $existing = fetchOne($pdo, 'SELECT id FROM accounts WHERE email = ?', [$email]);
+    if ($existing) fail('Account already exists. Use auth to update.', 409);
+
+    $enc = encryptPassword($password, getEncryptionKey());
+    $displayName = deriveDisplayName($email);
+    $pdo->prepare('INSERT INTO accounts (email, display_name, imap_host, imap_port, imap_tls, smtp_host, smtp_port, smtp_tls, password_encrypted, password_iv, password_tag) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        ->execute([$email, $displayName, $imapHost, $imapPort, $imapTls, $smtpHost, $smtpPort, $smtpTls, $enc['encrypted'], $enc['iv'], $enc['tag']]);
+    $accountId = (int) $pdo->lastInsertId();
+
+    $sessionToken = createSession($accountId, $ip, $_SERVER['HTTP_USER_AGENT'] ?? '');
+
+    jsonResponse([
+        'ok' => true,
+        'data' => [
+            'account_id' => $accountId,
+            'session_token' => $sessionToken,
+            'email' => $email,
+            'imap' => $result['imap'],
+            'smtp' => $result['smtp'],
+        ],
+    ]);
+}
+
+function actionDeleteAccount(): void
+{
+    $accountId = currentAccountId();
+    if ($accountId <= 0) fail('No account found. Run auth first.');
+
+    $pdo = db();
+    $account = fetchOne($pdo, 'SELECT id FROM accounts WHERE id = ?', [$accountId]);
+    if (!$account) fail('Account not found.');
+
+    $pdo->beginTransaction();
+    try {
+        $pdo->prepare('DELETE FROM sessions WHERE account_id = ?')->execute([$accountId]);
+        $pdo->prepare('DELETE FROM accounts WHERE id = ?')->execute([$accountId]);
+        $pdo->commit();
+    } catch (Throwable $e) {
+        $pdo->rollBack();
+        fail('Failed to delete account: ' . $e->getMessage(), 500);
+    }
+
+    deleteAccountAttachments($accountId);
+
+    jsonResponse(['ok' => true, 'data' => ['deleted' => true, 'account_id' => $accountId]]);
+}
+
+function actionDetectServer(): void
+{
+    $input = getInput();
+    $email = strtolower(trim($input['email'] ?? ''));
+    if ($email === '') fail('Missing required field: email');
+    if (!validateEmail($email)) fail('Invalid email address.');
+
+    $result = detectServersByEmail($email);
+    jsonResponse(['ok' => true, 'data' => $result]);
+}
+
+function actionTestConnection(): void
+{
+    $input = getInput();
+
+    if (empty($input['email']) || empty($input['password'])) {
+        fail('Missing required field: email, password');
+    }
+
+    $email = strtolower(trim($input['email']));
+    $password = $input['password'];
+    $ip = getClientIp();
+
+    if (!validateEmail($email)) {
+        fail('Invalid email address.');
+    }
+
+    if (!empty($input['preset'])) {
+        $presets = getPresets();
+        $preset = strtolower(trim($input['preset']));
+        if (!isset($presets[$preset])) {
+            fail("Unknown preset: {$preset}. Available: " . implode(', ', array_keys($presets)));
+        }
+        $p = $presets[$preset];
+        $imapHost = $p['imap_host']; $imapPort = $p['imap_port']; $imapTls = $p['imap_tls'];
+        $smtpHost = $p['smtp_host']; $smtpPort = $p['smtp_port']; $smtpTls = $p['smtp_tls'];
+    } else {
+        $required = ['imap_host', 'imap_port', 'imap_tls', 'smtp_host', 'smtp_port', 'smtp_tls'];
+        foreach ($required as $field) {
+            if (!isset($input[$field])) fail("Missing required field: {$field}");
+        }
+        $imapHost = $input['imap_host']; $imapPort = (int) $input['imap_port']; $imapTls = (int) $input['imap_tls'];
+        $smtpHost = $input['smtp_host']; $smtpPort = (int) $input['smtp_port']; $smtpTls = (int) $input['smtp_tls'];
+        validatePortAndTls($imapPort, $imapTls);
+        validatePortAndTls($smtpPort, $smtpTls);
+    }
+
+    checkRateLimit($email, $ip);
+
+    $result = testImapSmtp($imapHost, $imapPort, $imapTls, $smtpHost, $smtpPort, $smtpTls, $email, $password);
+
+    if (!$result['imapOk'] && !$result['smtpOk']) {
+        recordLoginFailure($email, $ip);
+        fail("IMAP: {$result['imap']['error']}; SMTP: {$result['smtp']['error']}");
+    }
+
+    jsonResponse([
+        'ok' => true,
+        'data' => [
+            'email' => $email,
+            'imap' => $result['imap'],
+            'smtp' => $result['smtp'],
+        ],
+    ]);
+}
+
 /* ---------------------------------------------------------------------------
  * Front Controller
  * ------------------------------------------------------------------------ */
@@ -2726,7 +2967,7 @@ function handleRequest(): void
 
     $action = $_GET['action'] ?? '';
 
-    $publicActions = ['login', 'session', 'auth'];
+    $publicActions = ['login', 'session', 'auth', 'detect_server', 'test_connection'];
     if (!in_array($action, $publicActions, true)) {
         requireSession();
     }
@@ -2788,6 +3029,21 @@ function handleRequest(): void
             break;
         case 'search':
             actionSearch();
+            break;
+        case 'list_accounts':
+            actionListAccounts();
+            break;
+        case 'add_account':
+            actionAddAccount();
+            break;
+        case 'delete_account':
+            actionDeleteAccount();
+            break;
+        case 'detect_server':
+            actionDetectServer();
+            break;
+        case 'test_connection':
+            actionTestConnection();
             break;
         default:
             fail('Unknown action: ' . ($action ?: '(none)'));

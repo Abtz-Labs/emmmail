@@ -66,6 +66,11 @@
 - `set_flags` — mark read/starred, move to folder (authenticated)
 - `batch_action` — bulk read/unread/star/unstar/delete/archive/move (authenticated)
 - `search` — FTS5 full-text search (authenticated)
+- `list_accounts` — list all accounts for switcher UI (authenticated)
+- `add_account` — add new account, returns session token (authenticated)
+- `delete_account` — delete current account + all data (authenticated)
+- `detect_server` — auto-detect IMAP/SMTP from email domain (public)
+- `test_connection` — test IMAP/SMTP without saving (public)
 - `compose` — send email or save draft (authenticated)
 - `drafts` — list drafts (authenticated)
 - `draft` — get single draft (authenticated)
@@ -74,7 +79,17 @@
 - `download_attachment` — download attachment file (authenticated)
 - `message_attachments` — list message attachments (authenticated)
 
+## Session 9 (2026-08-26) — Accounts endpoints
+- Implemented 5 endpoints: list_accounts, add_account, delete_account, detect_server, test_connection
+- Plan reviewed by 2 subagents; 18 findings addressed (IDOR fix, trust model, port/TLS validation, MX detection, etc.)
+- Extracted `testImapSmtp()` helper from `actionAuth()` — shared by auth, add_account, test_connection
+- Added `validatePortAndTls()` helper — port 1-65535, TLS 0-2
+- Added `detectServersByEmail()` — domain→preset mapping + MX fallback with trailing-dot trimming
+- `actionAuth()` refactored to use `testImapSmtp()` — same behavior, less duplication
+- `detect_server`/`test_connection` added to `$publicActions` (setup wizard)
+- `delete_account` uses transaction + `deleteAccountAttachments()` (was dead code)
+- 332 tests passing, 0 failures, 3 skipped
+
 ## Next
 - Build UI/UX
-- Add multi-account management endpoints
 - Add contacts/tags/settings endpoints

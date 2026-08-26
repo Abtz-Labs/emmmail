@@ -1540,6 +1540,145 @@ function testSearch(): void
     assertEquals(false, $res['ok'] ?? null, 'search rejects invalid session');
 }
 
+function testListAccounts(): void
+{
+    group('list_accounts');
+
+    $session = createTestAccountAndSession();
+    $token = $session['token'];
+    $accountId = $session['account_id'];
+
+    $res = apiRequest('list_accounts', [], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['ok'] ?? null, 'list_accounts returns ok:true');
+    assertTest(count($res['data']['accounts'] ?? []) >= 1, 'list_accounts returns at least 1 account');
+
+    $acct = $res['data']['accounts'][0];
+    assertEquals($accountId, $acct['id'] ?? 0, 'list_accounts includes account id');
+    assertTest(isset($acct['email']), 'list_accounts includes email');
+    assertTest(isset($acct['display_name']), 'list_accounts includes display_name');
+    assertTest(isset($acct['imap_host']), 'list_accounts includes imap_host');
+    assertTest(isset($acct['smtp_host']), 'list_accounts includes smtp_host');
+    assertTest(!isset($acct['password_encrypted']), 'list_accounts excludes password_encrypted');
+    assertTest(!isset($acct['password_iv']), 'list_accounts excludes password_iv');
+    assertTest(!isset($acct['password_tag']), 'list_accounts excludes password_tag');
+    assertTest(!isset($acct['imap_port']), 'list_accounts excludes imap_port');
+    assertTest(!isset($acct['imap_tls']), 'list_accounts excludes imap_tls');
+    assertTest(!isset($acct['smtp_port']), 'list_accounts excludes smtp_port');
+    assertTest(!isset($acct['smtp_tls']), 'list_accounts excludes smtp_tls');
+
+    $res = apiRequest('list_accounts', [], 'POST', ['X-Session-Token' => 'invalid']);
+    assertEquals(false, $res['ok'] ?? null, 'list_accounts rejects invalid session');
+}
+
+function testDeleteAccount(): void
+{
+    group('delete_account');
+
+    $session = createTestAccountAndSession();
+    $token = $session['token'];
+    $accountId = $session['account_id'];
+
+    $pdo = db();
+    insertTestFolder($accountId, 'INBOX', 'inbox');
+    insertTestMessage($accountId, 'INBOX', 1);
+
+    $res = apiRequest('delete_account', [], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['ok'] ?? null, 'delete_account returns ok:true');
+    assertEquals($accountId, $res['data']['account_id'] ?? 0, 'delete_account returns account_id');
+
+    $acct = $pdo->query("SELECT id FROM accounts WHERE id = $accountId")->fetch();
+    assertEquals(false, $acct !== false, 'delete_account removes account row');
+
+    $msgs = $pdo->query("SELECT COUNT(*) AS c FROM messages WHERE account_id = $accountId")->fetch();
+    assertEquals(0, (int) ($msgs['c'] ?? -1), 'delete_account cascades to messages');
+
+    $folders = $pdo->query("SELECT COUNT(*) AS c FROM folders WHERE account_id = $accountId")->fetch();
+    assertEquals(0, (int) ($folders['c'] ?? -1), 'delete_account cascades to folders');
+
+    $res = apiRequest('session', [], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['data']['authenticated'] ?? null, 'delete_account invalidates session');
+
+    $session2 = createTestAccountAndSession();
+    $token2 = $session2['token'];
+    $res = apiRequest('delete_account', [], 'POST', ['X-Session-Token' => $token2]);
+    assertEquals(true, $res['ok'] ?? null, 'delete_account works for second account');
+}
+
+function testDetectServer(): void
+{
+    group('detect_server');
+
+    $res = apiRequest('detect_server', ['email' => 'user@gmail.com']);
+    assertEquals(true, $res['ok'] ?? null, 'detect_server returns ok:true for gmail');
+    assertEquals(true, $res['data']['detected'] ?? null, 'detect_server detected=true for gmail');
+    assertEquals('gmail', $res['data']['preset'] ?? '', 'detect_server preset=gmail');
+    assertEquals('imap.gmail.com', $res['data']['imap_host'] ?? '', 'detect_server gmail imap_host');
+
+    $res = apiRequest('detect_server', ['email' => 'user@googlemail.com']);
+    assertEquals('gmail', $res['data']['preset'] ?? '', 'detect_server detects googlemail.com');
+
+    $res = apiRequest('detect_server', ['email' => 'user@hotmail.com']);
+    assertEquals('outlook', $res['data']['preset'] ?? '', 'detect_server detects hotmail as outlook');
+
+    $res = apiRequest('detect_server', ['email' => 'user@me.com']);
+    assertEquals('icloud', $res['data']['preset'] ?? '', 'detect_server detects me.com as icloud');
+
+    $res = apiRequest('detect_server', ['email' => 'user@migadu.com']);
+    assertEquals('migadu', $res['data']['preset'] ?? '', 'detect_server detects migadu');
+
+    $res = apiRequest('detect_server', ['email' => 'user@unknown-domain.xyz']);
+    assertEquals(true, $res['ok'] ?? null, 'detect_server returns ok:true for unknown domain');
+    assertEquals(false, $res['data']['detected'] ?? true, 'detect_server detected=false for unknown');
+    assertEquals(null, $res['data']['preset'] ?? null, 'detect_server preset=null for unknown');
+    assertEquals('imap.unknown-domain.xyz', $res['data']['imap_host'] ?? '', 'detect_server generic imap_host');
+    assertEquals('smtp.unknown-domain.xyz', $res['data']['smtp_host'] ?? '', 'detect_server generic smtp_host');
+
+    $res = apiRequest('detect_server', ['email' => 'USER@GMAIL.COM']);
+    assertEquals('gmail', $res['data']['preset'] ?? '', 'detect_server case insensitive');
+
+    $res = apiRequest('detect_server', ['email' => '']);
+    assertEquals(false, $res['ok'] ?? null, 'detect_server fails for empty email');
+
+    $res = apiRequest('detect_server', ['email' => 'not-an-email']);
+    assertEquals(false, $res['ok'] ?? null, 'detect_server fails for invalid email');
+}
+
+function testValidatePortAndTls(): void
+{
+    group('validate_port_and_tls');
+
+    $session = createTestAccountAndSession();
+    $token = $session['token'];
+
+    $res = apiRequest('test_connection', [
+        'email' => 'test@test.com', 'password' => 'pass',
+        'imap_host' => 'imap.test.com', 'imap_port' => 0, 'imap_tls' => 1,
+        'smtp_host' => 'smtp.test.com', 'smtp_port' => 587, 'smtp_tls' => 2,
+    ]);
+    assertEquals(false, $res['ok'] ?? null, 'test_connection rejects port 0');
+
+    $res = apiRequest('test_connection', [
+        'email' => 'test@test.com', 'password' => 'pass',
+        'imap_host' => 'imap.test.com', 'imap_port' => 993, 'imap_tls' => 1,
+        'smtp_host' => 'smtp.test.com', 'smtp_port' => 70000, 'smtp_tls' => 2,
+    ]);
+    assertEquals(false, $res['ok'] ?? null, 'test_connection rejects port 70000');
+
+    $res = apiRequest('test_connection', [
+        'email' => 'test@test.com', 'password' => 'pass',
+        'imap_host' => 'imap.test.com', 'imap_port' => 993, 'imap_tls' => 3,
+        'smtp_host' => 'smtp.test.com', 'smtp_port' => 587, 'smtp_tls' => 2,
+    ]);
+    assertEquals(false, $res['ok'] ?? null, 'test_connection rejects TLS 3');
+
+    $res = apiRequest('test_connection', [
+        'email' => 'test@test.com', 'password' => 'pass',
+        'imap_host' => 'imap.test.com', 'imap_port' => 993, 'imap_tls' => 1,
+        'smtp_host' => 'smtp.test.com', 'smtp_port' => 587, 'smtp_tls' => -1,
+    ]);
+    assertEquals(false, $res['ok'] ?? null, 'test_connection rejects TLS -1');
+}
+
 /* ---------------------------------------------------------------------------
  * MAIN
  * ------------------------------------------------------------------------ */
@@ -1586,5 +1725,9 @@ testGetThread();
 testSetFlags();
 testBatchAction();
 testSearch();
+testListAccounts();
+testDeleteAccount();
+testDetectServer();
+testValidatePortAndTls();
 
 summary();

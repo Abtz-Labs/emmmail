@@ -30,9 +30,10 @@ The entire application (backend logic, frontend markup, CSS, and JavaScript) liv
 - Flag management (read/starred) and message moves
 - Bulk operations (batch read, star, delete, archive, move)
 - Full-text search (FTS5)
-- Full test suite (TDD, 290 assertions)
-- [TODO] Full-text search (FTS5)
-- [TODO] Multi-account support
+- Multi-account support (add, switch, delete)
+- Server auto-detection (presets + MX lookup)
+- Connection testing without saving
+- Full test suite (TDD, 332 assertions)
 - [TODO] Folder/label management
 - [TODO] Contacts with autocomplete
 - [TODO] Keyboard shortcuts
@@ -461,25 +462,151 @@ curl -s http://localhost:2525/?action=search \
 
 ### Accounts
 
-#### [TODO] `list_accounts`
+#### `list_accounts`
 
-List all configured email accounts.
+List all configured email accounts (for account switcher UI).
 
-#### [TODO] `add_account`
+```bash
+curl -s http://localhost:2525/?action=list_accounts \
+  -H 'X-Session-Token: abc123...' | jq
+```
 
-Add a new email account.
+**Response:**
 
-#### [TODO] `delete_account`
+```json
+{
+  "ok": true,
+  "data": {
+    "accounts": [
+      { "id": 1, "email": "you@example.com", "display_name": "You",
+        "imap_host": "imap.migadu.com", "smtp_host": "smtp.migadu.com",
+        "is_active": 1, "last_sync_at": "2026-08-26T10:00:00Z", "created_at": "2026-08-25T08:00:00Z" }
+    ]
+  }
+}
+```
 
-Remove an email account and its data.
+#### `add_account`
 
-#### [TODO] `detect_server`
+Add a new email account. Tests IMAP/SMTP connectivity and returns a session token for the new account.
 
-Auto-detect IMAP/SMTP servers from an email address (via MX lookup and provider presets).
+```bash
+curl -s http://localhost:2525/?action=add_account \
+  -H 'Content-Type: application/json' \
+  -H 'X-Session-Token: abc123...' \
+  -d '{
+    "preset": "migadu",
+    "email": "other@example.com",
+    "password": "your-password"
+  }' | jq
+```
 
-#### [TODO] `test_connection`
+**Parameters:** Same as `auth` (preset or manual IMAP/SMTP config, email, password).
 
-Test IMAP/SMTP connectivity without saving.
+**Response:**
+
+```json
+{
+  "ok": true,
+  "data": {
+    "account_id": 2,
+    "session_token": "def456...",
+    "email": "other@example.com",
+    "imap": { "ok": true, "error": "", "folders": [...] },
+    "smtp": { "ok": true, "error": "" }
+  }
+}
+```
+
+#### `delete_account`
+
+Delete the current session's account and all associated data (messages, folders, attachments, sessions).
+
+```bash
+curl -s http://localhost:2525/?action=delete_account \
+  -H 'X-Session-Token: abc123...' | jq
+```
+
+**Response:**
+
+```json
+{ "ok": true, "data": { "deleted": true, "account_id": 1 } }
+```
+
+Note: This destroys the current session. The client must handle the logged-out state.
+
+#### `detect_server`
+
+Auto-detect IMAP/SMTP servers from an email address. Public endpoint (no session required).
+
+```bash
+curl -s http://localhost:2525/?action=detect_server \
+  -H 'Content-Type: application/json' \
+  -d '{"email": "user@gmail.com"}' | jq
+```
+
+**Parameters:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `email` | string | yes | Email address to detect servers for |
+
+**Response (known provider):**
+
+```json
+{
+  "ok": true,
+  "data": {
+    "detected": true,
+    "preset": "gmail",
+    "imap_host": "imap.gmail.com", "imap_port": 993, "imap_tls": 1,
+    "smtp_host": "smtp.gmail.com", "smtp_port": 465, "smtp_tls": 1
+  }
+}
+```
+
+**Response (unknown domain):**
+
+```json
+{
+  "ok": true,
+  "data": {
+    "detected": false,
+    "preset": null,
+    "imap_host": "imap.example.com", "imap_port": 993, "imap_tls": 1,
+    "smtp_host": "smtp.example.com", "smtp_port": 587, "smtp_tls": 2
+  }
+}
+```
+
+#### `test_connection`
+
+Test IMAP/SMTP connectivity without saving the account. Public endpoint (no session required).
+
+```bash
+curl -s http://localhost:2525/?action=test_connection \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "preset": "migadu",
+    "email": "you@example.com",
+    "password": "your-password"
+  }' | jq
+```
+
+**Parameters:** Same as `auth`.
+
+**Response:**
+
+```json
+{
+  "ok": true,
+  "data": {
+    "email": "you@example.com",
+    "imap": { "ok": true, "error": "", "folders": ["INBOX", "Sent", ...] },
+    "smtp": { "ok": true, "error": "" }
+  }
+}
+```
 
 ### Contacts & Tags
 
