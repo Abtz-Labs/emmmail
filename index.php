@@ -208,6 +208,19 @@ CREATE TABLE IF NOT EXISTS attachments (
 );
 CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_account ON attachments(account_id);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_token TEXT NOT NULL UNIQUE,
+    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    ip TEXT NOT NULL,
+    user_agent TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    last_activity_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(session_token);
+CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions(account_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_activity ON sessions(last_activity_at);
 SQL;
 
 function initDatabase(PDO $pdo): void
@@ -1095,6 +1108,93 @@ function checkRateLimit(string $email, string $ip): void
     if ((int) $st->fetchColumn() >= EMMMAIL_LOGIN_MAX_ATTEMPTS) {
         fail('Too many login attempts for this account. Try again later.', 429);
     }
+}
+
+/* ---------------------------------------------------------------------------
+ * Session Management
+ * ------------------------------------------------------------------------ */
+
+function createSession(int $accountId, string $ip, string $userAgent): string
+{
+    $pdo = db();
+    $token = bin2hex(random_bytes(32));
+
+    $pdo->prepare('INSERT INTO sessions (session_token, account_id, ip, user_agent) VALUES (?, ?, ?, ?)')
+        ->execute([$token, $accountId, $ip, $userAgent]);
+
+    return $token;
+}
+
+function validateSession(string $token): ?array
+{
+    $pdo = db();
+    $session = fetchOne($pdo, 'SELECT * FROM sessions WHERE session_token = ?', [$token]);
+
+    if (!$session) return null;
+
+    $lastActivity = strtotime($session['last_activity_at']);
+    $createdAt = strtotime($session['created_at']);
+    $now = time();
+
+    if ($now - $lastActivity > EMMMAIL_SESSION_IDLE) {
+        destroySession($token);
+        return null;
+    }
+
+    if ($now - $createdAt > EMMMAIL_SESSION_ABSOLUTE) {
+        destroySession($token);
+        return null;
+    }
+
+    $pdo->prepare('UPDATE sessions SET last_activity_at = datetime("now") WHERE session_token = ?')
+        ->execute([$token]);
+
+    return $session;
+}
+
+function destroySession(string $token): void
+{
+    $pdo = db();
+    $pdo->prepare('DELETE FROM sessions WHERE session_token = ?')->execute([$token]);
+}
+
+function destroyAllSessions(int $accountId): void
+{
+    $pdo = db();
+    $pdo->prepare('DELETE FROM sessions WHERE account_id = ?')->execute([$accountId]);
+}
+
+function getSessionToken(): ?string
+{
+    $token = $_SERVER['HTTP_X_SESSION_TOKEN'] ?? '';
+    if ($token !== '') return $token;
+
+    $token = $_COOKIE[EMMMAIL_SESSION_NAME] ?? '';
+    if ($token !== '') return $token;
+
+    $input = getInput();
+    return $input['session_token'] ?? null;
+}
+
+function requireSession(): array
+{
+    $token = getSessionToken();
+    if (!$token) {
+        fail('Authentication required. Provide session_token via X-Session-Token header, cookie, or request body.', 401);
+    }
+
+    $session = validateSession($token);
+    if (!$session) {
+        fail('Invalid or expired session. Please log in again.', 401);
+    }
+
+    $pdo = db();
+    $account = fetchOne($pdo, 'SELECT * FROM accounts WHERE id = ?', [$session['account_id']]);
+    if (!$account || !$account['is_active']) {
+        fail('Account not found or deactivated.', 401);
+    }
+
+    return $account;
 }
 
 /* ---------------------------------------------------------------------------
@@ -2043,6 +2143,99 @@ function actionMessageAttachments(): void
 }
 
 /* ---------------------------------------------------------------------------
+ * Session Endpoints
+ * ------------------------------------------------------------------------ */
+
+function actionLogin(): void
+{
+    $input = getInput();
+    $email = strtolower(trim($input['email'] ?? ''));
+    $password = $input['password'] ?? '';
+
+    if ($email === '' || $password === '') {
+        fail('Missing required field: email, password');
+    }
+
+    $pdo = db();
+    $account = fetchOne($pdo, 'SELECT * FROM accounts WHERE email = ? AND is_active = 1', [$email]);
+    if (!$account) {
+        fail('Invalid email or password.', 401);
+    }
+
+    $decrypted = decryptPassword($account, getEncryptionKey());
+    if ($decrypted === '' || $decrypted !== $password) {
+        fail('Invalid email or password.', 401);
+    }
+
+    $ip = getClientIp();
+    $userAgent = $_SERVER['HTTP_USER_AGENT'] ?? '';
+    $token = createSession((int) $account['id'], $ip, $userAgent);
+
+    jsonResponse([
+        'ok' => true,
+        'data' => [
+            'session_token' => $token,
+            'account_id' => (int) $account['id'],
+            'email' => $account['email'],
+            'display_name' => $account['display_name'],
+        ],
+    ]);
+}
+
+function actionLogout(): void
+{
+    $token = getSessionToken();
+    if ($token) {
+        destroySession($token);
+    }
+    jsonResponse([
+        'ok' => true,
+        'data' => ['logged_out' => true],
+    ]);
+}
+
+function actionSession(): void
+{
+    $token = getSessionToken();
+    if (!$token) {
+        jsonResponse([
+            'ok' => true,
+            'data' => ['authenticated' => false],
+        ]);
+        return;
+    }
+
+    $session = validateSession($token);
+    if (!$session) {
+        jsonResponse([
+            'ok' => true,
+            'data' => ['authenticated' => false],
+        ]);
+        return;
+    }
+
+    $pdo = db();
+    $account = fetchOne($pdo, 'SELECT id, email, display_name FROM accounts WHERE id = ? AND is_active = 1', [$session['account_id']]);
+    if (!$account) {
+        jsonResponse([
+            'ok' => true,
+            'data' => ['authenticated' => false],
+        ]);
+        return;
+    }
+
+    jsonResponse([
+        'ok' => true,
+        'data' => [
+            'authenticated' => true,
+            'account_id' => (int) $account['id'],
+            'email' => $account['email'],
+            'display_name' => $account['display_name'],
+        ],
+    ]);
+}
+
+/* ---------------------------------------------------------------------------
  * Front Controller
  * ------------------------------------------------------------------------ */
 
@@ -2050,9 +2243,23 @@ function handleRequest(): void
 {
     $action = $_GET['action'] ?? '';
 
+    $publicActions = ['login', 'session', 'auth'];
+    if (!in_array($action, $publicActions, true)) {
+        requireSession();
+    }
+
     switch ($action) {
         case 'auth':
             actionAuth();
+            break;
+        case 'login':
+            actionLogin();
+            break;
+        case 'logout':
+            actionLogout();
+            break;
+        case 'session':
+            actionSession();
             break;
         case 'sync':
             actionSync();

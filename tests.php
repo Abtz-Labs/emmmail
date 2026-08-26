@@ -161,12 +161,13 @@ function runInSubprocess(string $body): string
 }
 
 /** Simulates an HTTP request to index.php and returns decoded JSON. */
-function apiRequest(string $action, array $data = [], string $method = 'POST'): array
+function apiRequest(string $action, array $data = [], string $method = 'POST', array $headers = []): array
 {
     $script = sys_get_temp_dir() . '/emmmail_api_' . uniqid() . '.php';
     $json = json_encode($data, JSON_UNESCAPED_SLASHES);
     $inputFile = sys_get_temp_dir() . '/emmmail_input_' . uniqid() . '.json';
     file_put_contents($inputFile, $json);
+    $headersJson = json_encode($headers);
     $code = '<?php' . "\n"
         . 'putenv(' . var_export('EMMMAIL_DB=' . $GLOBALS['TEST_DB_PATH'], true) . ');' . "\n"
         . 'putenv(' . var_export('EMMMAIL_KEY=' . $GLOBALS['TEST_KEY'], true) . ');' . "\n"
@@ -176,6 +177,8 @@ function apiRequest(string $action, array $data = [], string $method = 'POST'): 
         . '$_GET[' . var_export('action', true) . '] = ' . var_export($action, true) . ';' . "\n"
         . '$_SERVER[' . var_export('REQUEST_METHOD', true) . '] = ' . var_export($method, true) . ';' . "\n"
         . '$_SERVER[' . var_export('CONTENT_TYPE', true) . '] = "application/json";' . "\n"
+        . '$headers = json_decode(' . var_export($headersJson, true) . ', true);' . "\n"
+        . 'foreach ($headers as $k => $v) { $_SERVER["HTTP_" . strtoupper(str_replace("-", "_", $k))] = $v; }' . "\n"
         . 'require ' . var_export($GLOBALS['INDEX_PHP'], true) . ";\n";
     file_put_contents($script, $code);
     exec(PHP_BINARY . ' ' . escapeshellarg($script) . ' 2>&1', $output, $exitCode);
@@ -560,7 +563,10 @@ function testSyncEndpoint(): void
 {
     group('Sync Endpoint');
 
-    $res = apiRequest('sync', ['account_id' => 99999]);
+    $session = createTestAccountAndSession();
+    $token = $session['token'];
+
+    $res = apiRequest('sync', ['account_id' => 99999], 'POST', ['X-Session-Token' => $token]);
     assertEquals(false, $res['ok'] ?? null, 'sync returns ok:false for nonexistent account');
 
     $email = 'sync_fail_' . uniqid() . '@test.com';
@@ -570,7 +576,7 @@ function testSyncEndpoint(): void
         ->execute([$email, 'Bad Account', 'imap.doesnotexist.invalid', 993, 1, 'smtp.doesnotexist.invalid', 587, 2, $enc['encrypted'], $enc['iv'], $enc['tag']]);
     $badId = (int) $pdo->lastInsertId();
 
-    $res = apiRequest('sync', ['account_id' => $badId]);
+    $res = apiRequest('sync', ['account_id' => $badId], 'POST', ['X-Session-Token' => $token]);
     assertEquals(false, $res['ok'] ?? null, 'sync returns ok:false for unreachable IMAP');
     assertTest(str_contains($res['error'] ?? '', 'IMAP'), 'unreachable IMAP error message');
 
@@ -579,7 +585,7 @@ function testSyncEndpoint(): void
         ->execute([$email2, 'Corrupt', 'imap.test.com', 993, 1, 'smtp.test.com', 587, 2, '!!!invalid!!!', 'AA==', 'BB==']);
     $corruptId = (int) $pdo->lastInsertId();
 
-    $res = apiRequest('sync', ['account_id' => $corruptId]);
+    $res = apiRequest('sync', ['account_id' => $corruptId], 'POST', ['X-Session-Token' => $token]);
     assertEquals(false, $res['ok'] ?? null, 'sync returns ok:false for corrupt password');
 }
 
@@ -657,7 +663,10 @@ function testUnknownAction(): void
 {
     group('Unknown Action');
 
-    $res = apiRequest('nonexistent_action');
+    $session = createTestAccountAndSession();
+    $token = $session['token'];
+
+    $res = apiRequest('nonexistent_action', [], 'POST', ['X-Session-Token' => $token]);
     assertEquals(false, $res['ok'] ?? null, 'unknown action returns ok:false');
     assertTest(str_contains($res['error'] ?? '', 'Unknown'), 'unknown action returns error message');
 }
@@ -816,26 +825,30 @@ function testComposeEndpoint(): void
 {
     group('Compose Endpoint');
 
-    $res = apiRequest('compose', []);
+    $session = createTestAccountAndSession();
+    $token = $session['token'];
+    $accountId = $session['account_id'];
+
+    $res = apiRequest('compose', [], 'POST', ['X-Session-Token' => $token]);
     assertEquals(false, $res['ok'] ?? null, 'compose returns ok:false for empty payload');
     assertTest(str_contains($res['error'] ?? '', 'account_id'), 'missing account_id error');
 
-    $res = apiRequest('compose', ['account_id' => 99999, 'to' => ['test@test.com']]);
+    $res = apiRequest('compose', ['account_id' => 99999, 'to' => ['test@test.com']], 'POST', ['X-Session-Token' => $token]);
     assertEquals(false, $res['ok'] ?? null, 'compose returns ok:false for nonexistent account');
 
-    $res = apiRequest('compose', ['account_id' => 1, 'to' => [], 'subject' => 'Hi']);
+    $res = apiRequest('compose', ['account_id' => $accountId, 'to' => [], 'subject' => 'Hi'], 'POST', ['X-Session-Token' => $token]);
     assertEquals(false, $res['ok'] ?? null, 'compose returns ok:false for empty to');
 
-    $res = apiRequest('compose', ['account_id' => 1, 'to' => ['test@test.com']]);
+    $res = apiRequest('compose', ['account_id' => $accountId, 'to' => ['test@test.com']], 'POST', ['X-Session-Token' => $token]);
     assertEquals(false, $res['ok'] ?? null, 'compose returns ok:false for empty subject and body');
 
-    $res = apiRequest('compose', ['account_id' => 1, 'to' => ['test@test.com'], 'subject' => 'Draft', 'draft' => true]);
+    $res = apiRequest('compose', ['account_id' => $accountId, 'to' => ['test@test.com'], 'subject' => 'Draft', 'draft' => true], 'POST', ['X-Session-Token' => $token]);
     assertEquals(true, $res['ok'] ?? null, 'compose saves draft');
     assertTest(($res['data']['draft_id'] ?? 0) > 0, 'draft_id returned');
     assertEquals(true, $res['data']['saved'] ?? null, 'draft saved flag');
     $draftId = $res['data']['draft_id'];
 
-    $res = apiRequest('drafts', ['account_id' => 1]);
+    $res = apiRequest('drafts', ['account_id' => $accountId], 'POST', ['X-Session-Token' => $token]);
     assertEquals(true, $res['ok'] ?? null, 'list drafts ok');
     assertTest(count($res['data']['drafts'] ?? []) > 0, 'drafts list not empty');
     $found = false;
@@ -844,20 +857,20 @@ function testComposeEndpoint(): void
     }
     assertTest($found, 'saved draft found in list');
 
-    $res = apiRequest('draft', ['draft_id' => $draftId]);
+    $res = apiRequest('draft', ['draft_id' => $draftId], 'POST', ['X-Session-Token' => $token]);
     assertEquals(true, $res['ok'] ?? null, 'get draft ok');
     assertEquals('Draft', $res['data']['subject'] ?? '', 'get draft subject');
 
-    $res = apiRequest('update_draft', ['draft_id' => $draftId, 'subject' => 'Updated Draft']);
+    $res = apiRequest('update_draft', ['draft_id' => $draftId, 'subject' => 'Updated Draft'], 'POST', ['X-Session-Token' => $token]);
     assertEquals(true, $res['ok'] ?? null, 'update draft ok');
 
-    $res = apiRequest('draft', ['draft_id' => $draftId]);
+    $res = apiRequest('draft', ['draft_id' => $draftId], 'POST', ['X-Session-Token' => $token]);
     assertEquals('Updated Draft', $res['data']['subject'] ?? '', 'updated draft subject');
 
-    $res = apiRequest('delete_draft', ['draft_id' => $draftId]);
+    $res = apiRequest('delete_draft', ['draft_id' => $draftId], 'POST', ['X-Session-Token' => $token]);
     assertEquals(true, $res['ok'] ?? null, 'delete draft ok');
 
-    $res = apiRequest('draft', ['draft_id' => $draftId]);
+    $res = apiRequest('draft', ['draft_id' => $draftId], 'POST', ['X-Session-Token' => $token]);
     assertEquals(false, $res['ok'] ?? null, 'deleted draft not found');
 }
 
@@ -908,17 +921,20 @@ function testAttachmentEndpoint(): void
 {
     group('Attachment Endpoint');
 
-    $res = apiRequest('message_attachments', []);
+    $session = createTestAccountAndSession();
+    $token = $session['token'];
+
+    $res = apiRequest('message_attachments', [], 'POST', ['X-Session-Token' => $token]);
     assertEquals(false, $res['ok'] ?? null, 'message_attachments returns ok:false for empty payload');
 
-    $res = apiRequest('message_attachments', ['message_id' => 99999]);
+    $res = apiRequest('message_attachments', ['message_id' => 99999], 'POST', ['X-Session-Token' => $token]);
     assertEquals(true, $res['ok'] ?? null, 'message_attachments returns ok:true for nonexistent message');
     assertTest(count($res['data']['attachments'] ?? []) === 0, 'nonexistent message has no attachments');
 
-    $res = apiRequest('download_attachment', []);
+    $res = apiRequest('download_attachment', [], 'POST', ['X-Session-Token' => $token]);
     assertEquals(false, $res['ok'] ?? null, 'download_attachment returns ok:false for empty payload');
 
-    $res = apiRequest('download_attachment', ['attachment_id' => 99999]);
+    $res = apiRequest('download_attachment', ['attachment_id' => 99999], 'POST', ['X-Session-Token' => $token]);
     assertEquals(false, $res['ok'] ?? null, 'download_attachment returns ok:false for nonexistent attachment');
 }
 
@@ -966,6 +982,73 @@ function storeTestAttachment(PDO $pdo, int $messageId, int $accountId): int
     return (int) $pdo->lastInsertId();
 }
 
+function createTestAccountAndSession(): array
+{
+    $pdo = db();
+    $email = 'test_' . uniqid() . '@test.com';
+    $password = 'testpass123';
+    $enc = encryptPassword($password, getEncryptionKey());
+    $pdo->prepare('INSERT INTO accounts (email, display_name, imap_host, imap_port, imap_tls, smtp_host, smtp_port, smtp_tls, password_encrypted, password_iv, password_tag) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        ->execute([$email, 'Test User', 'imap.test.com', 993, 1, 'smtp.test.com', 587, 2, $enc['encrypted'], $enc['iv'], $enc['tag']]);
+    $accountId = (int) $pdo->lastInsertId();
+
+    $token = createSession($accountId, '127.0.0.1', 'Test Agent');
+    return ['account_id' => $accountId, 'email' => $email, 'password' => $password, 'token' => $token];
+}
+
+function testSessionEndpoint(): void
+{
+    group('Session Endpoint');
+
+    $res = apiRequest('session', []);
+    assertEquals(true, $res['ok'] ?? null, 'session returns ok:true when not authenticated');
+    assertEquals(false, $res['data']['authenticated'] ?? null, 'session shows not authenticated');
+
+    $res = apiRequest('login', []);
+    assertEquals(false, $res['ok'] ?? null, 'login returns ok:false for empty payload');
+
+    $res = apiRequest('login', ['email' => 'test@test.com', 'password' => 'wrong']);
+    assertEquals(false, $res['ok'] ?? null, 'login returns ok:false for invalid credentials');
+
+    $email = 'sess' . uniqid() . '@test.com';
+    $password = 'testpass';
+    $enc = encryptPassword($password, getEncryptionKey());
+    $pdo = db();
+    $pdo->prepare('INSERT INTO accounts (email, display_name, imap_host, imap_port, imap_tls, smtp_host, smtp_port, smtp_tls, password_encrypted, password_iv, password_tag) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        ->execute([$email, 'Session Test', 'imap.test.com', 993, 1, 'smtp.test.com', 587, 2, $enc['encrypted'], $enc['iv'], $enc['tag']]);
+
+    $res = apiRequest('login', ['email' => $email, 'password' => $password]);
+    assertEquals(true, $res['ok'] ?? null, 'login returns ok:true with valid credentials');
+    assertTest(!empty($res['data']['session_token']), 'login returns session_token');
+    $token = $res['data']['session_token'];
+
+    $res = apiRequest('session', [], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['ok'] ?? null, 'session returns ok:true with valid token');
+    assertEquals(true, $res['data']['authenticated'] ?? null, 'session shows authenticated');
+    assertEquals($email, $res['data']['email'] ?? '', 'session returns email');
+
+    $res = apiRequest('logout', [], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['ok'] ?? null, 'logout returns ok:true');
+
+    $res = apiRequest('session', [], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['data']['authenticated'] ?? null, 'session shows not authenticated after logout');
+}
+
+function testSessionProtection(): void
+{
+    group('Session Protection');
+
+    $res = apiRequest('sync', []);
+    assertEquals(false, $res['ok'] ?? null, 'sync returns ok:false without session');
+    assertTest(str_contains($res['error'] ?? '', 'Authentication'), 'sync requires authentication');
+
+    $res = apiRequest('compose', []);
+    assertEquals(false, $res['ok'] ?? null, 'compose returns ok:false without session');
+
+    $res = apiRequest('drafts', []);
+    assertEquals(false, $res['ok'] ?? null, 'drafts returns ok:false without session');
+}
+
 /* ---------------------------------------------------------------------------
  * MAIN
  * ------------------------------------------------------------------------ */
@@ -996,5 +1079,7 @@ testComposeEndpoint();
 testDraftEndpointReal();
 testAttachmentEndpoint();
 testAttachmentStorage();
+testSessionEndpoint();
+testSessionProtection();
 
 summary();
