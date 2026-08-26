@@ -1,8 +1,11 @@
-# Database & Attachments
+# Database
 *.db
 *.sqlite
 *.sqlite3
+*.sqlite-*
 *.bak
+
+# Attachments
 attachments/
 
 # Environment

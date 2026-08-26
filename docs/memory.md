@@ -31,15 +31,27 @@
 - Phase 5: Added 6 security tests (account takeover, IDOR, CRLF, rate limiting, IP binding, path containment)
 - 207 tests passing, 0 failures, 3 skipped
 
+## Session 8 (2026-08-26) — Core API endpoints
+- Implemented 7 endpoints: list_folders, list_messages, get_message, get_thread, set_flags, batch_action, search
+- Plan reviewed by 2 subagents; 25 findings addressed (FTS5 migration strategy, composite cursor pagination, FTS query escaping, folder role resolution, etc.)
+- FTS5 migration via `migrateDatabase()` with `PRAGMA user_version` gating (separate from EMMMAIL_SCHEMA to avoid trigger body splitter issues)
+- `escapeFtsQuery()` wraps user tokens in double quotes for literal FTS5 matching
+- Composite cursor pagination: `(date, id)` keyset for list_messages
+- set_flags/batch_action: flag-only changes are local-only (sync reconciles); moves/deletes use folder role resolution
+- 290 tests passing, 0 failures, 3 skipped
+
 ## Key Decisions
 - No ext-imap (deprecated) — raw socket IMAP client
 - AES-256-GCM (not CBC) for password encryption
-- FTS5 with triggers for search (when needed)
+- FTS5 with triggers for search, migrated via `migrateDatabase()` (user_version 1→2)
 - `normalizeSubject` strips prefix but preserves case
 - TDD: tests FIRST, then implementation
 - Session tokens via X-Session-Token header or EMMMAILSESSID cookie (not request body)
 - Sessions bound to IP address (destroyed on IP change)
 - EMMMAIL_DISABLE_SSRF_CHECK=1 for testing only
+- Composite cursor pagination: `date|id` format, keyset `(date < ?) OR (date = ? AND id < ?)`
+- FTS query escaping: wrap tokens in double quotes to prevent FTS5 syntax errors
+- Folder role resolution: `SELECT name FROM folders WHERE account_id = ? AND role = ?`
 
 ## API Endpoints
 - `auth` — test IMAP/SMTP, create/update account (public)
@@ -47,6 +59,13 @@
 - `logout` — destroy session (authenticated)
 - `session` — check session status (public)
 - `sync` — fetch folders/messages from IMAP (authenticated)
+- `list_folders` — list folders with unread/total counts (authenticated)
+- `list_messages` — paginated message list per folder (authenticated)
+- `get_message` — full message with body and attachments (authenticated)
+- `get_thread` — thread metadata + all messages (authenticated)
+- `set_flags` — mark read/starred, move to folder (authenticated)
+- `batch_action` — bulk read/unread/star/unstar/delete/archive/move (authenticated)
+- `search` — FTS5 full-text search (authenticated)
 - `compose` — send email or save draft (authenticated)
 - `drafts` — list drafts (authenticated)
 - `draft` — get single draft (authenticated)
@@ -56,5 +75,6 @@
 - `message_attachments` — list message attachments (authenticated)
 
 ## Next
-- Add more API endpoints (list_messages, get_message, search, etc.)
 - Build UI/UX
+- Add multi-account management endpoints
+- Add contacts/tags/settings endpoints

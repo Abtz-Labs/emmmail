@@ -266,7 +266,47 @@ function initDatabase(PDO $pdo): void
         }
     }
     $pdo->exec('PRAGMA user_version = 1');
+    migrateDatabase($pdo);
     $done = true;
+}
+
+function migrateDatabase(PDO $pdo): void
+{
+    $version = (int) $pdo->query('PRAGMA user_version')->fetchColumn();
+    if ($version < 2) {
+        try {
+            $pdo->exec(<<<'SQL'
+                CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+                    subject, from_address, from_name, text_body,
+                    content='messages', content_rowid='id'
+                )
+            SQL);
+            $pdo->exec(<<<'SQL'
+                CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+                    INSERT INTO messages_fts(rowid, subject, from_address, from_name, text_body)
+                    VALUES (new.id, new.subject, new.from_address, new.from_name, new.text_body);
+                END
+            SQL);
+            $pdo->exec(<<<'SQL'
+                CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
+                    INSERT INTO messages_fts(messages_fts, rowid, subject, from_address, from_name, text_body)
+                    VALUES ('delete', old.id, old.subject, old.from_address, old.from_name, old.text_body);
+                END
+            SQL);
+            $pdo->exec(<<<'SQL'
+                CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
+                    INSERT INTO messages_fts(messages_fts, rowid, subject, from_address, from_name, text_body)
+                    VALUES ('delete', old.id, old.subject, old.from_address, old.from_name, old.text_body);
+                    INSERT INTO messages_fts(rowid, subject, from_address, from_name, text_body)
+                    VALUES (new.id, new.subject, new.from_address, new.from_name, new.text_body);
+                END
+            SQL);
+            $pdo->exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
+            $pdo->exec('PRAGMA user_version = 2');
+        } catch (Throwable $e) {
+            // FTS5 not available; search will return 501
+        }
+    }
 }
 
 function db(): PDO
@@ -2425,6 +2465,257 @@ function actionSession(): void
     ]);
 }
 
+function actionListFolders(): void
+{
+    $accountId = currentAccountId();
+    if ($accountId <= 0) fail('No account found. Run auth first.');
+
+    $pdo = db();
+    $folders = fetchAll($pdo, 'SELECT id, name, role, unread_count, total_count FROM folders WHERE account_id = ? ORDER BY CASE role WHEN \'inbox\' THEN 1 WHEN \'sent\' THEN 2 WHEN \'drafts\' THEN 3 WHEN \'archive\' THEN 4 WHEN \'junk\' THEN 5 WHEN \'trash\' THEN 6 ELSE 7 END, name', [$accountId]);
+
+    jsonResponse(['ok' => true, 'data' => ['folders' => $folders]]);
+}
+
+function actionListMessages(): void
+{
+    $accountId = currentAccountId();
+    if ($accountId <= 0) fail('No account found. Run auth first.');
+
+    $input = getInput();
+    $folder = $input['folder'] ?? '';
+    if ($folder === '') fail('Missing required field: folder');
+
+    $limit = (int) ($input['limit'] ?? 50);
+    $limit = max(1, min(100, $limit));
+
+    $cursor = $input['cursor'] ?? null;
+    $pdo = db();
+
+    if ($cursor !== null && str_contains($cursor, '|')) {
+        [$cursorDate, $cursorId] = explode('|', $cursor, 2);
+        $cursorDate = (string) $cursorDate;
+        $cursorId = (int) $cursorId;
+        $rows = fetchAll($pdo, 'SELECT id, uid, message_id, subject, from_address, from_name, to_addresses, date, is_read, is_starred, has_attachments, thread_id, SUBSTR(text_body, 1, 200) AS preview FROM messages WHERE account_id = ? AND folder_name = ? AND (date < ? OR (date = ? AND id < ?)) ORDER BY date DESC, id DESC LIMIT ?', [$accountId, $folder, $cursorDate, $cursorDate, $cursorId, $limit + 1]);
+    } else {
+        $rows = fetchAll($pdo, 'SELECT id, uid, message_id, subject, from_address, from_name, to_addresses, date, is_read, is_starred, has_attachments, thread_id, SUBSTR(text_body, 1, 200) AS preview FROM messages WHERE account_id = ? AND folder_name = ? ORDER BY date DESC, id DESC LIMIT ?', [$accountId, $folder, $limit + 1]);
+    }
+
+    $hasMore = count($rows) > $limit;
+    if ($hasMore) array_pop($rows);
+
+    foreach ($rows as &$row) {
+        $row['to_addresses'] = json_decode($row['to_addresses'] ?? '[]', true);
+    }
+    unset($row);
+
+    $nextCursor = null;
+    if ($hasMore && !empty($rows)) {
+        $last = end($rows);
+        $nextCursor = $last['date'] . '|' . $last['id'];
+    }
+
+    jsonResponse(['ok' => true, 'data' => ['messages' => $rows, 'has_more' => $hasMore, 'next_cursor' => $nextCursor]]);
+}
+
+function actionGetMessage(): void
+{
+    $accountId = currentAccountId();
+    if ($accountId <= 0) fail('No account found. Run auth first.');
+
+    $input = getInput();
+    $messageId = (int) ($input['message_id'] ?? 0);
+    if ($messageId <= 0) fail('Missing required field: message_id');
+
+    $pdo = db();
+    $msg = fetchOne($pdo, 'SELECT id, account_id, folder_name, uid, message_id, in_reply_to, refs, subject, from_address, from_name, to_addresses, cc_addresses, date, text_body, html_body, thread_id, is_read, is_starred, has_attachments, size, created_at FROM messages WHERE id = ? AND account_id = ?', [$messageId, $accountId]);
+    if (!$msg) fail('Message not found.');
+
+    $msg['to_addresses'] = json_decode($msg['to_addresses'] ?? '[]', true);
+    $msg['cc_addresses'] = json_decode($msg['cc_addresses'] ?? '[]', true);
+
+    $attachments = fetchAll($pdo, 'SELECT id, filename, content_type, size FROM attachments WHERE message_id = ? AND account_id = ? ORDER BY id', [$messageId, $accountId]);
+
+    jsonResponse(['ok' => true, 'data' => ['message' => $msg, 'attachments' => $attachments]]);
+}
+
+function actionGetThread(): void
+{
+    $accountId = currentAccountId();
+    if ($accountId <= 0) fail('No account found. Run auth first.');
+
+    $input = getInput();
+    $threadId = (int) ($input['thread_id'] ?? 0);
+    if ($threadId <= 0) fail('Missing required field: thread_id');
+
+    $pdo = db();
+    $thread = fetchOne($pdo, 'SELECT id, subject, message_count, preview, is_read, is_starred, last_message_at FROM threads WHERE id = ? AND account_id = ?', [$threadId, $accountId]);
+    if (!$thread) fail('Thread not found.');
+
+    $messages = fetchAll($pdo, 'SELECT id, uid, folder_name, message_id, subject, from_address, from_name, to_addresses, cc_addresses, date, is_read, is_starred, has_attachments, text_body, in_reply_to, refs FROM messages WHERE thread_id = ? AND account_id = ? ORDER BY date ASC, id ASC', [$threadId, $accountId]);
+
+    foreach ($messages as &$msg) {
+        $msg['to_addresses'] = json_decode($msg['to_addresses'] ?? '[]', true);
+        $msg['cc_addresses'] = json_decode($msg['cc_addresses'] ?? '[]', true);
+    }
+    unset($msg);
+
+    jsonResponse(['ok' => true, 'data' => ['thread' => $thread, 'messages' => $messages]]);
+}
+
+function actionSetFlags(): void
+{
+    $accountId = currentAccountId();
+    if ($accountId <= 0) fail('No account found. Run auth first.');
+
+    $input = getInput();
+    $messageId = (int) ($input['message_id'] ?? 0);
+    if ($messageId <= 0) fail('Missing required field: message_id');
+
+    $pdo = db();
+    $msg = fetchOne($pdo, 'SELECT id, thread_id, is_read, is_starred, folder_name FROM messages WHERE id = ? AND account_id = ?', [$messageId, $accountId]);
+    if (!$msg) fail('Message not found.');
+
+    $sets = [];
+    $params = [];
+    $whitelist = ['is_read', 'is_starred', 'folder_name'];
+    foreach ($whitelist as $col) {
+        if (array_key_exists($col, $input)) {
+            $sets[] = "$col = ?";
+            $params[] = $input[$col];
+        }
+    }
+
+    if (empty($sets)) fail('No flags to update.');
+
+    $params[] = $messageId;
+    $params[] = $accountId;
+    $pdo->prepare('UPDATE messages SET ' . implode(', ', $sets) . ' WHERE id = ? AND account_id = ?')->execute($params);
+
+    if ($msg['thread_id']) updateThreadAggregates((int) $msg['thread_id']);
+
+    $updated = fetchOne($pdo, 'SELECT id, is_read, is_starred, folder_name FROM messages WHERE id = ?', [$messageId]);
+    jsonResponse(['ok' => true, 'data' => $updated]);
+}
+
+function actionBatchAction(): void
+{
+    $accountId = currentAccountId();
+    if ($accountId <= 0) fail('No account found. Run auth first.');
+
+    $input = getInput();
+    $messageIds = $input['message_ids'] ?? [];
+    $action = $input['action'] ?? '';
+
+    if (!is_array($messageIds) || empty($messageIds)) fail('Missing required field: message_ids');
+    if ($action === '') fail('Missing required field: action');
+
+    $validActions = ['read', 'unread', 'star', 'unstar', 'delete', 'archive', 'move'];
+    if (!in_array($action, $validActions, true)) fail('Invalid action: ' . $action);
+
+    $ids = array_unique(array_filter(array_map(fn($v) => (int) $v, $messageIds), fn($v) => $v > 0));
+    if (count($ids) > 200) fail('Too many message IDs (max 200).');
+    if (empty($ids)) fail('No valid message IDs.');
+
+    $pdo = db();
+    $placeholders = implode(',', array_fill(0, count($ids), '?'));
+
+    $params = array_merge($ids, [$accountId]);
+    $existing = fetchAll($pdo, "SELECT id, thread_id FROM messages WHERE id IN ($placeholders) AND account_id = ?", $params);
+    $existingIds = array_column($existing, 'id');
+    $threadIds = array_unique(array_filter(array_column($existing, 'thread_id')));
+
+    if (empty($existingIds)) {
+        jsonResponse(['ok' => true, 'data' => ['affected' => 0]]);
+        return;
+    }
+
+    $existingPlaceholders = implode(',', array_fill(0, count($existingIds), '?'));
+    $updateParams = [];
+
+    switch ($action) {
+        case 'read':
+            $pdo->prepare("UPDATE messages SET is_read = 1 WHERE id IN ($existingPlaceholders) AND account_id = ?")->execute(array_merge($existingIds, [$accountId]));
+            break;
+        case 'unread':
+            $pdo->prepare("UPDATE messages SET is_read = 0 WHERE id IN ($existingPlaceholders) AND account_id = ?")->execute(array_merge($existingIds, [$accountId]));
+            break;
+        case 'star':
+            $pdo->prepare("UPDATE messages SET is_starred = 1 WHERE id IN ($existingPlaceholders) AND account_id = ?")->execute(array_merge($existingIds, [$accountId]));
+            break;
+        case 'unstar':
+            $pdo->prepare("UPDATE messages SET is_starred = 0 WHERE id IN ($existingPlaceholders) AND account_id = ?")->execute(array_merge($existingIds, [$accountId]));
+            break;
+        case 'delete':
+            $trash = fetchOne($pdo, 'SELECT name FROM folders WHERE account_id = ? AND role = ?', [$accountId, 'trash']);
+            if (!$trash) fail('Trash folder not found. Run sync first.');
+            $pdo->prepare("UPDATE messages SET folder_name = ? WHERE id IN ($existingPlaceholders) AND account_id = ?")->execute(array_merge([$trash['name']], $existingIds, [$accountId]));
+            break;
+        case 'archive':
+            $archive = fetchOne($pdo, 'SELECT name FROM folders WHERE account_id = ? AND role = ?', [$accountId, 'archive']);
+            if (!$archive) fail('Archive folder not found. Run sync first.');
+            $pdo->prepare("UPDATE messages SET folder_name = ? WHERE id IN ($existingPlaceholders) AND account_id = ?")->execute(array_merge([$archive['name']], $existingIds, [$accountId]));
+            break;
+        case 'move':
+            $folderName = $input['folder_name'] ?? '';
+            if ($folderName === '') fail('Missing required field: folder_name for move action.');
+            $dest = fetchOne($pdo, 'SELECT name FROM folders WHERE account_id = ? AND name = ?', [$accountId, $folderName]);
+            if (!$dest) fail('Destination folder not found: ' . $folderName);
+            $pdo->prepare("UPDATE messages SET folder_name = ? WHERE id IN ($existingPlaceholders) AND account_id = ?")->execute(array_merge([$folderName], $existingIds, [$accountId]));
+            break;
+    }
+
+    foreach ($threadIds as $tid) {
+        updateThreadAggregates((int) $tid);
+    }
+
+    jsonResponse(['ok' => true, 'data' => ['affected' => count($existingIds)]]);
+}
+
+function escapeFtsQuery(string $query): string
+{
+    $query = trim($query);
+    if ($query === '') return '';
+    $tokens = preg_split('/\s+/', $query);
+    $escaped = array_map(fn($t) => '"' . str_replace('"', '""', $t) . '"', $tokens);
+    return implode(' ', $escaped);
+}
+
+function actionSearch(): void
+{
+    $accountId = currentAccountId();
+    if ($accountId <= 0) fail('No account found. Run auth first.');
+
+    $input = getInput();
+    $query = trim($input['query'] ?? '');
+    if ($query === '') fail('Missing required field: query');
+
+    $folder = $input['folder'] ?? null;
+    $limit = (int) ($input['limit'] ?? 50);
+    $limit = max(1, min(100, $limit));
+
+    $ftsQuery = escapeFtsQuery($query);
+    if ($ftsQuery === '') fail('Invalid search query.');
+
+    $pdo = db();
+
+    try {
+        if ($folder !== null && $folder !== '') {
+            $rows = fetchAll($pdo, 'SELECT m.id, m.uid, m.folder_name, m.subject, m.from_address, m.from_name, m.to_addresses, m.date, m.is_read, m.is_starred, m.has_attachments, m.thread_id, SUBSTR(m.text_body, 1, 200) AS preview FROM messages_fts fts JOIN messages m ON m.id = fts.rowid WHERE messages_fts MATCH ? AND m.account_id = ? AND m.folder_name = ? ORDER BY rank LIMIT ?', [$ftsQuery, $accountId, $folder, $limit]);
+        } else {
+            $rows = fetchAll($pdo, 'SELECT m.id, m.uid, m.folder_name, m.subject, m.from_address, m.from_name, m.to_addresses, m.date, m.is_read, m.is_starred, m.has_attachments, m.thread_id, SUBSTR(m.text_body, 1, 200) AS preview FROM messages_fts fts JOIN messages m ON m.id = fts.rowid WHERE messages_fts MATCH ? AND m.account_id = ? ORDER BY rank LIMIT ?', [$ftsQuery, $accountId, $limit]);
+        }
+    } catch (Throwable $e) {
+        fail('Search query error: ' . $e->getMessage());
+    }
+
+    foreach ($rows as &$row) {
+        $row['to_addresses'] = json_decode($row['to_addresses'] ?? '[]', true);
+    }
+    unset($row);
+
+    jsonResponse(['ok' => true, 'data' => ['messages' => $rows]]);
+}
+
 /* ---------------------------------------------------------------------------
  * Front Controller
  * ------------------------------------------------------------------------ */
@@ -2476,6 +2767,27 @@ function handleRequest(): void
             break;
         case 'message_attachments':
             actionMessageAttachments();
+            break;
+        case 'list_folders':
+            actionListFolders();
+            break;
+        case 'list_messages':
+            actionListMessages();
+            break;
+        case 'get_message':
+            actionGetMessage();
+            break;
+        case 'get_thread':
+            actionGetThread();
+            break;
+        case 'set_flags':
+            actionSetFlags();
+            break;
+        case 'batch_action':
+            actionBatchAction();
+            break;
+        case 'search':
+            actionSearch();
             break;
         default:
             fail('Unknown action: ' . ($action ?: '(none)'));

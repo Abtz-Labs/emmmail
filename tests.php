@@ -1208,6 +1208,338 @@ function testPathContainment(): void
     assertEquals(false, $res['ok'] ?? null, 'download_attachment rejects nonexistent attachment');
 }
 
+function insertTestFolder(int $accountId, string $name, string $role, int $unread = 0, int $total = 0): int
+{
+    $pdo = db();
+    $pdo->prepare('INSERT INTO folders (account_id, name, role, unread_count, total_count) VALUES (?, ?, ?, ?, ?)')
+        ->execute([$accountId, $name, $role, $unread, $total]);
+    return (int) $pdo->lastInsertId();
+}
+
+function insertTestMessage(int $accountId, string $folder, int $uid, array $attrs = []): int
+{
+    $pdo = db();
+    $subject = $attrs['subject'] ?? 'Test Subject ' . $uid;
+    $fromAddr = $attrs['from_address'] ?? 'sender@test.com';
+    $fromName = $attrs['from_name'] ?? 'Sender';
+    $toAddrs = $attrs['to_addresses'] ?? json_encode(['recipient@test.com']);
+    $date = $attrs['date'] ?? date('Y-m-d\TH:i:s\Z');
+    $textBody = $attrs['text_body'] ?? 'Plain text body for message ' . $uid;
+    $htmlBody = $attrs['html_body'] ?? '<p>HTML body for message ' . $uid . '</p>';
+    $isRead = $attrs['is_read'] ?? 0;
+    $isStarred = $attrs['is_starred'] ?? 0;
+    $hasAttachments = $attrs['has_attachments'] ?? 0;
+    $messageId = $attrs['message_id'] ?? '<msg' . $uid . '@test.com>';
+    $inReplyTo = $attrs['in_reply_to'] ?? '';
+    $refs = $attrs['refs'] ?? '';
+
+    $pdo->prepare('INSERT INTO messages (account_id, folder_name, uid, message_id, in_reply_to, refs, subject, from_address, from_name, to_addresses, cc_addresses, date, text_body, html_body, is_read, is_starred, has_attachments) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        ->execute([$accountId, $folder, $uid, $messageId, $inReplyTo, $refs, $subject, $fromAddr, $fromName, $toAddrs, '[]', $date, $textBody, $htmlBody, $isRead, $isStarred, $hasAttachments]);
+    return (int) $pdo->lastInsertId();
+}
+
+function insertTestThread(int $accountId, string $subject, string $lastMessageAt, int $messageCount = 1, string $preview = '', int $isRead = 0, int $isStarred = 0): int
+{
+    $pdo = db();
+    $threadKey = hash('sha1', strtolower(preg_replace('/^(re|fwd?|fw):\s*/i', '', $subject)));
+    $pdo->prepare('INSERT INTO threads (account_id, thread_key, subject, last_message_at, message_count, preview, is_read, is_starred) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+        ->execute([$accountId, $threadKey, $subject, $lastMessageAt, $messageCount, $preview, $isRead, $isStarred]);
+    return (int) $pdo->lastInsertId();
+}
+
+function testListFolders(): void
+{
+    group('list_folders');
+
+    $session = createTestAccountAndSession();
+    $token = $session['token'];
+    $accountId = $session['account_id'];
+
+    $res = apiRequest('list_folders', [], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['ok'] ?? null, 'list_folders returns ok:true');
+    assertEquals([], $res['data']['folders'] ?? null, 'list_folders returns empty array when no folders');
+
+    insertTestFolder($accountId, 'INBOX', 'inbox', 5, 120);
+    insertTestFolder($accountId, 'Sent', 'sent', 0, 40);
+    insertTestFolder($accountId, 'Trash', 'trash', 0, 10);
+
+    $res = apiRequest('list_folders', [], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['ok'] ?? null, 'list_folders returns ok:true with folders');
+    assertEquals(3, count($res['data']['folders'] ?? []), 'list_folders returns 3 folders');
+
+    $folders = $res['data']['folders'] ?? [];
+    assertEquals('INBOX', $folders[0]['name'] ?? '', 'list_folders sorts inbox first');
+    assertEquals('inbox', $folders[0]['role'] ?? '', 'list_folders includes role');
+    assertEquals(5, $folders[0]['unread_count'] ?? 0, 'list_folders includes unread_count');
+    assertEquals(120, $folders[0]['total_count'] ?? 0, 'list_folders includes total_count');
+    assertEquals('Sent', $folders[1]['name'] ?? '', 'list_folders sorts sent second');
+    assertEquals('Trash', $folders[2]['name'] ?? '', 'list_folders sorts trash last');
+
+    $res = apiRequest('list_folders', [], 'POST', ['X-Session-Token' => 'invalid-token']);
+    assertEquals(false, $res['ok'] ?? null, 'list_folders rejects invalid session');
+}
+
+function testListMessages(): void
+{
+    group('list_messages');
+
+    $session = createTestAccountAndSession();
+    $token = $session['token'];
+    $accountId = $session['account_id'];
+
+    $res = apiRequest('list_messages', [], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['ok'] ?? null, 'list_messages fails without folder');
+
+    $res = apiRequest('list_messages', ['folder' => 'INBOX'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['ok'] ?? null, 'list_messages returns ok:true for empty folder');
+    assertEquals([], $res['data']['messages'] ?? null, 'list_messages returns empty array for empty folder');
+    assertEquals(false, $res['data']['has_more'] ?? null, 'list_messages has_more false when empty');
+
+    insertTestFolder($accountId, 'INBOX', 'inbox');
+    insertTestMessage($accountId, 'INBOX', 1, ['subject' => 'First', 'date' => '2026-08-25T10:00:00Z']);
+    insertTestMessage($accountId, 'INBOX', 2, ['subject' => 'Second', 'date' => '2026-08-26T10:00:00Z']);
+    insertTestMessage($accountId, 'INBOX', 3, ['subject' => 'Third', 'date' => '2026-08-26T14:00:00Z']);
+
+    $res = apiRequest('list_messages', ['folder' => 'INBOX'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['ok'] ?? null, 'list_messages returns ok:true');
+    assertEquals(3, count($res['data']['messages'] ?? []), 'list_messages returns 3 messages');
+    assertEquals('Third', $res['data']['messages'][0]['subject'] ?? '', 'list_messages sorts newest first');
+    assertEquals('First', $res['data']['messages'][2]['subject'] ?? '', 'list_messages sorts oldest last');
+
+    $msg = $res['data']['messages'][0];
+    assertTest(is_array($msg['to_addresses'] ?? null), 'list_messages to_addresses is array');
+    assertTest(isset($msg['preview']), 'list_messages includes preview');
+    assertTest(!isset($msg['text_body']), 'list_messages excludes text_body');
+    assertTest(!isset($msg['html_body']), 'list_messages excludes html_body');
+
+    $res = apiRequest('list_messages', ['folder' => 'INBOX', 'limit' => 2], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(2, count($res['data']['messages'] ?? []), 'list_messages respects limit');
+    assertEquals(true, $res['data']['has_more'] ?? null, 'list_messages has_more true when more exist');
+    assertTest(!empty($res['data']['next_cursor']), 'list_messages returns next_cursor');
+
+    $cursor = $res['data']['next_cursor'];
+    $res = apiRequest('list_messages', ['folder' => 'INBOX', 'limit' => 2, 'cursor' => $cursor], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(1, count($res['data']['messages'] ?? []), 'list_messages cursor returns remaining');
+    assertEquals('First', $res['data']['messages'][0]['subject'] ?? '', 'list_messages cursor returns older messages');
+    assertEquals(false, $res['data']['has_more'] ?? null, 'list_messages cursor has_more false at end');
+
+    $res = apiRequest('list_messages', ['folder' => 'INBOX', 'limit' => 0], 'POST', ['X-Session-Token' => $token]);
+    assertTest(count($res['data']['messages'] ?? []) >= 1, 'list_messages limit=0 clamped to 1');
+
+    $res = apiRequest('list_messages', ['folder' => 'INBOX', 'limit' => 500], 'POST', ['X-Session-Token' => $token]);
+    assertTest(count($res['data']['messages'] ?? []) <= 100, 'list_messages limit=500 clamped to 100');
+
+    $res = apiRequest('list_messages', ['folder' => 'INBOX'], 'POST', ['X-Session-Token' => 'invalid']);
+    assertEquals(false, $res['ok'] ?? null, 'list_messages rejects invalid session');
+}
+
+function testGetMessage(): void
+{
+    group('get_message');
+
+    $session = createTestAccountAndSession();
+    $token = $session['token'];
+    $accountId = $session['account_id'];
+
+    $res = apiRequest('get_message', ['message_id' => 99999], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['ok'] ?? null, 'get_message fails for nonexistent id');
+
+    insertTestFolder($accountId, 'INBOX', 'inbox');
+    $msgId = insertTestMessage($accountId, 'INBOX', 1, [
+        'subject' => 'Test Email',
+        'from_address' => 'alice@example.com',
+        'from_name' => 'Alice',
+        'to_addresses' => json_encode(['bob@test.com']),
+        'cc_addresses' => json_encode(['carol@test.com']),
+        'text_body' => 'Hello Bob',
+        'html_body' => '<p>Hello Bob</p>',
+    ]);
+
+    $res = apiRequest('get_message', ['message_id' => $msgId], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['ok'] ?? null, 'get_message returns ok:true');
+    assertEquals('Test Email', $res['data']['message']['subject'] ?? '', 'get_message returns subject');
+    assertEquals('Hello Bob', $res['data']['message']['text_body'] ?? '', 'get_message returns text_body');
+    assertEquals('<p>Hello Bob</p>', $res['data']['message']['html_body'] ?? '', 'get_message returns html_body');
+    assertEquals('alice@example.com', $res['data']['message']['from_address'] ?? '', 'get_message returns from_address');
+    assertTest(is_array($res['data']['message']['to_addresses'] ?? null), 'get_message to_addresses is array');
+    assertTest(is_array($res['data']['message']['cc_addresses'] ?? null), 'get_message cc_addresses is array');
+    assertTest(!isset($res['data']['message']['raw_headers']), 'get_message excludes raw_headers');
+    assertEquals([], $res['data']['attachments'] ?? null, 'get_message returns empty attachments');
+
+    $session2 = createTestAccountAndSession();
+    $token2 = $session2['token'];
+    $res = apiRequest('get_message', ['message_id' => $msgId], 'POST', ['X-Session-Token' => $token2]);
+    assertEquals(false, $res['ok'] ?? null, 'get_message blocks cross-account access');
+}
+
+function testGetThread(): void
+{
+    group('get_thread');
+
+    $session = createTestAccountAndSession();
+    $token = $session['token'];
+    $accountId = $session['account_id'];
+
+    $res = apiRequest('get_thread', ['thread_id' => 99999], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['ok'] ?? null, 'get_thread fails for nonexistent id');
+
+    insertTestFolder($accountId, 'INBOX', 'inbox');
+    $threadId = insertTestThread($accountId, 'Hello Thread', '2026-08-26T10:00:00Z', 2, 'Latest preview', 0, 1);
+    insertTestMessage($accountId, 'INBOX', 1, ['subject' => 'Hello Thread', 'date' => '2026-08-25T08:00:00Z']);
+    insertTestMessage($accountId, 'INBOX', 2, ['subject' => 'Re: Hello Thread', 'date' => '2026-08-26T10:00:00Z']);
+
+    $pdo = db();
+    $pdo->prepare('UPDATE messages SET thread_id = ? WHERE account_id = ? AND uid IN (1, 2)')
+        ->execute([$threadId, $accountId]);
+
+    $res = apiRequest('get_thread', ['thread_id' => $threadId], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['ok'] ?? null, 'get_thread returns ok:true');
+    assertEquals('Hello Thread', $res['data']['thread']['subject'] ?? '', 'get_thread returns subject');
+    assertEquals(2, $res['data']['thread']['message_count'] ?? 0, 'get_thread returns message_count');
+    assertEquals(2, count($res['data']['messages'] ?? []), 'get_thread returns 2 messages');
+    assertEquals('Hello Thread', $res['data']['messages'][0]['subject'] ?? '', 'get_thread messages sorted by date ASC');
+    assertEquals('Re: Hello Thread', $res['data']['messages'][1]['subject'] ?? '', 'get_thread second message is newer');
+
+    $msg = $res['data']['messages'][0];
+    assertTest(isset($msg['text_body']), 'get_thread messages include text_body');
+    assertTest(!isset($msg['html_body']), 'get_thread messages exclude html_body');
+
+    $session2 = createTestAccountAndSession();
+    $token2 = $session2['token'];
+    $res = apiRequest('get_thread', ['thread_id' => $threadId], 'POST', ['X-Session-Token' => $token2]);
+    assertEquals(false, $res['ok'] ?? null, 'get_thread blocks cross-account access');
+}
+
+function testSetFlags(): void
+{
+    group('set_flags');
+
+    $session = createTestAccountAndSession();
+    $token = $session['token'];
+    $accountId = $session['account_id'];
+
+    insertTestFolder($accountId, 'INBOX', 'inbox');
+    $msgId = insertTestMessage($accountId, 'INBOX', 1, ['is_read' => 0, 'is_starred' => 0]);
+
+    $res = apiRequest('set_flags', ['message_id' => $msgId, 'is_read' => 1], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['ok'] ?? null, 'set_flags returns ok:true');
+    assertEquals(1, $res['data']['is_read'] ?? null, 'set_flags marks as read');
+
+    $pdo = db();
+    $row = $pdo->query("SELECT is_read FROM messages WHERE id = $msgId")->fetch();
+    assertEquals(1, (int) $row['is_read'], 'set_flags persisted is_read');
+
+    $res = apiRequest('set_flags', ['message_id' => $msgId, 'is_starred' => 1], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(1, $res['data']['is_starred'] ?? null, 'set_flags marks as starred');
+
+    $row = $pdo->query("SELECT is_starred FROM messages WHERE id = $msgId")->fetch();
+    assertEquals(1, (int) $row['is_starred'], 'set_flags persisted is_starred');
+
+    $res = apiRequest('set_flags', ['message_id' => 99999, 'is_read' => 1], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['ok'] ?? null, 'set_flags fails for nonexistent message');
+
+    $session2 = createTestAccountAndSession();
+    $token2 = $session2['token'];
+    $res = apiRequest('set_flags', ['message_id' => $msgId, 'is_read' => 1], 'POST', ['X-Session-Token' => $token2]);
+    assertEquals(false, $res['ok'] ?? null, 'set_flags blocks cross-account');
+}
+
+function testBatchAction(): void
+{
+    group('batch_action');
+
+    $session = createTestAccountAndSession();
+    $token = $session['token'];
+    $accountId = $session['account_id'];
+
+    insertTestFolder($accountId, 'INBOX', 'inbox');
+    $msg1 = insertTestMessage($accountId, 'INBOX', 1, ['is_read' => 0, 'is_starred' => 0]);
+    $msg2 = insertTestMessage($accountId, 'INBOX', 2, ['is_read' => 0, 'is_starred' => 0]);
+    $msg3 = insertTestMessage($accountId, 'INBOX', 3, ['is_read' => 0, 'is_starred' => 0]);
+
+    $res = apiRequest('batch_action', ['message_ids' => [], 'action' => 'read'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['ok'] ?? null, 'batch_action fails for empty ids');
+
+    $res = apiRequest('batch_action', ['message_ids' => [$msg1, $msg2], 'action' => 'invalid'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['ok'] ?? null, 'batch_action fails for invalid action');
+
+    $res = apiRequest('batch_action', ['message_ids' => [$msg1, $msg2, $msg3], 'action' => 'read'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['ok'] ?? null, 'batch_action read returns ok:true');
+    assertEquals(3, $res['data']['affected'] ?? 0, 'batch_action read affects 3 messages');
+
+    $pdo = db();
+    $unread = $pdo->query("SELECT COUNT(*) AS c FROM messages WHERE account_id = $accountId AND is_read = 0")->fetch();
+    assertEquals(0, (int) $unread['c'], 'batch_action read marks all as read');
+
+    $res = apiRequest('batch_action', ['message_ids' => [$msg1, $msg2], 'action' => 'star'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(2, $res['data']['affected'] ?? 0, 'batch_action star affects 2 messages');
+
+    $starred = $pdo->query("SELECT COUNT(*) AS c FROM messages WHERE account_id = $accountId AND is_starred = 1")->fetch();
+    assertEquals(2, (int) $starred['c'], 'batch_action star marks 2 as starred');
+
+    $res = apiRequest('batch_action', ['message_ids' => [$msg1, $msg2], 'action' => 'unstar'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(2, $res['data']['affected'] ?? 0, 'batch_action unstar affects 2 messages');
+
+    $starred = $pdo->query("SELECT COUNT(*) AS c FROM messages WHERE account_id = $accountId AND is_starred = 1")->fetch();
+    assertEquals(0, (int) $starred['c'], 'batch_action unstar clears starred');
+
+    $res = apiRequest('batch_action', ['message_ids' => [$msg1, $msg2], 'action' => 'unread'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(2, $res['data']['affected'] ?? 0, 'batch_action unread affects 2 messages');
+
+    $unread = $pdo->query("SELECT COUNT(*) AS c FROM messages WHERE account_id = $accountId AND is_read = 0")->fetch();
+    assertEquals(2, (int) $unread['c'], 'batch_action unread marks 2 as unread');
+
+    $res = apiRequest('batch_action', ['message_ids' => [$msg1, $msg1, $msg2], 'action' => 'read'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(2, $res['data']['affected'] ?? 0, 'batch_action dedupes ids');
+
+    $session2 = createTestAccountAndSession();
+    $token2 = $session2['token'];
+    $res = apiRequest('batch_action', ['message_ids' => [$msg1], 'action' => 'read'], 'POST', ['X-Session-Token' => $token2]);
+    assertEquals(0, $res['data']['affected'] ?? -1, 'batch_action blocks cross-account');
+}
+
+function testSearch(): void
+{
+    group('search');
+
+    $session = createTestAccountAndSession();
+    $token = $session['token'];
+    $accountId = $session['account_id'];
+
+    insertTestFolder($accountId, 'INBOX', 'inbox');
+    insertTestMessage($accountId, 'INBOX', 1, ['subject' => 'Quarterly Report', 'from_name' => 'Alice', 'text_body' => 'Please find attached the Q3 report.']);
+    insertTestMessage($accountId, 'INBOX', 2, ['subject' => 'Lunch Plans', 'from_name' => 'Bob', 'text_body' => 'Want to grab lunch tomorrow?']);
+    insertTestMessage($accountId, 'INBOX', 3, ['subject' => 'Re: Quarterly Report', 'from_name' => 'Carol', 'text_body' => 'Thanks for the report, looks great.']);
+
+    $res = apiRequest('search', ['query' => ''], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['ok'] ?? null, 'search fails for empty query');
+
+    $res = apiRequest('search', ['query' => 'report'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['ok'] ?? null, 'search returns ok:true');
+    assertEquals(2, count($res['data']['messages'] ?? []), 'search finds 2 messages with "report"');
+
+    $res = apiRequest('search', ['query' => 'lunch'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(1, count($res['data']['messages'] ?? []), 'search finds 1 message with "lunch"');
+
+    $res = apiRequest('search', ['query' => 'Alice'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(1, count($res['data']['messages'] ?? []), 'search finds by sender name');
+
+    $res = apiRequest('search', ['query' => 'report', 'folder' => 'INBOX'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(2, count($res['data']['messages'] ?? []), 'search with folder filter works');
+
+    $res = apiRequest('search', ['query' => 'report AND lunch'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['ok'] ?? null, 'search special chars do not cause 500');
+
+    $res = apiRequest('search', ['query' => '"test" OR *'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['ok'] ?? null, 'search quotes and wildcards do not cause 500');
+
+    $res = apiRequest('search', ['query' => 'report', 'limit' => 1], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(1, count($res['data']['messages'] ?? []), 'search respects limit');
+
+    $res = apiRequest('search', ['query' => 'report'], 'POST', ['X-Session-Token' => 'invalid']);
+    assertEquals(false, $res['ok'] ?? null, 'search rejects invalid session');
+}
+
 /* ---------------------------------------------------------------------------
  * MAIN
  * ------------------------------------------------------------------------ */
@@ -1247,5 +1579,12 @@ testCrlfInjectionRejection();
 testLoginRateLimiting();
 testSessionIpBinding();
 testPathContainment();
+testListFolders();
+testListMessages();
+testGetMessage();
+testGetThread();
+testSetFlags();
+testBatchAction();
+testSearch();
 
 summary();

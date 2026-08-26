@@ -24,7 +24,13 @@ The entire application (backend logic, frontend markup, CSS, and JavaScript) liv
 - Rate limiting for login attempts
 - SSRF protection (blocks private/reserved IPs)
 - CRLF injection prevention
-- Full test suite (TDD, 207 assertions)
+- Message listing with cursor-based pagination
+- Full message retrieval with body and attachments
+- Thread view with all messages
+- Flag management (read/starred) and message moves
+- Bulk operations (batch read, star, delete, archive, move)
+- Full-text search (FTS5)
+- Full test suite (TDD, 290 assertions)
 - [TODO] Full-text search (FTS5)
 - [TODO] Multi-account support
 - [TODO] Folder/label management
@@ -260,29 +266,198 @@ Sessions are bound to the IP address that created them and expire after 30 minut
 
 ### Sync
 
-#### [TODO] `list_messages`
+#### `list_folders`
 
-List messages in a folder. Supports pagination and filtering.
+List all folders for the authenticated account, sorted by role priority.
 
-#### [TODO] `get_thread`
+```bash
+curl -s http://localhost:2525/?action=list_folders \
+  -H 'X-Session-Token: abc123...' | jq
+```
 
-Get all messages in a thread.
+**Response:**
 
-#### [TODO] `get_message`
+```json
+{
+  "ok": true,
+  "data": {
+    "folders": [
+      { "id": 1, "name": "INBOX", "role": "inbox", "unread_count": 5, "total_count": 120 },
+      { "id": 2, "name": "Sent", "role": "sent", "unread_count": 0, "total_count": 40 }
+    ]
+  }
+}
+```
 
-Get a single message by ID.
+#### `list_messages`
 
-#### [TODO] `set_flags`
+List messages in a folder with cursor-based pagination.
 
-Mark messages as read/unread, starred/unstarred.
+```bash
+curl -s http://localhost:2525/?action=list_messages \
+  -H 'Content-Type: application/json' \
+  -H 'X-Session-Token: abc123...' \
+  -d '{"folder": "INBOX", "limit": 20}' | jq
+```
 
-#### [TODO] `batch_action`
+**Parameters:**
 
-Move, delete, or archive multiple messages.
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `folder` | string | yes | Folder name (e.g., `INBOX`) |
+| `limit` | int | no | Max messages per page (1-100, default 50) |
+| `cursor` | string | no | Pagination cursor from previous response |
 
-#### [TODO] `search`
+**Response:**
 
-Full-text search across all messages.
+```json
+{
+  "ok": true,
+  "data": {
+    "messages": [
+      { "id": 1, "uid": 42, "subject": "Hi", "from_address": "a@b.com",
+        "from_name": "Alice", "to_addresses": ["x@y.com"], "date": "2026-08-26T10:00:00Z",
+        "is_read": 0, "is_starred": 0, "has_attachments": 1, "thread_id": 5,
+        "preview": "Hey, check this out..." }
+    ],
+    "has_more": true,
+    "next_cursor": "2026-08-25T09:00:00Z|38"
+  }
+}
+```
+
+#### `get_message`
+
+Get a single message with full body and attachments.
+
+```bash
+curl -s http://localhost:2525/?action=get_message \
+  -H 'Content-Type: application/json' \
+  -H 'X-Session-Token: abc123...' \
+  -d '{"message_id": 1}' | jq
+```
+
+**Parameters:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `message_id` | int | yes | Message database ID |
+
+**Response:**
+
+```json
+{
+  "ok": true,
+  "data": {
+    "message": {
+      "id": 1, "subject": "Hello", "from_address": "a@b.com",
+      "text_body": "Plain text...", "html_body": "<p>HTML...</p>",
+      "to_addresses": ["x@y.com"], "cc_addresses": ["z@w.com"],
+      "is_read": 1, "is_starred": 0, "has_attachments": 1
+    },
+    "attachments": [
+      { "id": 1, "filename": "report.pdf", "content_type": "application/pdf", "size": 32000 }
+    ]
+  }
+}
+```
+
+#### `get_thread`
+
+Get thread metadata and all messages in the thread, ordered by date.
+
+```bash
+curl -s http://localhost:2525/?action=get_thread \
+  -H 'Content-Type: application/json' \
+  -H 'X-Session-Token: abc123...' \
+  -d '{"thread_id": 5}' | jq
+```
+
+**Parameters:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `thread_id` | int | yes | Thread database ID |
+
+**Response:**
+
+```json
+{
+  "ok": true,
+  "data": {
+    "thread": { "id": 5, "subject": "Hello", "message_count": 3, "preview": "...", "is_read": 0, "is_starred": 1, "last_message_at": "2026-08-26T10:00:00Z" },
+    "messages": [
+      { "id": 1, "date": "2026-08-25T08:00:00Z", "from_address": "a@b.com", "text_body": "...", "to_addresses": ["x@y.com"], "cc_addresses": [] }
+    ]
+  }
+}
+```
+
+#### `set_flags`
+
+Update message flags (read/starred) or move to a different folder.
+
+```bash
+curl -s http://localhost:2525/?action=set_flags \
+  -H 'Content-Type: application/json' \
+  -H 'X-Session-Token: abc123...' \
+  -d '{"message_id": 1, "is_read": 1, "is_starred": 1}' | jq
+```
+
+**Parameters:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `message_id` | int | yes | Message database ID |
+| `is_read` | int | no | 0 or 1 |
+| `is_starred` | int | no | 0 or 1 |
+| `folder_name` | string | no | Move to this folder (requires IMAP) |
+
+#### `batch_action`
+
+Bulk operations on multiple messages.
+
+```bash
+curl -s http://localhost:2525/?action=batch_action \
+  -H 'Content-Type: application/json' \
+  -H 'X-Session-Token: abc123...' \
+  -d '{"message_ids": [1, 2, 3], "action": "read"}' | jq
+```
+
+**Parameters:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `message_ids` | int[] | yes | Array of message IDs (max 200) |
+| `action` | string | yes | `read`, `unread`, `star`, `unstar`, `delete`, `archive`, `move` |
+| `folder_name` | string | if action=move | Destination folder name |
+
+**Response:**
+
+```json
+{ "ok": true, "data": { "affected": 3 } }
+```
+
+#### `search`
+
+Full-text search across messages using FTS5.
+
+```bash
+curl -s http://localhost:2525/?action=search \
+  -H 'Content-Type: application/json' \
+  -H 'X-Session-Token: abc123...' \
+  -d '{"query": "quarterly report"}' | jq
+```
+
+**Parameters:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `query` | string | yes | Search terms |
+| `folder` | string | no | Limit to folder |
+| `limit` | int | no | Max results (1-100, default 50) |
+
+**Response:** Same shape as `list_messages` (without `has_more`/`next_cursor`).
 
 ### Accounts
 
