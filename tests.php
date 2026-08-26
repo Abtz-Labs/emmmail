@@ -19,6 +19,7 @@ putenv('EMMMAIL_DB=' . $GLOBALS['TEST_DB_PATH']);
 putenv('EMMMAIL_KEY=' . $GLOBALS['TEST_KEY']);
 putenv('EMMMAIL_ATTACHMENTS=' . $GLOBALS['TEST_ATTACH_DIR']);
 putenv('EMMMAIL_DEBUG=1');
+putenv('EMMMAIL_DISABLE_SSRF_CHECK=1');
 
 ob_start();
 require $GLOBALS['INDEX_PHP'];
@@ -150,6 +151,7 @@ function runInSubprocess(string $body): string
         . 'putenv(' . var_export('EMMMAIL_KEY=' . $GLOBALS['TEST_KEY'], true) . ');' . "\n"
         . 'putenv(' . var_export('EMMMAIL_ATTACHMENTS=' . $GLOBALS['TEST_ATTACH_DIR'], true) . ');' . "\n"
         . 'putenv(' . var_export('EMMMAIL_DEBUG=1', true) . ');' . "\n"
+        . 'putenv(' . var_export('EMMMAIL_DISABLE_SSRF_CHECK=1', true) . ');' . "\n"
         . "ob_start();\n"
         . 'require ' . var_export($GLOBALS['INDEX_PHP'], true) . ";\n"
         . "ob_end_clean();\n"
@@ -821,6 +823,49 @@ PHP;
     assertTest(strpos($out, 'NOT_BLOCKED') !== false, 'rate limit window expiry');
 }
 
+function testSsrfProtection(): void
+{
+    group('SSRF Protection');
+
+    $code = <<<'PHP'
+putenv('EMMMAIL_DISABLE_SSRF_CHECK=');
+echo json_encode([
+    "google" => isSafeHost("imap.gmail.com"),
+    "migadu" => isSafeHost("imap.migadu.com"),
+    "localhost" => isSafeHost("localhost"),
+    "loopback" => isSafeHost("127.0.0.1"),
+    "private10" => isSafeHost("10.0.0.1"),
+    "private172" => isSafeHost("172.16.0.1"),
+    "private192" => isSafeHost("192.168.1.1"),
+    "metadata" => isSafeHost("169.254.169.254"),
+    "zero" => isSafeHost("0.0.0.0"),
+    "multicast" => isSafeHost("224.0.0.1"),
+    "broadcast" => isSafeHost("255.255.255.255"),
+    "ipv6_loopback" => isSafeHost("::1"),
+    "ipv6_linklocal" => isSafeHost("fe80::1"),
+    "empty" => isSafeHost(""),
+]);
+PHP;
+    $out = runInSubprocess($code);
+    $result = json_decode($out, true);
+    assertTest($result !== null, 'SSRF test produced valid JSON');
+
+    assertEquals(true, $result['google'] ?? null, 'isSafeHost allows imap.gmail.com');
+    assertEquals(true, $result['migadu'] ?? null, 'isSafeHost allows imap.migadu.com');
+    assertEquals(false, $result['localhost'] ?? null, 'isSafeHost blocks localhost');
+    assertEquals(false, $result['loopback'] ?? null, 'isSafeHost blocks 127.0.0.1');
+    assertEquals(false, $result['private10'] ?? null, 'isSafeHost blocks 10.x.x.x');
+    assertEquals(false, $result['private172'] ?? null, 'isSafeHost blocks 172.16-31.x.x');
+    assertEquals(false, $result['private192'] ?? null, 'isSafeHost blocks 192.168.x.x');
+    assertEquals(false, $result['metadata'] ?? null, 'isSafeHost blocks 169.254.169.254');
+    assertEquals(false, $result['zero'] ?? null, 'isSafeHost blocks 0.0.0.0');
+    assertEquals(false, $result['multicast'] ?? null, 'isSafeHost blocks 224.x.x.x');
+    assertEquals(false, $result['broadcast'] ?? null, 'isSafeHost blocks 255.255.255.255');
+    assertEquals(false, $result['ipv6_loopback'] ?? null, 'isSafeHost blocks ::1');
+    assertEquals(false, $result['ipv6_linklocal'] ?? null, 'isSafeHost blocks fe80::');
+    assertEquals(false, $result['empty'] ?? null, 'isSafeHost blocks empty string');
+}
+
 function testComposeEndpoint(): void
 {
     group('Compose Endpoint');
@@ -1073,6 +1118,7 @@ testDateNormalization();
 testSubjectNormalization();
 testBlockedAttachments();
 testRateLimiting();
+testSsrfProtection();
 testSyncEndpoint();
 testSyncEndpointReal();
 testComposeEndpoint();

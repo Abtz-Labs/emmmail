@@ -303,6 +303,7 @@ final class ImapClient
 
     public function __construct(string $host, int $port, int $tlsMode, string $user, string $pass, int $timeout = 10)
     {
+        validateHost($host);
         $this->host = $host;
         $this->port = $port;
         $this->tlsMode = TlsMode::tryFrom($tlsMode)?->value ?? TlsMode::Ssl->value;
@@ -749,6 +750,7 @@ final class SmtpClient
 
     public function __construct(string $host, int $port, int $tlsMode, string $user, string $pass, int $timeout = 10)
     {
+        validateHost($host);
         $this->host = $host;
         $this->port = $port;
         $this->tlsMode = TlsMode::tryFrom($tlsMode)?->value ?? TlsMode::StartTls->value;
@@ -962,6 +964,58 @@ function getInput(): array
 function getClientIp(): string
 {
     return $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
+}
+
+function isSafeHost(string $host): bool
+{
+    if (getenv('EMMMAIL_DISABLE_SSRF_CHECK') === '1') return true;
+
+    $host = trim($host);
+    if ($host === '') return false;
+
+    $ip = @inet_pton($host);
+    if ($ip === false) {
+        $resolved = @gethostbyname($host);
+        if ($resolved === $host) return false;
+        $ip = @inet_pton($resolved);
+        if ($ip === false) return false;
+    }
+
+    $unpacked = @unpack('n*', $ip);
+    if ($unpacked === false) return false;
+
+    if (strlen($ip) === 4) {
+        $a = $unpacked[1] >> 8;
+        $b = $unpacked[1] & 0xFF;
+        if ($a === 10) return false;
+        if ($a === 172 && $b >= 16 && $b <= 31) return false;
+        if ($a === 192 && $b === 168) return false;
+        if ($a === 127) return false;
+        if ($a === 0) return false;
+        if ($a === 169 && $b === 254) return false;
+        if ($a >= 224) return false;
+    }
+
+    if (strlen($ip) === 16) {
+        $firstWord = $unpacked[1];
+        $allZero = true;
+        for ($i = 2; $i <= 7; $i++) {
+            if ($unpacked[$i] !== 0) { $allZero = false; break; }
+        }
+        if ($firstWord === 0 && $allZero && $unpacked[8] === 1) return false;
+        if (($firstWord & 0xFE00) === 0xFC00) return false;
+        if (($firstWord & 0xFFC0) === 0xFE80) return false;
+        if ($firstWord === 0x2001 && $unpacked[2] === 0x0000) return false;
+    }
+
+    return true;
+}
+
+function validateHost(string $host): void
+{
+    if (!isSafeHost($host)) {
+        fail("Connection to host not allowed: {$host}");
+    }
 }
 
 function escapeHtml(?string $s): string
