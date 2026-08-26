@@ -195,6 +195,19 @@ CREATE TABLE IF NOT EXISTS drafts (
     updated_at TEXT DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_drafts_account ON drafts(account_id);
+
+CREATE TABLE IF NOT EXISTS attachments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    filename TEXT NOT NULL,
+    content_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+    size INTEGER NOT NULL DEFAULT 0,
+    file_path TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);
+CREATE INDEX IF NOT EXISTS idx_attachments_account ON attachments(account_id);
 SQL;
 
 function initDatabase(PDO $pdo): void
@@ -1488,7 +1501,32 @@ function storeMessage(PDO $pdo, int $accountId, string $folderName, int $uid, ar
 
     $pdo->prepare('INSERT INTO messages (account_id, folder_name, uid, message_id, in_reply_to, refs, subject, from_address, from_name, to_addresses, cc_addresses, date, text_body, html_body, is_read, is_starred, has_attachments, raw_headers) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
         ->execute([$accountId, $folderName, $uid, $messageId, $inReplyTo, $refs, $subject, $fromAddress, $fromName, $toAddresses, $ccAddresses, $date, $parsed['text_body'] ?? '', $parsed['html_body'] ?? '', $isRead, $isStarred, $hasAttachments, $rawHeaders]);
-    return (int) $pdo->lastInsertId();
+    $msgId = (int) $pdo->lastInsertId();
+
+    storeAttachments($pdo, $msgId, $accountId, $parsed['attachments'] ?? []);
+
+    return $msgId;
+}
+
+function storeAttachments(PDO $pdo, int $messageId, int $accountId, array $attachments): void
+{
+    if (empty($attachments)) return;
+
+    $dir = EMMMAIL_ATTACH_DIR . '/' . $accountId . '/' . $messageId;
+    if (!is_dir($dir)) @mkdir($dir, 0755, true);
+
+    foreach ($attachments as $att) {
+        $filename = sanitizeFilename($att['filename'] ?? 'attachment');
+        $contentType = $att['content_type'] ?? 'application/octet-stream';
+        $data = $att['data'] ?? '';
+        $size = strlen($data);
+
+        $filePath = $dir . '/' . $filename;
+        @file_put_contents($filePath, $data);
+
+        $pdo->prepare('INSERT INTO attachments (message_id, account_id, filename, content_type, size, file_path) VALUES (?, ?, ?, ?, ?, ?)')
+            ->execute([$messageId, $accountId, $filename, $contentType, $size, $filePath]);
+    }
 }
 
 function updateThreadAggregates(PDO $pdo, int $threadId): void
@@ -1963,6 +2001,47 @@ function actionDeleteDraft(): void
     ]);
 }
 
+function actionDownloadAttachment(): void
+{
+    $input = getInput();
+    $attachmentId = (int) ($input['attachment_id'] ?? 0);
+    if ($attachmentId <= 0) fail('Missing required field: attachment_id');
+
+    $pdo = db();
+    $att = fetchOne($pdo, 'SELECT * FROM attachments WHERE id = ?', [$attachmentId]);
+    if (!$att) fail('Attachment not found.');
+
+    $filePath = $att['file_path'];
+    if (!is_file($filePath)) fail('Attachment file not found on disk.');
+
+    $filename = $att['filename'];
+    $contentType = $att['content_type'];
+    $size = (int) $att['size'];
+
+    header('Content-Type: ' . $contentType);
+    header('Content-Length: ' . $size);
+    header('Content-Disposition: attachment; filename="' . $filename . '"');
+    header('X-Content-Type-Options: nosniff');
+    header('Cache-Control: no-store');
+    readfile($filePath);
+    exit;
+}
+
+function actionMessageAttachments(): void
+{
+    $input = getInput();
+    $messageId = (int) ($input['message_id'] ?? 0);
+    if ($messageId <= 0) fail('Missing required field: message_id');
+
+    $pdo = db();
+    $attachments = fetchAll($pdo, 'SELECT id, filename, content_type, size FROM attachments WHERE message_id = ? ORDER BY id', [$messageId]);
+
+    jsonResponse([
+        'ok' => true,
+        'data' => ['attachments' => $attachments],
+    ]);
+}
+
 /* ---------------------------------------------------------------------------
  * Front Controller
  * ------------------------------------------------------------------------ */
@@ -1992,6 +2071,12 @@ function handleRequest(): void
             break;
         case 'delete_draft':
             actionDeleteDraft();
+            break;
+        case 'download_attachment':
+            actionDownloadAttachment();
+            break;
+        case 'message_attachments':
+            actionMessageAttachments();
             break;
         default:
             fail('Unknown action: ' . ($action ?: '(none)'));

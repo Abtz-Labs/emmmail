@@ -904,6 +904,68 @@ function testDraftEndpointReal(): void
     assertEquals(true, $res['ok'] ?? null, 'delete draft ok');
 }
 
+function testAttachmentEndpoint(): void
+{
+    group('Attachment Endpoint');
+
+    $res = apiRequest('message_attachments', []);
+    assertEquals(false, $res['ok'] ?? null, 'message_attachments returns ok:false for empty payload');
+
+    $res = apiRequest('message_attachments', ['message_id' => 99999]);
+    assertEquals(true, $res['ok'] ?? null, 'message_attachments returns ok:true for nonexistent message');
+    assertTest(count($res['data']['attachments'] ?? []) === 0, 'nonexistent message has no attachments');
+
+    $res = apiRequest('download_attachment', []);
+    assertEquals(false, $res['ok'] ?? null, 'download_attachment returns ok:false for empty payload');
+
+    $res = apiRequest('download_attachment', ['attachment_id' => 99999]);
+    assertEquals(false, $res['ok'] ?? null, 'download_attachment returns ok:false for nonexistent attachment');
+}
+
+function testAttachmentStorage(): void
+{
+    group('Attachment Storage');
+
+    withDbGroup(function (PDO $pdo) {
+        $email = 'att' . uniqid() . '@test.com';
+        $enc = encryptPassword('pw', getEncryptionKey());
+        $pdo->prepare('INSERT INTO accounts (email, display_name, imap_host, imap_port, imap_tls, smtp_host, smtp_port, smtp_tls, password_encrypted, password_iv, password_tag) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+            ->execute([$email, 'Att Test', 'imap.test.com', 993, 1, 'smtp.test.com', 587, 2, $enc['encrypted'], $enc['iv'], $enc['tag']]);
+        $accountId = (int) $pdo->lastInsertId();
+
+        $pdo->prepare('INSERT INTO messages (account_id, folder_name, uid, subject, from_address, to_addresses, text_body, is_read) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+            ->execute([$accountId, 'INBOX', 1, 'Test', 'from@test.com', json_encode([['email' => 'to@test.com']]), 'Body', 1]);
+        $messageId = (int) $pdo->lastInsertId();
+
+        $attId = storeTestAttachment($pdo, $messageId, $accountId);
+
+        $att = fetchOne($pdo, 'SELECT * FROM attachments WHERE id = ?', [$attId]);
+        assertTest($att !== null, 'attachment stored in database');
+        assertEquals('test.txt', $att['filename'] ?? '', 'attachment filename');
+        assertEquals('text/plain', $att['content_type'] ?? '', 'attachment content type');
+        assertTest((int) ($att['size'] ?? 0) > 0, 'attachment size > 0');
+        assertTest(is_file($att['file_path'] ?? ''), 'attachment file exists on disk');
+
+        $content = @file_get_contents($att['file_path']);
+        assertTest(str_contains($content, 'Hello World'), 'attachment content matches');
+    });
+}
+
+function storeTestAttachment(PDO $pdo, int $messageId, int $accountId): int
+{
+    $dir = EMMMAIL_ATTACH_DIR . '/' . $accountId . '/' . $messageId;
+    if (!is_dir($dir)) @mkdir($dir, 0755, true);
+
+    $filename = 'test.txt';
+    $content = 'Hello World';
+    $filePath = $dir . '/' . $filename;
+    @file_put_contents($filePath, $content);
+
+    $pdo->prepare('INSERT INTO attachments (message_id, account_id, filename, content_type, size, file_path) VALUES (?, ?, ?, ?, ?, ?)')
+        ->execute([$messageId, $accountId, $filename, 'text/plain', strlen($content), $filePath]);
+    return (int) $pdo->lastInsertId();
+}
+
 /* ---------------------------------------------------------------------------
  * MAIN
  * ------------------------------------------------------------------------ */
@@ -932,5 +994,7 @@ testSyncEndpoint();
 testSyncEndpointReal();
 testComposeEndpoint();
 testDraftEndpointReal();
+testAttachmentEndpoint();
+testAttachmentStorage();
 
 summary();

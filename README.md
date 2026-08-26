@@ -13,16 +13,19 @@ The entire application (backend logic, frontend markup, CSS, and JavaScript) liv
 ## Features
 
 - Pure PHP IMAP and SMTP clients (no ext-imap dependency)
-- IMAP-only login (credentials validated against the mail server)
+- IMAP/SMTP login (credentials validated against the mail server)
 - AES-256-GCM password encryption (key stored in `.env`)
 - Thread grouping by subject
-- Full-text search (FTS5)
-- [TODO] Compose, reply, forward
+- Compose and send emails via SMTP
+- Draft management (save, list, update, delete)
+- Attachment storage and download
+- Provider presets (Gmail, Yahoo, Outlook, Migadu, iCloud)
+- Rate limiting for login attempts
+- Full test suite (TDD)
+- [TODO] Full-text search (FTS5)
 - [TODO] Multi-account support
 - [TODO] Folder/label management
-- [TODO] Attachments (upload, download)
 - [TODO] Contacts with autocomplete
-- [TODO] Drafts and outbox with scheduled send
 - [TODO] Keyboard shortcuts
 - [TODO] Dark/light theme
 - [TODO] Mobile-first responsive design
@@ -173,23 +176,7 @@ Response (failure):
 | `smtp_port` | int | if no preset | SMTP port (usually 465 for SSL, 587 for STARTTLS) |
 | `smtp_tls` | int | if no preset | TLS mode: `0` = none, `1` = SSL, `2` = STARTTLS |
 
-#### [TODO] `auth_status`
-
-Check if the user is currently authenticated.
-
-#### [TODO] `login`
-
-Login with email and password (validates against IMAP).
-
-#### [TODO] `setup`
-
-First-time setup — create the initial account.
-
-#### [TODO] `logout`
-
-End the current session.
-
-### Messages
+### Sync
 
 #### [TODO] `list_messages`
 
@@ -237,28 +224,6 @@ Auto-detect IMAP/SMTP servers from an email address (via MX lookup and provider 
 
 Test IMAP/SMTP connectivity without saving.
 
-### Drafts & Outbox
-
-#### [TODO] `save_draft`
-
-Save a message draft.
-
-#### [TODO] `list_drafts`
-
-List all drafts.
-
-#### [TODO] `delete_draft`
-
-Delete a draft.
-
-#### [TODO] `schedule_send`
-
-Schedule a message for delayed sending (with undo window).
-
-#### [TODO] `cancel_send`
-
-Cancel a scheduled message.
-
 ### Contacts & Tags
 
 #### [TODO] `list_contacts`
@@ -293,9 +258,223 @@ Update email signature.
 
 ### Sync
 
-#### [TODO] `sync_account`
+#### `sync`
 
-Trigger a manual sync for an account.
+Trigger a manual sync for an account. Fetches folders and messages from IMAP.
+
+```bash
+curl -s http://localhost:2525/?action=sync \
+  -H 'Content-Type: application/json' \
+  -d '{"account_id": 1}' | jq
+```
+
+**Parameters:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `account_id` | int | no | Account ID. If omitted, syncs the first account. |
+| `folder` | string | no | Sync only this folder (e.g., `INBOX`). |
+| `since` | string | no | Only fetch messages since this date (ISO 8601). |
+
+**Response:**
+
+```json
+{
+  "ok": true,
+  "data": {
+    "account_id": 1,
+    "folders_synced": 5,
+    "messages_synced": 142,
+    "last_sync_at": "2026-08-26T12:00:00Z"
+  }
+}
+```
+
+### Compose
+
+#### `compose`
+
+Send an email or save as draft.
+
+**Send immediately:**
+
+```bash
+curl -s http://localhost:2525/?action=compose \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "account_id": 1,
+    "to": ["recipient@example.com"],
+    "subject": "Hello",
+    "body": "This is a test email."
+  }' | jq
+```
+
+**Save as draft:**
+
+```bash
+curl -s http://localhost:2525/?action=compose \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "account_id": 1,
+    "to": ["recipient@example.com"],
+    "subject": "Hello",
+    "body": "This is a draft.",
+    "draft": true
+  }' | jq
+```
+
+**Parameters:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `account_id` | int | yes | Account ID to send from |
+| `to` | array | yes | Recipient email addresses |
+| `cc` | array | no | CC recipients |
+| `bcc` | array | no | BCC recipients |
+| `subject` | string | yes* | Email subject (*required if body is empty) |
+| `body` | string | yes* | Plain text body (*required if subject is empty) |
+| `body_html` | string | no | HTML body (optional, sent as multipart) |
+| `attachments` | array | no | Array of `{filename, content_type, content}` (base64 encoded) |
+| `in_reply_to` | string | no | Message ID this is replying to |
+| `draft` | bool | no | If `true`, save as draft instead of sending |
+
+**Response (sent):**
+
+```json
+{
+  "ok": true,
+  "data": {
+    "sent": true,
+    "to": ["recipient@example.com"],
+    "cc": [],
+    "bcc": [],
+    "subject": "Hello"
+  }
+}
+```
+
+**Response (draft saved):**
+
+```json
+{
+  "ok": true,
+  "data": {
+    "draft_id": 1,
+    "saved": true
+  }
+}
+```
+
+### Drafts
+
+#### `drafts`
+
+List all drafts for an account.
+
+```bash
+curl -s http://localhost:2525/?action=drafts \
+  -H 'Content-Type: application/json' \
+  -d '{"account_id": 1}' | jq
+```
+
+**Response:**
+
+```json
+{
+  "ok": true,
+  "data": {
+    "drafts": [
+      {
+        "id": 1,
+        "to_addresses": ["recipient@example.com"],
+        "cc_addresses": [],
+        "subject": "Hello",
+        "body": "This is a draft.",
+        "body_html": null,
+        "in_reply_to": null,
+        "created_at": "2026-08-26 12:00:00",
+        "updated_at": "2026-08-26 12:00:00"
+      }
+    ]
+  }
+}
+```
+
+#### `draft`
+
+Get a single draft by ID.
+
+```bash
+curl -s http://localhost:2525/?action=draft \
+  -H 'Content-Type: application/json' \
+  -d '{"draft_id": 1}' | jq
+```
+
+#### `update_draft`
+
+Update draft fields.
+
+```bash
+curl -s http://localhost:2525/?action=update_draft \
+  -H 'Content-Type: application/json' \
+  -d '{"draft_id": 1, "subject": "Updated Subject", "body": "Updated body."}' | jq
+```
+
+**Updatable fields:** `to_addresses`, `cc_addresses`, `bcc_addresses`, `subject`, `body`, `body_html`, `attachments`, `in_reply_to`
+
+#### `delete_draft`
+
+Delete a draft.
+
+```bash
+curl -s http://localhost:2525/?action=delete_draft \
+  -H 'Content-Type: application/json' \
+  -d '{"draft_id": 1}' | jq
+```
+
+### Attachments
+
+#### `message_attachments`
+
+List all attachments for a message.
+
+```bash
+curl -s http://localhost:2525/?action=message_attachments \
+  -H 'Content-Type: application/json' \
+  -d '{"message_id": 1}' | jq
+```
+
+**Response:**
+
+```json
+{
+  "ok": true,
+  "data": {
+    "attachments": [
+      {
+        "id": 1,
+        "filename": "document.pdf",
+        "content_type": "application/pdf",
+        "size": 1024
+      }
+    ]
+  }
+}
+```
+
+#### `download_attachment`
+
+Download an attachment file.
+
+```bash
+# Direct download
+curl -O -J 'http://localhost:2525/?action=download_attachment&attachment_id=1'
+
+# Or via POST
+curl -s http://localhost:2525/?action=download_attachment \
+  -H 'Content-Type: application/json' \
+  -d '{"attachment_id": 1}' --output document.pdf
+```
 
 ## User Manual
 
