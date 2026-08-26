@@ -20,8 +20,11 @@ The entire application (backend logic, frontend markup, CSS, and JavaScript) liv
 - Draft management (save, list, update, delete)
 - Attachment storage and download
 - Provider presets (Gmail, Yahoo, Outlook, Migadu, iCloud)
+- Session-based authentication with IP binding
 - Rate limiting for login attempts
-- Full test suite (TDD)
+- SSRF protection (blocks private/reserved IPs)
+- CRLF injection prevention
+- Full test suite (TDD, 207 assertions)
 - [TODO] Full-text search (FTS5)
 - [TODO] Multi-account support
 - [TODO] Folder/label management
@@ -175,6 +178,85 @@ Response (failure):
 | `smtp_host` | string | if no preset | SMTP server hostname |
 | `smtp_port` | int | if no preset | SMTP port (usually 465 for SSL, 587 for STARTTLS) |
 | `smtp_tls` | int | if no preset | TLS mode: `0` = none, `1` = SSL, `2` = STARTTLS |
+
+#### `login`
+
+Authenticate with email and password. Returns a session token.
+
+```bash
+curl -s http://localhost:2525/?action=login \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "email": "you@example.com",
+    "password": "your-password"
+  }' | jq
+```
+
+**Response:**
+
+```json
+{
+  "ok": true,
+  "data": {
+    "session_token": "abc123...",
+    "account_id": 1,
+    "email": "you@example.com",
+    "display_name": "Your Name"
+  }
+}
+```
+
+#### `logout`
+
+Destroy the current session.
+
+```bash
+curl -s http://localhost:2525/?action=logout \
+  -H 'X-Session-Token: abc123...' | jq
+```
+
+#### `session`
+
+Check if the current session is authenticated.
+
+```bash
+curl -s http://localhost:2525/?action=session \
+  -H 'X-Session-Token: abc123...' | jq
+```
+
+**Response (authenticated):**
+
+```json
+{
+  "ok": true,
+  "data": {
+    "authenticated": true,
+    "account_id": 1,
+    "email": "you@example.com",
+    "display_name": "Your Name"
+  }
+}
+```
+
+**Response (not authenticated):**
+
+```json
+{
+  "ok": true,
+  "data": {
+    "authenticated": false
+  }
+}
+```
+
+### Session Management
+
+All endpoints except `auth`, `login`, and `session` require a valid session token. The token can be provided via:
+
+1. `X-Session-Token` header (recommended)
+2. `EMMMAILSESSID` cookie
+
+Sessions are bound to the IP address that created them and expire after 30 minutes of inactivity or 24 hours absolute.
 
 ### Sync
 

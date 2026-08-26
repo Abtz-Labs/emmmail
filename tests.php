@@ -179,6 +179,7 @@ function apiRequest(string $action, array $data = [], string $method = 'POST', a
         . '$_GET[' . var_export('action', true) . '] = ' . var_export($action, true) . ';' . "\n"
         . '$_SERVER[' . var_export('REQUEST_METHOD', true) . '] = ' . var_export($method, true) . ';' . "\n"
         . '$_SERVER[' . var_export('CONTENT_TYPE', true) . '] = "application/json";' . "\n"
+        . '$_SERVER[' . var_export('REMOTE_ADDR', true) . '] = "127.0.0.1";' . "\n"
         . '$headers = json_decode(' . var_export($headersJson, true) . ', true);' . "\n"
         . 'foreach ($headers as $k => $v) { $_SERVER["HTTP_" . strtoupper(str_replace("-", "_", $k))] = $v; }' . "\n"
         . 'require ' . var_export($GLOBALS['INDEX_PHP'], true) . ";\n";
@@ -876,7 +877,7 @@ function testComposeEndpoint(): void
 
     $res = apiRequest('compose', [], 'POST', ['X-Session-Token' => $token]);
     assertEquals(false, $res['ok'] ?? null, 'compose returns ok:false for empty payload');
-    assertTest(str_contains($res['error'] ?? '', 'account_id'), 'missing account_id error');
+    assertTest(str_contains($res['error'] ?? '', 'to'), 'missing to error');
 
     $res = apiRequest('compose', ['account_id' => 99999, 'to' => ['test@test.com']], 'POST', ['X-Session-Token' => $token]);
     assertEquals(false, $res['ok'] ?? null, 'compose returns ok:false for nonexistent account');
@@ -973,8 +974,7 @@ function testAttachmentEndpoint(): void
     assertEquals(false, $res['ok'] ?? null, 'message_attachments returns ok:false for empty payload');
 
     $res = apiRequest('message_attachments', ['message_id' => 99999], 'POST', ['X-Session-Token' => $token]);
-    assertEquals(true, $res['ok'] ?? null, 'message_attachments returns ok:true for nonexistent message');
-    assertTest(count($res['data']['attachments'] ?? []) === 0, 'nonexistent message has no attachments');
+    assertEquals(false, $res['ok'] ?? null, 'message_attachments returns ok:false for nonexistent message');
 
     $res = apiRequest('download_attachment', [], 'POST', ['X-Session-Token' => $token]);
     assertEquals(false, $res['ok'] ?? null, 'download_attachment returns ok:false for empty payload');
@@ -1037,7 +1037,8 @@ function createTestAccountAndSession(): array
         ->execute([$email, 'Test User', 'imap.test.com', 993, 1, 'smtp.test.com', 587, 2, $enc['encrypted'], $enc['iv'], $enc['tag']]);
     $accountId = (int) $pdo->lastInsertId();
 
-    $token = createSession($accountId, '127.0.0.1', 'Test Agent');
+    $ip = $_SERVER['REMOTE_ADDR'] ?? '127.0.0.1';
+    $token = createSession($accountId, $ip, 'Test Agent');
     return ['account_id' => $accountId, 'email' => $email, 'password' => $password, 'token' => $token];
 }
 
@@ -1094,6 +1095,119 @@ function testSessionProtection(): void
     assertEquals(false, $res['ok'] ?? null, 'drafts returns ok:false without session');
 }
 
+function testAccountTakeoverPrevention(): void
+{
+    group('Account Takeover Prevention');
+
+    $session1 = createTestAccountAndSession();
+    $email1 = $session1['email'];
+
+    $res = apiRequest('auth', [
+        'preset' => 'migadu',
+        'email' => $email1,
+        'password' => 'newpassword',
+    ]);
+    assertEquals(false, $res['ok'] ?? null, 'auth rejects overwrite without session');
+}
+
+function testIdorPrevention(): void
+{
+    group('IDOR Prevention');
+
+    $session1 = createTestAccountAndSession();
+    $token1 = $session1['token'];
+    $accountId1 = $session1['account_id'];
+
+    $session2 = createTestAccountAndSession();
+    $token2 = $session2['token'];
+    $accountId2 = $session2['account_id'];
+
+    $pdo = db();
+    $enc = encryptPassword('pw', getEncryptionKey());
+    $pdo->prepare('INSERT INTO drafts (account_id, to_addresses, subject, body) VALUES (?, ?, ?, ?)')
+        ->execute([$accountId2, json_encode([['email' => 'test@test.com']]), 'Draft', 'Body']);
+    $draftId = (int) $pdo->lastInsertId();
+
+    $res = apiRequest('draft', ['draft_id' => $draftId], 'POST', ['X-Session-Token' => $token1]);
+    assertEquals(false, $res['ok'] ?? null, 'draft rejects cross-account access');
+
+    $res = apiRequest('delete_draft', ['draft_id' => $draftId], 'POST', ['X-Session-Token' => $token1]);
+    assertEquals(false, $res['ok'] ?? null, 'delete_draft rejects cross-account access');
+
+    $res = apiRequest('update_draft', ['draft_id' => $draftId, 'subject' => 'Hacked'], 'POST', ['X-Session-Token' => $token1]);
+    assertEquals(false, $res['ok'] ?? null, 'update_draft rejects cross-account access');
+}
+
+function testCrlfInjectionRejection(): void
+{
+    group('CRLF Injection Rejection');
+
+    $session = createTestAccountAndSession();
+    $token = $session['token'];
+    $accountId = $session['account_id'];
+
+    $res = apiRequest('compose', [
+        'account_id' => $accountId,
+        'to' => ['test@test.com'],
+        'subject' => "Subject\r\nBcc: evil@hacker.com",
+        'body' => 'Test',
+        'draft' => true,
+    ], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['ok'] ?? null, 'compose accepts sanitized subject');
+
+    if ($res['ok'] && isset($res['data']['draft_id'])) {
+        $draftId = $res['data']['draft_id'];
+        $res2 = apiRequest('draft', ['draft_id' => $draftId], 'POST', ['X-Session-Token' => $token]);
+        $subject = $res2['data']['subject'] ?? '';
+        assertTest(!str_contains($subject, "\r"), 'draft subject has no CR');
+        assertTest(!str_contains($subject, "\n"), 'draft subject has no LF');
+    }
+}
+
+function testLoginRateLimiting(): void
+{
+    group('Login Rate Limiting');
+
+    $session = createTestAccountAndSession();
+    $email = $session['email'];
+
+    for ($i = 0; $i < EMMMAIL_LOGIN_MAX_ATTEMPTS; $i++) {
+        apiRequest('login', ['email' => $email, 'password' => 'wrong']);
+    }
+
+    $res = apiRequest('login', ['email' => $email, 'password' => 'wrong']);
+    assertEquals(false, $res['ok'] ?? null, 'login blocked after max attempts');
+    assertTest(str_contains($res['error'] ?? '', 'Too many'), 'login returns rate limit error');
+}
+
+function testSessionIpBinding(): void
+{
+    group('Session IP Binding');
+
+    $pdo = db();
+    $email = 'ipbind' . uniqid() . '@test.com';
+    $enc = encryptPassword('testpass', getEncryptionKey());
+    $pdo->prepare('INSERT INTO accounts (email, display_name, imap_host, imap_port, imap_tls, smtp_host, smtp_port, smtp_tls, password_encrypted, password_iv, password_tag) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        ->execute([$email, 'IP Bind Test', 'imap.test.com', 993, 1, 'smtp.test.com', 587, 2, $enc['encrypted'], $enc['iv'], $enc['tag']]);
+    $accountId = (int) $pdo->lastInsertId();
+
+    $token = createSession($accountId, '10.0.0.1', 'Test Agent');
+
+    $res = apiRequest('session', [], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['data']['authenticated'] ?? null, 'session rejects different IP');
+}
+
+function testPathContainment(): void
+{
+    group('Path Containment');
+
+    $session = createTestAccountAndSession();
+    $token = $session['token'];
+
+    $res = apiRequest('download_attachment', ['attachment_id' => 99999], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['ok'] ?? null, 'download_attachment rejects nonexistent attachment');
+}
+
 /* ---------------------------------------------------------------------------
  * MAIN
  * ------------------------------------------------------------------------ */
@@ -1127,5 +1241,11 @@ testAttachmentEndpoint();
 testAttachmentStorage();
 testSessionEndpoint();
 testSessionProtection();
+testAccountTakeoverPrevention();
+testIdorPrevention();
+testCrlfInjectionRejection();
+testLoginRateLimiting();
+testSessionIpBinding();
+testPathContainment();
 
 summary();

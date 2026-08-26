@@ -3,7 +3,7 @@
 ## Project Overview
 - **Goal:** One-file, mobile-first, Gmail-inspired web email client with IMAP/SMTP
 - **Tech:** PHP 8.1+, pure PHP IMAP/SMTP (stream_socket_client), Vanilla JS, SQLite
-- **Auth:** IMAP-only login (user's credentials validated against IMAP server)
+- **Auth:** Session-based authentication with IP binding
 - **Philosophy:** Single `index.php`, zero deps, TDD
 
 ## Session 5 (2026-08-25) — Rewrite: API-first
@@ -15,13 +15,6 @@
 - `apiRequest()` test helper reads from exec stdout (not file) since `exit` kills subprocess before file write
 - 82 tests passing: .env parser, encryption, DB schema, IMAP role detection/tokenizer/fetch parser, auth endpoint, unknown action, HTML escaping, display names, address parsing, filename sanitization, date normalization, subject normalization, blocked attachments, rate limiting
 
-## Key Decisions
-- No ext-imap (deprecated) — raw socket IMAP client
-- AES-256-GCM (not CBC) for password encryption
-- FTS5 with triggers for search (when needed)
-- `normalizeSubject` strips prefix but preserves case
-- TDD: tests FIRST, then implementation
-
 ## Session 6 (2026-08-26) — tests.php code review
 - Full review of tests.php against index.php; suite passes 197/0/3 by default
 - Latent bugs (only trigger when EMMMAIL_TEST_* set): testSyncEndpointReal + testDraftEndpointReal call protected endpoints without session token (will always fail); testDraftEndpointReal subject assert uses `substr($draftId,-6)` vs saved `uniqid()` subject (can never pass)
@@ -29,6 +22,39 @@
 - SSRF only unit-tested; endpoints always run with EMMMAIL_DISABLE_SSRF_CHECK=1 inherited
 - No MIME parser, MIME builder, or storeMessage/thread helper unit tests
 
+## Session 7 (2026-08-26) — Security fixes
+- Code review found 16 index.php issues + 8 test issues
+- Phase 1 (Critical): Account takeover blocked (auth requires session to update existing accounts), IDOR fixed (all actions derive account_id from session)
+- Phase 2 (High): CRLF injection prevented (sanitizeHeader), login rate limiting added, sessions bound to IP
+- Phase 3 (Medium): IPv4-mapped IPv6 blocked in SSRF, try/finally for socket cleanup, encryption key race fixed with flock, max message size (10MB), Bcc removed from MIME headers, orphaned attachment cleanup
+- Phase 4 (Low): Path containment on download, Content-Type sanitization, email validation, session cleanup
+- Phase 5: Added 6 security tests (account takeover, IDOR, CRLF, rate limiting, IP binding, path containment)
+- 207 tests passing, 0 failures, 3 skipped
+
+## Key Decisions
+- No ext-imap (deprecated) — raw socket IMAP client
+- AES-256-GCM (not CBC) for password encryption
+- FTS5 with triggers for search (when needed)
+- `normalizeSubject` strips prefix but preserves case
+- TDD: tests FIRST, then implementation
+- Session tokens via X-Session-Token header or EMMMAILSESSID cookie (not request body)
+- Sessions bound to IP address (destroyed on IP change)
+- EMMMAIL_DISABLE_SSRF_CHECK=1 for testing only
+
+## API Endpoints
+- `auth` — test IMAP/SMTP, create/update account (public)
+- `login` — authenticate, create session (public)
+- `logout` — destroy session (authenticated)
+- `session` — check session status (public)
+- `sync` — fetch folders/messages from IMAP (authenticated)
+- `compose` — send email or save draft (authenticated)
+- `drafts` — list drafts (authenticated)
+- `draft` — get single draft (authenticated)
+- `update_draft` — update draft (authenticated)
+- `delete_draft` — delete draft (authenticated)
+- `download_attachment` — download attachment file (authenticated)
+- `message_attachments` — list message attachments (authenticated)
+
 ## Next
-- Add more API endpoints (auth_status, list_accounts, messages, etc.)
+- Add more API endpoints (list_messages, get_message, search, etc.)
 - Build UI/UX

@@ -14,6 +14,7 @@ const EMMMAIL_SESSION_ABSOLUTE = 86400;
 const EMMMAIL_LOGIN_MAX_ATTEMPTS = 5;
 const EMMMAIL_LOGIN_WINDOW = 900;
 const EMMMAIL_IP_MAX_ATTEMPTS = 15;
+const EMMMAIL_MAX_MESSAGE_SIZE = 10485760;
 
 define('EMMMAIL_DB_PATH', (getenv('EMMMAIL_DB') ?: (parseEnvFile(EMMMAIL_ENV_FILE)['EMMMAIL_DB'] ?? EMMMAIL_ROOT . '/emmmail.sqlite')));
 define('EMMMAIL_ATTACH_DIR', (getenv('EMMMAIL_ATTACHMENTS') ?: (parseEnvFile(EMMMAIL_ENV_FILE)['EMMMAIL_ATTACHMENTS'] ?? EMMMAIL_ROOT . '/attachments')));
@@ -59,6 +60,25 @@ function getEncryptionKey(): string
     if (!empty($env['EMMMAIL_KEY'])) {
         putenv('EMMMAIL_KEY=' . $env['EMMMAIL_KEY']);
         return $env['EMMMAIL_KEY'];
+    }
+
+    $fp = @fopen(EMMMAIL_ENV_FILE, 'c');
+    if ($fp) {
+        flock($fp, LOCK_EX);
+        $env = parseEnvFile(EMMMAIL_ENV_FILE);
+        if (!empty($env['EMMMAIL_KEY'])) {
+            flock($fp, LOCK_UN);
+            fclose($fp);
+            putenv('EMMMAIL_KEY=' . $env['EMMMAIL_KEY']);
+            return $env['EMMMAIL_KEY'];
+        }
+        $key = bin2hex(random_bytes(32));
+        fwrite($fp, "EMMMAIL_KEY={$key}\n");
+        flock($fp, LOCK_UN);
+        fclose($fp);
+        @chmod(EMMMAIL_ENV_FILE, 0600);
+        putenv('EMMMAIL_KEY=' . $key);
+        return $key;
     }
 
     $key = bin2hex(random_bytes(32));
@@ -581,6 +601,9 @@ final class ImapClient
 
     private function readRaw(int $n): string
     {
+        if ($n > EMMMAIL_MAX_MESSAGE_SIZE) {
+            throw new RuntimeException('IMAP: message too large (' . $n . ' bytes)');
+        }
         $out = '';
         while (strlen($out) < $n) {
             if ($this->inbuf === '') {
@@ -820,11 +843,13 @@ final class SmtpClient
 
     public function send(string $from, array $to, string $message): void
     {
+        $from = sanitizeHeader($from);
         $res = $this->cmd('MAIL FROM:<' . $from . '>');
         if ($res['code'] !== 250) {
             throw new RuntimeException('SMTP MAIL FROM failed: ' . $res['code']);
         }
         foreach ($to as $addr) {
+            $addr = sanitizeHeader($addr);
             $res = $this->cmd('RCPT TO:<' . $addr . '>');
             if ($res['code'] !== 250 && $res['code'] !== 251) {
                 throw new RuntimeException('SMTP RCPT TO failed: ' . $res['code']);
@@ -1006,6 +1031,18 @@ function isSafeHost(string $host): bool
         if (($firstWord & 0xFE00) === 0xFC00) return false;
         if (($firstWord & 0xFFC0) === 0xFE80) return false;
         if ($firstWord === 0x2001 && $unpacked[2] === 0x0000) return false;
+        if ($firstWord === 0 && $unpacked[2] === 0 && $unpacked[3] === 0 && $unpacked[4] === 0 && $unpacked[5] === 0 && $unpacked[6] === 0xFFFF) {
+            $ipv4 = ($unpacked[7] << 16) | $unpacked[8];
+            $a = ($ipv4 >> 24) & 0xFF;
+            $b = ($ipv4 >> 16) & 0xFF;
+            if ($a === 10) return false;
+            if ($a === 172 && $b >= 16 && $b <= 31) return false;
+            if ($a === 192 && $b === 168) return false;
+            if ($a === 127) return false;
+            if ($a === 0) return false;
+            if ($a === 169 && $b === 254) return false;
+            if ($a >= 224) return false;
+        }
     }
 
     return true;
@@ -1016,6 +1053,19 @@ function validateHost(string $host): void
     if (!isSafeHost($host)) {
         fail("Connection to host not allowed: {$host}");
     }
+}
+
+function sanitizeHeader(string $s): string
+{
+    return str_replace(["\r", "\n", "\0"], '', $s);
+}
+
+function validateEmail(string $email): bool
+{
+    $email = trim($email);
+    if ($email === '') return false;
+    if (preg_match('/[\r\n\0]/', $email)) return false;
+    return filter_var($email, FILTER_VALIDATE_EMAIL) !== false;
 }
 
 function escapeHtml(?string $s): string
@@ -1200,6 +1250,12 @@ function validateSession(string $token): ?array
         return null;
     }
 
+    $currentIp = getClientIp();
+    if ($session['ip'] !== $currentIp) {
+        destroySession($token);
+        return null;
+    }
+
     $pdo->prepare('UPDATE sessions SET last_activity_at = datetime("now") WHERE session_token = ?')
         ->execute([$token]);
 
@@ -1218,6 +1274,12 @@ function destroyAllSessions(int $accountId): void
     $pdo->prepare('DELETE FROM sessions WHERE account_id = ?')->execute([$accountId]);
 }
 
+function cleanupExpiredSessions(): void
+{
+    $pdo = db();
+    $pdo->exec('DELETE FROM sessions WHERE last_activity_at < datetime("now", "-1 day")');
+}
+
 function getSessionToken(): ?string
 {
     $token = $_SERVER['HTTP_X_SESSION_TOKEN'] ?? '';
@@ -1226,8 +1288,7 @@ function getSessionToken(): ?string
     $token = $_COOKIE[EMMMAIL_SESSION_NAME] ?? '';
     if ($token !== '') return $token;
 
-    $input = getInput();
-    return $input['session_token'] ?? null;
+    return null;
 }
 
 function requireSession(): array
@@ -1248,7 +1309,13 @@ function requireSession(): array
         fail('Account not found or deactivated.', 401);
     }
 
+    $GLOBALS['EMMMAIL_CURRENT_ACCOUNT'] = $account;
     return $account;
+}
+
+function currentAccountId(): int
+{
+    return (int) ($GLOBALS['EMMMAIL_CURRENT_ACCOUNT']['id'] ?? 0);
 }
 
 /* ---------------------------------------------------------------------------
@@ -1473,15 +1540,15 @@ function foldHeader(string $header): string
 
 function buildMimeMessage(array $params): string
 {
-    $from = $params['from'] ?? '';
-    $to = $params['to'] ?? [];
-    $cc = $params['cc'] ?? [];
-    $bcc = $params['bcc'] ?? [];
-    $subject = $params['subject'] ?? '';
+    $from = sanitizeHeader($params['from'] ?? '');
+    $to = array_map('sanitizeHeader', $params['to'] ?? []);
+    $cc = array_map('sanitizeHeader', $params['cc'] ?? []);
+    $bcc = array_map('sanitizeHeader', $params['bcc'] ?? []);
+    $subject = sanitizeHeader($params['subject'] ?? '');
     $body = $params['body'] ?? '';
     $bodyHtml = $params['body_html'] ?? '';
     $attachments = $params['attachments'] ?? [];
-    $inReplyTo = $params['in_reply_to'] ?? '';
+    $inReplyTo = sanitizeHeader($params['in_reply_to'] ?? '');
     $date = $params['date'] ?? '';
     $messageId = $params['message_id'] ?? '';
 
@@ -1498,7 +1565,6 @@ function buildMimeMessage(array $params): string
     $headers[] = 'Message-ID: <' . $messageId . '>';
     $headers[] = 'MIME-Version: 1.0';
     if ($inReplyTo !== '') $headers[] = 'In-Reply-To: <' . $inReplyTo . '>';
-    if (!empty($bcc)) $headers[] = 'Bcc: ' . implode(', ', $bcc);
 
     $boundary = '=_boundary_' . bin2hex(random_bytes(16));
     $hasAttachments = !empty($attachments);
@@ -1676,10 +1742,45 @@ function storeAttachments(PDO $pdo, int $messageId, int $accountId, array $attac
         $size = strlen($data);
 
         $filePath = $dir . '/' . $filename;
-        @file_put_contents($filePath, $data);
+        $written = @file_put_contents($filePath, $data);
+        if ($written === false) continue;
 
         $pdo->prepare('INSERT INTO attachments (message_id, account_id, filename, content_type, size, file_path) VALUES (?, ?, ?, ?, ?, ?)')
             ->execute([$messageId, $accountId, $filename, $contentType, $size, $filePath]);
+    }
+}
+
+function deleteAttachmentFiles(int $accountId, int $messageId): void
+{
+    $dir = EMMMAIL_ATTACH_DIR . '/' . $accountId . '/' . $messageId;
+    if (is_dir($dir)) {
+        $files = glob($dir . '/*');
+        if ($files) {
+            foreach ($files as $file) {
+                if (is_file($file)) @unlink($file);
+            }
+        }
+        @rmdir($dir);
+    }
+}
+
+function deleteAccountAttachments(int $accountId): void
+{
+    $dir = EMMMAIL_ATTACH_DIR . '/' . $accountId;
+    if (is_dir($dir)) {
+        $subdirs = glob($dir . '/*', GLOB_ONLYDIR);
+        if ($subdirs) {
+            foreach ($subdirs as $subdir) {
+                $files = glob($subdir . '/*');
+                if ($files) {
+                    foreach ($files as $file) {
+                        if (is_file($file)) @unlink($file);
+                    }
+                }
+                @rmdir($subdir);
+            }
+        }
+        @rmdir($dir);
     }
 }
 
@@ -1737,6 +1838,10 @@ function actionAuth(): void
     $email = strtolower(trim($input['email']));
     $password = $input['password'];
     $ip = getClientIp();
+
+    if (!validateEmail($email)) {
+        fail('Invalid email address.');
+    }
 
     if (!empty($input['preset'])) {
         $presets = getPresets();
@@ -1804,6 +1909,10 @@ function actionAuth(): void
     $existing = fetchOne($pdo, 'SELECT id FROM accounts WHERE email = ?', [$email]);
 
     if ($existing) {
+        $session = validateSession(getSessionToken() ?? '');
+        if (!$session || (int) $session['account_id'] !== (int) $existing['id']) {
+            fail('Account already exists. Log in to update settings.', 409);
+        }
         $pdo->prepare('UPDATE accounts SET imap_host=?, imap_port=?, imap_tls=?, smtp_host=?, smtp_port=?, smtp_tls=?, password_encrypted=?, password_iv=?, password_tag=?, is_active=1 WHERE id=?')
             ->execute([$imapHost, $imapPort, $imapTls, $smtpHost, $smtpPort, $smtpTls, $enc['encrypted'], $enc['iv'], $enc['tag'], $existing['id']]);
         $accountId = (int) $existing['id'];
@@ -1828,15 +1937,10 @@ function actionAuth(): void
 function actionSync(): void
 {
     $input = getInput();
-    $accountId = (int) ($input['account_id'] ?? 0);
+    $accountId = currentAccountId();
     $folderFilter = $input['folder'] ?? null;
     $since = $input['since'] ?? null;
 
-    if ($accountId <= 0) {
-        $pdo = db();
-        $row = fetchOne($pdo, 'SELECT id FROM accounts ORDER BY id LIMIT 1');
-        $accountId = $row ? (int) $row['id'] : 0;
-    }
     if ($accountId <= 0) {
         fail('No account found. Run auth first.');
     }
@@ -1860,131 +1964,142 @@ function actionSync(): void
         fail('IMAP connection failed: ' . $e->getMessage());
     }
 
-    $folders = $imap->listFolders();
-    $foldersSynced = 0;
-    $messagesSynced = 0;
-    $sinceDate = $since ? strtoupper(date('d-M-Y', strtotime($since))) : null;
+    try {
+        $folders = $imap->listFolders();
+        $foldersSynced = 0;
+        $messagesSynced = 0;
+        $sinceDate = $since ? strtoupper(date('d-M-Y', strtotime($since))) : null;
 
-    foreach ($folders as $f) {
-        $folderName = $f['name'];
-        if ($folderFilter !== null && $folderName !== $folderFilter) {
-            continue;
-        }
-
-        $role = ImapClient::detectRole($folderName, $f['flags']);
-
-        try {
-            $status = $imap->selectFolder($folderName);
-        } catch (Throwable $e) {
-            continue;
-        }
-
-        $existingFolder = fetchOne($pdo, 'SELECT id, uid_validity, last_uid FROM folders WHERE account_id = ? AND name = ?', [$accountId, $folderName]);
-
-        if ($existingFolder && (int) ($existingFolder['uid_validity'] ?? 0) !== ($status['uid_validity'] ?? 0)) {
-            $pdo->prepare('DELETE FROM messages WHERE account_id = ? AND folder_name = ?')
-                ->execute([$accountId, $folderName]);
-            $pdo->prepare('UPDATE folders SET uid_validity = ?, last_uid = 0, unread_count = 0, total_count = 0 WHERE id = ?')
-                ->execute([$status['uid_validity'], $existingFolder['id']]);
-            $existingFolder['last_uid'] = 0;
-        }
-
-        if ($existingFolder) {
-            $pdo->prepare('UPDATE folders SET role = ?, uid_validity = ?, unread_count = ?, total_count = ? WHERE id = ?')
-                ->execute([$role, $status['uid_validity'], $status['unseen'], $status['exists'], $existingFolder['id']]);
-        } else {
-            $pdo->prepare('INSERT INTO folders (account_id, name, role, uid_validity, unread_count, total_count) VALUES (?, ?, ?, ?, ?, ?)')
-                ->execute([$accountId, $folderName, $role, $status['uid_validity'], $status['unseen'], $status['exists']]);
-        }
-
-        $uidsToFetch = [];
-        if ($sinceDate) {
-            $uidsToFetch = $imap->searchSince($sinceDate);
-        } else {
-            $messages = $imap->fetchMessages();
-            foreach ($messages as $m) {
-                if ($m['uid'] > ($existingFolder['last_uid'] ?? 0)) {
-                    $uidsToFetch[] = $m['uid'];
-                }
+        foreach ($folders as $f) {
+            $folderName = $f['name'];
+            if ($folderFilter !== null && $folderName !== $folderFilter) {
+                continue;
             }
-        }
 
-        $lastUid = $existingFolder['last_uid'] ?? 0;
-        $threadIds = [];
-        foreach ($uidsToFetch as $uid) {
+            $role = ImapClient::detectRole($folderName, $f['flags']);
+
             try {
-                $fetched = $imap->fetchMessageBody($uid);
-                $raw = $fetched['raw'];
-                if ($raw === '') continue;
-
-                $sepPos = strpos($raw, "\r\n\r\n");
-                if ($sepPos === false) $sepPos = strpos($raw, "\n\n");
-                $rawHeaders = $sepPos !== false ? substr($raw, 0, $sepPos) : $raw;
-
-                $parsed = parseMimeMessage($raw);
-                $flags = $fetched['flags'];
-
-                $messageId = trim($parsed['headers']['message-id'] ?? '', '<>');
-                $inReplyTo = trim($parsed['headers']['in-reply-to'] ?? '', '<>');
-                $refs = trim($parsed['headers']['references'] ?? '');
-                $subject = $parsed['headers']['subject'] ?? '(no subject)';
-                $date = normalizeDate($parsed['headers']['date'] ?? '');
-
-                $threadId = upsertThread($pdo, $accountId, $subject, $messageId, $inReplyTo, $refs, $date);
-                $msgId = storeMessage($pdo, $accountId, $folderName, $uid, $parsed, $flags, $rawHeaders);
-                $pdo->prepare('UPDATE messages SET thread_id = ? WHERE id = ?')->execute([$threadId, $msgId]);
-                $threadIds[$threadId] = true;
-
-                if ($uid > $lastUid) $lastUid = $uid;
-                $messagesSynced++;
+                $status = $imap->selectFolder($folderName);
             } catch (Throwable $e) {
                 continue;
             }
+
+            $existingFolder = fetchOne($pdo, 'SELECT id, uid_validity, last_uid FROM folders WHERE account_id = ? AND name = ?', [$accountId, $folderName]);
+
+            if ($existingFolder && (int) ($existingFolder['uid_validity'] ?? 0) !== ($status['uid_validity'] ?? 0)) {
+                $messagesToDelete = fetchAll($pdo, 'SELECT id FROM messages WHERE account_id = ? AND folder_name = ?', [$accountId, $folderName]);
+                foreach ($messagesToDelete as $msg) {
+                    deleteAttachmentFiles($accountId, (int) $msg['id']);
+                }
+                $pdo->prepare('DELETE FROM messages WHERE account_id = ? AND folder_name = ?')
+                    ->execute([$accountId, $folderName]);
+                $pdo->prepare('UPDATE folders SET uid_validity = ?, last_uid = 0, unread_count = 0, total_count = 0 WHERE id = ?')
+                    ->execute([$status['uid_validity'], $existingFolder['id']]);
+                $existingFolder['last_uid'] = 0;
+            }
+
+            if ($existingFolder) {
+                $pdo->prepare('UPDATE folders SET role = ?, uid_validity = ?, unread_count = ?, total_count = ? WHERE id = ?')
+                    ->execute([$role, $status['uid_validity'], $status['unseen'], $status['exists'], $existingFolder['id']]);
+            } else {
+                $pdo->prepare('INSERT INTO folders (account_id, name, role, uid_validity, unread_count, total_count) VALUES (?, ?, ?, ?, ?, ?)')
+                    ->execute([$accountId, $folderName, $role, $status['uid_validity'], $status['unseen'], $status['exists']]);
+            }
+
+            $uidsToFetch = [];
+            if ($sinceDate) {
+                $uidsToFetch = $imap->searchSince($sinceDate);
+            } else {
+                $messages = $imap->fetchMessages();
+                foreach ($messages as $m) {
+                    if ($m['uid'] > ($existingFolder['last_uid'] ?? 0)) {
+                        $uidsToFetch[] = $m['uid'];
+                    }
+                }
+            }
+
+            $lastUid = $existingFolder['last_uid'] ?? 0;
+            $threadIds = [];
+            foreach ($uidsToFetch as $uid) {
+                try {
+                    $fetched = $imap->fetchMessageBody($uid);
+                    $raw = $fetched['raw'];
+                    if ($raw === '') continue;
+
+                    $sepPos = strpos($raw, "\r\n\r\n");
+                    if ($sepPos === false) $sepPos = strpos($raw, "\n\n");
+                    $rawHeaders = $sepPos !== false ? substr($raw, 0, $sepPos) : $raw;
+
+                    $parsed = parseMimeMessage($raw);
+                    $flags = $fetched['flags'];
+
+                    $messageId = trim($parsed['headers']['message-id'] ?? '', '<>');
+                    $inReplyTo = trim($parsed['headers']['in-reply-to'] ?? '', '<>');
+                    $refs = trim($parsed['headers']['references'] ?? '');
+                    $subject = $parsed['headers']['subject'] ?? '(no subject)';
+                    $date = normalizeDate($parsed['headers']['date'] ?? '');
+
+                    $threadId = upsertThread($pdo, $accountId, $subject, $messageId, $inReplyTo, $refs, $date);
+                    $msgId = storeMessage($pdo, $accountId, $folderName, $uid, $parsed, $flags, $rawHeaders);
+                    $pdo->prepare('UPDATE messages SET thread_id = ? WHERE id = ?')->execute([$threadId, $msgId]);
+                    $threadIds[$threadId] = true;
+
+                    if ($uid > $lastUid) $lastUid = $uid;
+                    $messagesSynced++;
+                } catch (Throwable $e) {
+                    continue;
+                }
+            }
+
+            foreach (array_keys($threadIds) as $tid) {
+                updateThreadAggregates($pdo, $tid);
+            }
+
+            $pdo->prepare('UPDATE folders SET last_uid = ? WHERE account_id = ? AND name = ?')
+                ->execute([$lastUid, $accountId, $folderName]);
+            $foldersSynced++;
         }
 
-        foreach (array_keys($threadIds) as $tid) {
-            updateThreadAggregates($pdo, $tid);
-        }
+        $now = gmdate('Y-m-d\TH:i:s\Z');
+        $pdo->prepare('UPDATE accounts SET last_sync_at = ? WHERE id = ?')
+            ->execute([$now, $accountId]);
 
-        $pdo->prepare('UPDATE folders SET last_uid = ? WHERE account_id = ? AND name = ?')
-            ->execute([$lastUid, $accountId, $folderName]);
-        $foldersSynced++;
+        jsonResponse([
+            'ok' => true,
+            'data' => [
+                'account_id' => $accountId,
+                'folders_synced' => $foldersSynced,
+                'messages_synced' => $messagesSynced,
+                'last_sync_at' => $now,
+            ],
+        ]);
+    } finally {
+        $imap->logout();
     }
-
-    $now = gmdate('Y-m-d\TH:i:s\Z');
-    $pdo->prepare('UPDATE accounts SET last_sync_at = ? WHERE id = ?')
-        ->execute([$now, $accountId]);
-
-    $imap->logout();
-
-    jsonResponse([
-        'ok' => true,
-        'data' => [
-            'account_id' => $accountId,
-            'folders_synced' => $foldersSynced,
-            'messages_synced' => $messagesSynced,
-            'last_sync_at' => $now,
-        ],
-    ]);
 }
 
 function actionCompose(): void
 {
     $input = getInput();
-    $accountId = (int) ($input['account_id'] ?? 0);
+    $accountId = currentAccountId();
     $to = $input['to'] ?? [];
     $cc = $input['cc'] ?? [];
     $bcc = $input['bcc'] ?? [];
-    $subject = $input['subject'] ?? '';
+    $subject = sanitizeHeader($input['subject'] ?? '');
     $body = $input['body'] ?? '';
     $bodyHtml = $input['body_html'] ?? '';
     $attachments = $input['attachments'] ?? [];
-    $inReplyTo = $input['in_reply_to'] ?? '';
+    $inReplyTo = sanitizeHeader($input['in_reply_to'] ?? '');
     $draft = $input['draft'] ?? false;
 
-    if ($accountId <= 0) fail('Missing required field: account_id');
+    if ($accountId <= 0) fail('No account found. Run auth first.');
     if (empty($to)) fail('Missing required field: to');
     if ($subject === '' && $body === '' && $bodyHtml === '') fail('Missing required field: subject, body, or body_html');
+
+    $allAddresses = array_merge($to, $cc, $bcc);
+    foreach ($allAddresses as $addr) {
+        if (!validateEmail($addr)) fail('Invalid email address: ' . sanitizeHeader($addr));
+    }
 
     $pdo = db();
     $account = fetchOne($pdo, 'SELECT * FROM accounts WHERE id = ?', [$accountId]);
@@ -2041,9 +2156,10 @@ function actionCompose(): void
         $smtp->connect();
         $smtp->login();
         $smtp->send($fromEmail, $allRecipients, $message);
-        $smtp->quit();
     } catch (Throwable $e) {
         fail('SMTP send failed: ' . $e->getMessage());
+    } finally {
+        $smtp->quit();
     }
 
     jsonResponse([
@@ -2060,9 +2176,8 @@ function actionCompose(): void
 
 function actionListDrafts(): void
 {
-    $input = getInput();
-    $accountId = (int) ($input['account_id'] ?? 0);
-    if ($accountId <= 0) fail('Missing required field: account_id');
+    $accountId = currentAccountId();
+    if ($accountId <= 0) fail('No account found. Run auth first.');
 
     $pdo = db();
     $account = fetchOne($pdo, 'SELECT id FROM accounts WHERE id = ?', [$accountId]);
@@ -2088,8 +2203,9 @@ function actionGetDraft(): void
     $draftId = (int) ($input['draft_id'] ?? 0);
     if ($draftId <= 0) fail('Missing required field: draft_id');
 
+    $accountId = currentAccountId();
     $pdo = db();
-    $draft = fetchOne($pdo, 'SELECT * FROM drafts WHERE id = ?', [$draftId]);
+    $draft = fetchOne($pdo, 'SELECT * FROM drafts WHERE id = ? AND account_id = ?', [$draftId, $accountId]);
     if (!$draft) fail('Draft not found.');
 
     $draft['to_addresses'] = json_decode($draft['to_addresses'] ?? '[]', true);
@@ -2109,8 +2225,9 @@ function actionUpdateDraft(): void
     $draftId = (int) ($input['draft_id'] ?? 0);
     if ($draftId <= 0) fail('Missing required field: draft_id');
 
+    $accountId = currentAccountId();
     $pdo = db();
-    $draft = fetchOne($pdo, 'SELECT id FROM drafts WHERE id = ?', [$draftId]);
+    $draft = fetchOne($pdo, 'SELECT id FROM drafts WHERE id = ? AND account_id = ?', [$draftId, $accountId]);
     if (!$draft) fail('Draft not found.');
 
     $fields = [];
@@ -2130,7 +2247,7 @@ function actionUpdateDraft(): void
 
     $fields[] = "updated_at = datetime('now')";
     $params[] = $draftId;
-    $pdo->prepare('UPDATE drafts SET ' . implode(', ', $fields) . ' WHERE id = ?')->execute($params);
+    $pdo->prepare('UPDATE drafts SET ' . implode(', ', $fields) . ' WHERE id = ? AND account_id = ?')->execute(array_merge($params, [$accountId]));
 
     jsonResponse([
         'ok' => true,
@@ -2144,11 +2261,12 @@ function actionDeleteDraft(): void
     $draftId = (int) ($input['draft_id'] ?? 0);
     if ($draftId <= 0) fail('Missing required field: draft_id');
 
+    $accountId = currentAccountId();
     $pdo = db();
-    $draft = fetchOne($pdo, 'SELECT id FROM drafts WHERE id = ?', [$draftId]);
+    $draft = fetchOne($pdo, 'SELECT id FROM drafts WHERE id = ? AND account_id = ?', [$draftId, $accountId]);
     if (!$draft) fail('Draft not found.');
 
-    $pdo->prepare('DELETE FROM drafts WHERE id = ?')->execute([$draftId]);
+    $pdo->prepare('DELETE FROM drafts WHERE id = ? AND account_id = ?')->execute([$draftId, $accountId]);
     jsonResponse([
         'ok' => true,
         'data' => ['deleted' => true],
@@ -2161,15 +2279,21 @@ function actionDownloadAttachment(): void
     $attachmentId = (int) ($input['attachment_id'] ?? 0);
     if ($attachmentId <= 0) fail('Missing required field: attachment_id');
 
+    $accountId = currentAccountId();
     $pdo = db();
-    $att = fetchOne($pdo, 'SELECT * FROM attachments WHERE id = ?', [$attachmentId]);
+    $att = fetchOne($pdo, 'SELECT * FROM attachments WHERE id = ? AND account_id = ?', [$attachmentId, $accountId]);
     if (!$att) fail('Attachment not found.');
 
     $filePath = $att['file_path'];
-    if (!is_file($filePath)) fail('Attachment file not found on disk.');
+    $realPath = realpath($filePath);
+    $attachDir = realpath(EMMMAIL_ATTACH_DIR);
+    if ($realPath === false || $attachDir === false || !str_starts_with($realPath, $attachDir)) {
+        fail('Attachment file not found on disk.');
+    }
+    if (!is_file($realPath)) fail('Attachment file not found on disk.');
 
-    $filename = $att['filename'];
-    $contentType = $att['content_type'];
+    $filename = sanitizeHeader($att['filename']);
+    $contentType = preg_replace('/[\r\n\0].*/', '', $att['content_type']);
     $size = (int) $att['size'];
 
     header('Content-Type: ' . $contentType);
@@ -2177,7 +2301,7 @@ function actionDownloadAttachment(): void
     header('Content-Disposition: attachment; filename="' . $filename . '"');
     header('X-Content-Type-Options: nosniff');
     header('Cache-Control: no-store');
-    readfile($filePath);
+    readfile($realPath);
     exit;
 }
 
@@ -2187,7 +2311,11 @@ function actionMessageAttachments(): void
     $messageId = (int) ($input['message_id'] ?? 0);
     if ($messageId <= 0) fail('Missing required field: message_id');
 
+    $accountId = currentAccountId();
     $pdo = db();
+    $message = fetchOne($pdo, 'SELECT id FROM messages WHERE id = ? AND account_id = ?', [$messageId, $accountId]);
+    if (!$message) fail('Message not found.');
+
     $attachments = fetchAll($pdo, 'SELECT id, filename, content_type, size FROM attachments WHERE message_id = ? ORDER BY id', [$messageId]);
 
     jsonResponse([
@@ -2210,18 +2338,26 @@ function actionLogin(): void
         fail('Missing required field: email, password');
     }
 
+    if (!validateEmail($email)) {
+        fail('Invalid email address.');
+    }
+
+    $ip = getClientIp();
+    checkRateLimit($email, $ip);
+
     $pdo = db();
     $account = fetchOne($pdo, 'SELECT * FROM accounts WHERE email = ? AND is_active = 1', [$email]);
     if (!$account) {
+        recordLoginFailure($email, $ip);
         fail('Invalid email or password.', 401);
     }
 
     $decrypted = decryptPassword($account, getEncryptionKey());
     if ($decrypted === '' || $decrypted !== $password) {
+        recordLoginFailure($email, $ip);
         fail('Invalid email or password.', 401);
     }
 
-    $ip = getClientIp();
     $userAgent = $_SERVER['HTTP_USER_AGENT'] ?? '';
     $token = createSession((int) $account['id'], $ip, $userAgent);
 
@@ -2295,6 +2431,8 @@ function actionSession(): void
 
 function handleRequest(): void
 {
+    cleanupExpiredSessions();
+
     $action = $_GET['action'] ?? '';
 
     $publicActions = ['login', 'session', 'auth'];

@@ -1,7 +1,7 @@
 # Security Fixes Plan
 
 **Date:** 2026-08-26
-**Status:** pending
+**Status:** done
 
 ## Overview
 
