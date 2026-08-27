@@ -33,9 +33,9 @@ The entire application (backend logic, frontend markup, CSS, and JavaScript) liv
 - Multi-account support (add, switch, delete)
 - Server auto-detection (presets + MX lookup)
 - Connection testing without saving
-- Full test suite (TDD, 332 assertions)
-- [TODO] Folder/label management
-- [TODO] Contacts with autocomplete
+- Contact management (auto-populated from messages, search, autocomplete)
+- Tag management (create, list, case-insensitive uniqueness)
+- Full test suite (TDD, 382 assertions)
 - [TODO] Keyboard shortcuts
 - [TODO] Dark/light theme
 - [TODO] Mobile-first responsive design
@@ -610,21 +610,113 @@ curl -s http://localhost:2525/?action=test_connection \
 
 ### Contacts & Tags
 
-#### [TODO] `list_contacts`
+#### `list_contacts`
 
-List contacts for an account.
+List contacts sorted by use count (most-used first). Contacts are auto-populated from message addresses during sync.
 
-#### [TODO] `search_contacts`
+```bash
+curl -s http://localhost:2525/?action=list_contacts \
+  -H 'Content-Type: application/json' \
+  -H 'X-Session-Token: abc123...' \
+  -d '{"q": "alice", "limit": 50}' | jq
+```
 
-Search contacts by name or email.
+**Parameters:**
 
-#### [TODO] `list_tags`
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `q` | string | no | Search by email or name (substring match) |
+| `limit` | int | no | Max results (1-500, default 300) |
 
-List all tags.
+**Response:**
 
-#### [TODO] `create_tag`
+```json
+{
+  "ok": true,
+  "data": {
+    "contacts": [
+      { "email": "alice@example.com", "name": "Alice", "use_count": 15 }
+    ]
+  }
+}
+```
+
+#### `search_contacts`
+
+Search contacts for autocomplete (prefix match, sorted by use count).
+
+```bash
+curl -s http://localhost:2525/?action=search_contacts \
+  -H 'Content-Type: application/json' \
+  -H 'X-Session-Token: abc123...' \
+  -d '{"q": "ali"}' | jq
+```
+
+**Parameters:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `q` | string | yes | Search prefix |
+| `limit` | int | no | Max results (1-20, default 10) |
+
+**Response:**
+
+```json
+{
+  "ok": true,
+  "data": {
+    "contacts": [
+      { "email": "alice@example.com", "name": "Alice" }
+    ]
+  }
+}
+```
+
+#### `list_tags`
+
+List all tags for the account, sorted by name.
+
+```bash
+curl -s http://localhost:2525/?action=list_tags \
+  -H 'X-Session-Token: abc123...' | jq
+```
+
+**Response:**
+
+```json
+{
+  "ok": true,
+  "data": {
+    "tags": [
+      { "id": 1, "name": "Important", "color": "#6366f1" }
+    ]
+  }
+}
+```
+
+#### `create_tag`
 
 Create a new tag.
+
+```bash
+curl -s http://localhost:2525/?action=create_tag \
+  -H 'Content-Type: application/json' \
+  -H 'X-Session-Token: abc123...' \
+  -d '{"name": "Important", "color": "#ff0000"}' | jq
+```
+
+**Parameters:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | yes | Tag name (max 100 chars, case-insensitive unique) |
+| `color` | string | no | Hex color (default `#6366f1`) |
+
+**Response:**
+
+```json
+{ "ok": true, "data": { "id": 1, "name": "Important", "color": "#ff0000" } }
+```
 
 ### Settings
 

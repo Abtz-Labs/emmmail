@@ -78,6 +78,10 @@
 - `delete_draft` — delete draft (authenticated)
 - `download_attachment` — download attachment file (authenticated)
 - `message_attachments` — list message attachments (authenticated)
+- `list_contacts` — list contacts by use count (authenticated)
+- `search_contacts` — prefix-match contacts for autocomplete (authenticated)
+- `list_tags` — list tags sorted by name (authenticated)
+- `create_tag` — create tag with name and color (authenticated)
 
 ## Session 9 (2026-08-26) — Accounts endpoints
 - Implemented 5 endpoints: list_accounts, add_account, delete_account, detect_server, test_connection
@@ -90,6 +94,19 @@
 - `delete_account` uses transaction + `deleteAccountAttachments()` (was dead code)
 - 332 tests passing, 0 failures, 3 skipped
 
+## Session 10 (2026-08-26) — Contacts & Tags endpoints
+- Implemented 4 endpoints: list_contacts, search_contacts, list_tags, create_tag
+- Plan reviewed by 2 subagents; 21 findings addressed (name wipe fix, case-insensitive tags, LIKE escaping, etc.)
+- Added 3 schema tables: contacts, tags, message_tags (in EMMMAIL_SCHEMA)
+- `sanitizeContactName()` — strips control chars, collapses whitespace, caps at 200 chars
+- `updateContacts()` — upsert hook in storeMessage, dedupes within message, preserves existing name
+- `queryContacts()` — shared helper for list_contacts/search_contacts, LIKE wildcard escaping
+- Tags use `COLLATE NOCASE` for case-insensitive uniqueness
+- Color regex: `#[0-9a-fA-F]{3,4,6,8}` (valid CSS hex lengths only)
+- Message tagging (tag_message/untag_message) deferred to future phase
+- 382 tests passing, 0 failures, 3 skipped
+
 ## Next
 - Build UI/UX
+- Add settings endpoints
 - Add contacts/tags/settings endpoints

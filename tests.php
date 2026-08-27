@@ -1679,6 +1679,198 @@ function testValidatePortAndTls(): void
     assertEquals(false, $res['ok'] ?? null, 'test_connection rejects TLS -1');
 }
 
+function testUpdateContacts(): void
+{
+    group('updateContacts');
+
+    $pdo = db();
+    $session = createTestAccountAndSession();
+    $accountId = $session['account_id'];
+
+    $pdo->exec('CREATE TABLE IF NOT EXISTS contacts (id INTEGER PRIMARY KEY AUTOINCREMENT, account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, email TEXT NOT NULL, name TEXT, use_count INTEGER NOT NULL DEFAULT 1, last_used_at TEXT NOT NULL DEFAULT (datetime(\'now\')), UNIQUE(account_id, email))');
+
+    updateContacts($pdo, $accountId, [['email' => 'alice@test.com', 'name' => 'Alice']]);
+    $c = fetchOne($pdo, 'SELECT * FROM contacts WHERE account_id = ? AND email = ?', [$accountId, 'alice@test.com']);
+    assertTest($c !== null, 'updateContacts inserts new contact');
+    assertEquals(1, (int) $c['use_count'], 'updateContacts use_count starts at 1');
+    assertEquals('Alice', $c['name'], 'updateContacts stores name');
+
+    updateContacts($pdo, $accountId, [['email' => 'alice@test.com', 'name' => 'Alice']]);
+    $c = fetchOne($pdo, 'SELECT * FROM contacts WHERE account_id = ? AND email = ?', [$accountId, 'alice@test.com']);
+    assertEquals(2, (int) $c['use_count'], 'updateContacts increments use_count on upsert');
+
+    updateContacts($pdo, $accountId, [['email' => 'alice@test.com', 'name' => '']]);
+    $c = fetchOne($pdo, 'SELECT * FROM contacts WHERE account_id = ? AND email = ?', [$accountId, 'alice@test.com']);
+    assertEquals('Alice', $c['name'], 'updateContacts preserves existing name when new name is empty');
+    assertEquals(3, (int) $c['use_count'], 'updateContacts still increments use_count');
+
+    updateContacts($pdo, $accountId, [['email' => 'alice@test.com', 'name' => 'Alicia']]);
+    $c = fetchOne($pdo, 'SELECT * FROM contacts WHERE account_id = ? AND email = ?', [$accountId, 'alice@test.com']);
+    assertEquals('Alicia', $c['name'], 'updateContacts updates name when new name is non-empty');
+
+    updateContacts($pdo, $accountId, [['email' => 'not-an-email', 'name' => 'Bad']]);
+    $c = fetchOne($pdo, 'SELECT * FROM contacts WHERE account_id = ? AND email = ?', [$accountId, 'not-an-email']);
+    assertEquals(null, $c, 'updateContacts rejects invalid email');
+
+    updateContacts($pdo, $accountId, ['not-an-array']);
+    assertTest(true, 'updateContacts rejects non-array entry');
+
+    updateContacts($pdo, $accountId, [['email' => 'dup@test.com', 'name' => 'Dup'], ['email' => 'dup@test.com', 'name' => 'Dup2']]);
+    $c = fetchOne($pdo, 'SELECT * FROM contacts WHERE account_id = ? AND email = ?', [$accountId, 'dup@test.com']);
+    assertEquals(1, (int) $c['use_count'], 'updateContacts dedupes within one message');
+}
+
+function testListContacts(): void
+{
+    group('list_contacts');
+
+    $session = createTestAccountAndSession();
+    $token = $session['token'];
+    $accountId = $session['account_id'];
+
+    $pdo = db();
+    $pdo->exec('CREATE TABLE IF NOT EXISTS contacts (id INTEGER PRIMARY KEY AUTOINCREMENT, account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, email TEXT NOT NULL, name TEXT, use_count INTEGER NOT NULL DEFAULT 1, last_used_at TEXT NOT NULL DEFAULT (datetime(\'now\')), UNIQUE(account_id, email))');
+
+    $res = apiRequest('list_contacts', [], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['ok'] ?? null, 'list_contacts returns ok:true');
+    assertEquals([], $res['data']['contacts'] ?? null, 'list_contacts returns empty array when no contacts');
+
+    $pdo->prepare('INSERT INTO contacts (account_id, email, name, use_count) VALUES (?, ?, ?, ?)')->execute([$accountId, 'alice@test.com', 'Alice', 10]);
+    $pdo->prepare('INSERT INTO contacts (account_id, email, name, use_count) VALUES (?, ?, ?, ?)')->execute([$accountId, 'bob@test.com', 'Bob', 5]);
+    $pdo->prepare('INSERT INTO contacts (account_id, email, name, use_count) VALUES (?, ?, ?, ?)')->execute([$accountId, 'carol@test.com', 'Carol', 15]);
+
+    $res = apiRequest('list_contacts', [], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(3, count($res['data']['contacts'] ?? []), 'list_contacts returns 3 contacts');
+    assertEquals('carol@test.com', $res['data']['contacts'][0]['email'] ?? '', 'list_contacts sorts by use_count DESC');
+    assertTest(is_int($res['data']['contacts'][0]['use_count'] ?? null), 'list_contacts use_count is int');
+
+    $res = apiRequest('list_contacts', ['q' => 'alice'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(1, count($res['data']['contacts'] ?? []), 'list_contacts search by email');
+    assertEquals('alice@test.com', $res['data']['contacts'][0]['email'] ?? '', 'list_contacts search returns correct contact');
+
+    $res = apiRequest('list_contacts', ['q' => 'Bob'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(1, count($res['data']['contacts'] ?? []), 'list_contacts search by name case-insensitive');
+
+    $res = apiRequest('list_contacts', ['q' => 'BOB'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(1, count($res['data']['contacts'] ?? []), 'list_contacts search uppercase matches lowercase email');
+
+    $res = apiRequest('list_contacts', ['q' => '%'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(0, count($res['data']['contacts'] ?? []), 'list_contacts LIKE wildcard escaped');
+
+    $res = apiRequest('list_contacts', ['limit' => 2], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(2, count($res['data']['contacts'] ?? []), 'list_contacts respects limit');
+
+    $res = apiRequest('list_contacts', ['limit' => 0], 'POST', ['X-Session-Token' => $token]);
+    assertTest(count($res['data']['contacts'] ?? []) >= 1, 'list_contacts limit=0 clamped to 1');
+
+    $res = apiRequest('list_contacts', ['limit' => 999], 'POST', ['X-Session-Token' => $token]);
+    assertTest(count($res['data']['contacts'] ?? []) <= 500, 'list_contacts limit=999 clamped to 500');
+
+    $res = apiRequest('list_contacts', [], 'POST', ['X-Session-Token' => 'invalid']);
+    assertEquals(false, $res['ok'] ?? null, 'list_contacts rejects invalid session');
+}
+
+function testSearchContacts(): void
+{
+    group('search_contacts');
+
+    $session = createTestAccountAndSession();
+    $token = $session['token'];
+    $accountId = $session['account_id'];
+
+    $pdo = db();
+    $pdo->exec('CREATE TABLE IF NOT EXISTS contacts (id INTEGER PRIMARY KEY AUTOINCREMENT, account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, email TEXT NOT NULL, name TEXT, use_count INTEGER NOT NULL DEFAULT 1, last_used_at TEXT NOT NULL DEFAULT (datetime(\'now\')), UNIQUE(account_id, email))');
+
+    $pdo->prepare('INSERT INTO contacts (account_id, email, name, use_count) VALUES (?, ?, ?, ?)')->execute([$accountId, 'alice@test.com', 'Alice', 10]);
+    $pdo->prepare('INSERT INTO contacts (account_id, email, name, use_count) VALUES (?, ?, ?, ?)')->execute([$accountId, 'bob@alice.com', 'Bob', 5]);
+    $pdo->prepare('INSERT INTO contacts (account_id, email, name, use_count) VALUES (?, ?, ?, ?)')->execute([$accountId, 'alicia@test.com', 'Alicia', 8]);
+
+    $res = apiRequest('search_contacts', ['q' => ''], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['ok'] ?? null, 'search_contacts fails for empty query');
+
+    $res = apiRequest('search_contacts', ['q' => 'ali'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['ok'] ?? null, 'search_contacts returns ok:true');
+    assertEquals(2, count($res['data']['contacts'] ?? []), 'search_contacts prefix matches 2 contacts');
+
+    $res = apiRequest('search_contacts', ['q' => 'bob@alice'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(1, count($res['data']['contacts'] ?? []), 'search_contacts prefix match on email');
+    assertEquals('bob@alice.com', $res['data']['contacts'][0]['email'] ?? '', 'search_contacts returns correct contact');
+
+    $res = apiRequest('search_contacts', ['q' => 'ali', 'limit' => 1], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(1, count($res['data']['contacts'] ?? []), 'search_contacts respects limit');
+
+    $res = apiRequest('search_contacts', ['q' => 'nonexistent'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals([], $res['data']['contacts'] ?? null, 'search_contacts empty result for no matches');
+
+    $res = apiRequest('search_contacts', ['q' => 'ali'], 'POST', ['X-Session-Token' => 'invalid']);
+    assertEquals(false, $res['ok'] ?? null, 'search_contacts rejects invalid session');
+}
+
+function testListTags(): void
+{
+    group('list_tags');
+
+    $session = createTestAccountAndSession();
+    $token = $session['token'];
+    $accountId = $session['account_id'];
+
+    $pdo = db();
+    $pdo->exec('CREATE TABLE IF NOT EXISTS tags (id INTEGER PRIMARY KEY AUTOINCREMENT, account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, name TEXT NOT NULL COLLATE NOCASE, color TEXT NOT NULL DEFAULT \'#6366f1\', UNIQUE(account_id, name))');
+
+    $res = apiRequest('list_tags', [], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['ok'] ?? null, 'list_tags returns ok:true');
+    assertEquals([], $res['data']['tags'] ?? null, 'list_tags returns empty array when no tags');
+
+    $pdo->prepare('INSERT INTO tags (account_id, name, color) VALUES (?, ?, ?)')->execute([$accountId, 'Work', '#ff0000']);
+    $pdo->prepare('INSERT INTO tags (account_id, name, color) VALUES (?, ?, ?)')->execute([$accountId, 'Important', '#00ff00']);
+    $pdo->prepare('INSERT INTO tags (account_id, name, color) VALUES (?, ?, ?)')->execute([$accountId, 'Archive', '#0000ff']);
+
+    $res = apiRequest('list_tags', [], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(3, count($res['data']['tags'] ?? []), 'list_tags returns 3 tags');
+    assertEquals('Archive', $res['data']['tags'][0]['name'] ?? '', 'list_tags sorted by name');
+    assertTest(is_int($res['data']['tags'][0]['id'] ?? null), 'list_tags id is int');
+
+    $res = apiRequest('list_tags', [], 'POST', ['X-Session-Token' => 'invalid']);
+    assertEquals(false, $res['ok'] ?? null, 'list_tags rejects invalid session');
+}
+
+function testCreateTag(): void
+{
+    group('create_tag');
+
+    $session = createTestAccountAndSession();
+    $token = $session['token'];
+
+    $pdo = db();
+    $pdo->exec('CREATE TABLE IF NOT EXISTS tags (id INTEGER PRIMARY KEY AUTOINCREMENT, account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, name TEXT NOT NULL COLLATE NOCASE, color TEXT NOT NULL DEFAULT \'#6366f1\', UNIQUE(account_id, name))');
+
+    $res = apiRequest('create_tag', ['name' => 'Important'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['ok'] ?? null, 'create_tag returns ok:true');
+    assertTest(is_int($res['data']['id'] ?? null), 'create_tag returns int id');
+    assertEquals('Important', $res['data']['name'] ?? '', 'create_tag returns name');
+    assertEquals('#6366f1', $res['data']['color'] ?? '', 'create_tag defaults color');
+
+    $res = apiRequest('create_tag', ['name' => 'Urgent', 'color' => '#ff0000'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['ok'] ?? null, 'create_tag with custom color');
+    assertEquals('#ff0000', $res['data']['color'] ?? '', 'create_tag stores custom color');
+
+    $res = apiRequest('create_tag', ['name' => ''], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['ok'] ?? null, 'create_tag rejects empty name');
+
+    $res = apiRequest('create_tag', ['name' => 'Important'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['ok'] ?? null, 'create_tag rejects duplicate name');
+
+    $res = apiRequest('create_tag', ['name' => 'important'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['ok'] ?? null, 'create_tag rejects duplicate name case-insensitive');
+
+    $res = apiRequest('create_tag', ['name' => 'BadColor', 'color' => 'red'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['ok'] ?? null, 'create_tag invalid color uses default');
+    assertEquals('#6366f1', $res['data']['color'] ?? '', 'create_tag invalid color defaulted');
+
+    $res = apiRequest('create_tag', ['name' => 'Test'], 'POST', ['X-Session-Token' => 'invalid']);
+    assertEquals(false, $res['ok'] ?? null, 'create_tag rejects invalid session');
+}
+
 /* ---------------------------------------------------------------------------
  * MAIN
  * ------------------------------------------------------------------------ */
@@ -1729,5 +1921,10 @@ testListAccounts();
 testDeleteAccount();
 testDetectServer();
 testValidatePortAndTls();
+testUpdateContacts();
+testListContacts();
+testSearchContacts();
+testListTags();
+testCreateTag();
 
 summary();

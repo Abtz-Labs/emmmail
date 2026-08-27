@@ -241,6 +241,31 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(session_token);
 CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions(account_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_activity ON sessions(last_activity_at);
+
+CREATE TABLE IF NOT EXISTS contacts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    email TEXT NOT NULL,
+    name TEXT,
+    use_count INTEGER NOT NULL DEFAULT 1,
+    last_used_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(account_id, email)
+);
+
+CREATE TABLE IF NOT EXISTS tags (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    name TEXT NOT NULL COLLATE NOCASE,
+    color TEXT NOT NULL DEFAULT '#6366f1',
+    UNIQUE(account_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS message_tags (
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+    PRIMARY KEY (message_id, tag_id)
+);
+CREATE INDEX IF NOT EXISTS idx_message_tags_tag ON message_tags(tag_id);
 SQL;
 
 function initDatabase(PDO $pdo): void
@@ -1763,6 +1788,12 @@ function storeMessage(PDO $pdo, int $accountId, string $folderName, int $uid, ar
         ->execute([$accountId, $folderName, $uid, $messageId, $inReplyTo, $refs, $subject, $fromAddress, $fromName, $toAddresses, $ccAddresses, $date, $parsed['text_body'] ?? '', $parsed['html_body'] ?? '', $isRead, $isStarred, $hasAttachments, $rawHeaders]);
     $msgId = (int) $pdo->lastInsertId();
 
+    $contactAddresses = [];
+    if ($fromAddress !== '') $contactAddresses[] = ['email' => $fromAddress, 'name' => $fromName];
+    foreach (json_decode($toAddresses, true) ?? [] as $a) $contactAddresses[] = $a;
+    foreach (json_decode($ccAddresses, true) ?? [] as $a) $contactAddresses[] = $a;
+    updateContacts($pdo, $accountId, $contactAddresses);
+
     storeAttachments($pdo, $msgId, $accountId, $parsed['attachments'] ?? []);
 
     return $msgId;
@@ -2957,6 +2988,106 @@ function actionTestConnection(): void
     ]);
 }
 
+function sanitizeContactName(string $name): string
+{
+    $name = preg_replace('/[\x00-\x1F\x7F]/', '', $name);
+    $name = preg_replace('/\s+/', ' ', $name);
+    $name = trim($name);
+    if (mb_strlen($name) > 200) $name = mb_substr($name, 0, 200);
+    return $name;
+}
+
+function updateContacts(PDO $pdo, int $accountId, array $addresses): void
+{
+    $st = $pdo->prepare('INSERT INTO contacts (account_id, email, name) VALUES (?, ?, ?)
+        ON CONFLICT(account_id, email) DO UPDATE SET
+        use_count = use_count + 1,
+        last_used_at = datetime("now"),
+        name = CASE WHEN excluded.name != \'\' THEN excluded.name ELSE contacts.name END');
+    $seen = [];
+    foreach ($addresses as $a) {
+        if (!is_array($a)) continue;
+        $email = strtolower(trim((string) ($a['email'] ?? '')));
+        if ($email === '' || !filter_var($email, FILTER_VALIDATE_EMAIL)) continue;
+        if (isset($seen[$email])) continue;
+        $seen[$email] = true;
+        $name = sanitizeContactName((string) ($a['name'] ?? ''));
+        $st->execute([$accountId, $email, $name]);
+    }
+}
+
+function queryContacts(PDO $pdo, int $accountId, string $q, int $limit): array
+{
+    if ($q !== '') {
+        $like = '%' . addcslashes($q, '\%_') . '%';
+        return fetchAll($pdo, "SELECT email, name, use_count FROM contacts WHERE account_id = ? AND (LOWER(email) LIKE LOWER(?) ESCAPE '\\' OR name LIKE ? ESCAPE '\\' COLLATE NOCASE) ORDER BY use_count DESC, email LIMIT ?", [$accountId, $like, $like, $limit]);
+    }
+    return fetchAll($pdo, 'SELECT email, name, use_count FROM contacts WHERE account_id = ? ORDER BY use_count DESC, email LIMIT ?', [$accountId, $limit]);
+}
+
+function actionListContacts(): void
+{
+    $accountId = currentAccountId();
+    if ($accountId <= 0) fail('No account found. Run auth first.');
+    $input = getInput();
+    $q = trim((string) ($input['q'] ?? ''));
+    $limit = max(1, min(500, (int) ($input['limit'] ?? 300)));
+    $pdo = db();
+    $contacts = queryContacts($pdo, $accountId, $q, $limit);
+    foreach ($contacts as &$c) {
+        $c['use_count'] = (int) $c['use_count'];
+    }
+    unset($c);
+    jsonResponse(['ok' => true, 'data' => ['contacts' => $contacts]]);
+}
+
+function actionSearchContacts(): void
+{
+    $accountId = currentAccountId();
+    if ($accountId <= 0) fail('No account found. Run auth first.');
+    $input = getInput();
+    $q = trim((string) ($input['q'] ?? ''));
+    if ($q === '') fail('Missing required field: q');
+    $limit = max(1, min(20, (int) ($input['limit'] ?? 10)));
+    $pdo = db();
+    $like = addcslashes($q, '\%_') . '%';
+    $contacts = fetchAll($pdo, 'SELECT email, name FROM contacts WHERE account_id = ? AND (LOWER(email) LIKE LOWER(?) OR name LIKE ? COLLATE NOCASE) ORDER BY use_count DESC, email LIMIT ?', [$accountId, $like, $like, $limit]);
+    jsonResponse(['ok' => true, 'data' => ['contacts' => $contacts]]);
+}
+
+function actionListTags(): void
+{
+    $accountId = currentAccountId();
+    if ($accountId <= 0) fail('No account found. Run auth first.');
+    $pdo = db();
+    $tags = fetchAll($pdo, 'SELECT id, name, color FROM tags WHERE account_id = ? ORDER BY name COLLATE NOCASE', [$accountId]);
+    foreach ($tags as &$t) {
+        $t['id'] = (int) $t['id'];
+    }
+    unset($t);
+    jsonResponse(['ok' => true, 'data' => ['tags' => $tags]]);
+}
+
+function actionCreateTag(): void
+{
+    $accountId = currentAccountId();
+    if ($accountId <= 0) fail('No account found. Run auth first.');
+    $input = getInput();
+    $name = trim((string) ($input['name'] ?? ''));
+    if ($name === '') fail('Missing required field: name');
+    if (mb_strlen($name) > 100) $name = mb_substr($name, 0, 100);
+    $color = trim((string) ($input['color'] ?? '#6366f1'));
+    if (!preg_match('/^#[0-9a-fA-F]{3}$|^#[0-9a-fA-F]{4}$|^#[0-9a-fA-F]{6}$|^#[0-9a-fA-F]{8}$/', $color)) $color = '#6366f1';
+    $pdo = db();
+    try {
+        $pdo->prepare('INSERT INTO tags (account_id, name, color) VALUES (?, ?, ?)')->execute([$accountId, $name, $color]);
+    } catch (PDOException $e) {
+        if (str_contains($e->getMessage(), 'UNIQUE')) fail('A tag with this name already exists', 409);
+        throw $e;
+    }
+    jsonResponse(['ok' => true, 'data' => ['id' => (int) $pdo->lastInsertId(), 'name' => $name, 'color' => $color]]);
+}
+
 /* ---------------------------------------------------------------------------
  * Front Controller
  * ------------------------------------------------------------------------ */
@@ -3044,6 +3175,18 @@ function handleRequest(): void
             break;
         case 'test_connection':
             actionTestConnection();
+            break;
+        case 'list_contacts':
+            actionListContacts();
+            break;
+        case 'search_contacts':
+            actionSearchContacts();
+            break;
+        case 'list_tags':
+            actionListTags();
+            break;
+        case 'create_tag':
+            actionCreateTag();
             break;
         default:
             fail('Unknown action: ' . ($action ?: '(none)'));
