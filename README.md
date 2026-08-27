@@ -35,7 +35,8 @@ The entire application (backend logic, frontend markup, CSS, and JavaScript) liv
 - Connection testing without saving
 - Contact management (auto-populated from messages, search, autocomplete)
 - Tag management (create, list, case-insensitive uniqueness)
-- Full test suite (TDD, 382 assertions)
+- Per-account settings (theme, signature, preferences)
+- Full test suite (TDD, 415 assertions)
 - [TODO] Keyboard shortcuts
 - [TODO] Dark/light theme
 - [TODO] Mobile-first responsive design
@@ -720,17 +721,74 @@ curl -s http://localhost:2525/?action=create_tag \
 
 ### Settings
 
-#### [TODO] `get_settings`
+#### `get_settings`
 
-Get user settings.
+Get all settings for the current account with defaults applied.
 
-#### [TODO] `update_settings`
+```bash
+curl -s http://localhost:2525/?action=get_settings \
+  -H 'X-Session-Token: abc123...' | jq
+```
 
-Update user settings.
+**Response:**
 
-#### [TODO] `update_signature`
+```json
+{
+  "ok": true,
+  "data": {
+    "settings": {
+      "signature": "",
+      "theme": "dark",
+      "show_remote_images": false,
+      "sync_on_load": true
+    }
+  }
+}
+```
 
-Update email signature.
+#### `update_settings`
+
+Update settings for the current account. Only whitelisted keys are accepted.
+
+```bash
+curl -s http://localhost:2525/?action=update_settings \
+  -H 'Content-Type: application/json' \
+  -H 'X-Session-Token: abc123...' \
+  -d '{"theme": "light", "show_remote_images": true}' | jq
+```
+
+**Parameters:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `theme` | string | no | `dark` or `light` |
+| `show_remote_images` | bool | no | Show remote images in messages |
+| `sync_on_load` | bool | no | Auto-sync on app load |
+
+**Response:** Returns full settings after update.
+
+#### `update_signature`
+
+Update the email signature for the current account.
+
+```bash
+curl -s http://localhost:2525/?action=update_signature \
+  -H 'Content-Type: application/json' \
+  -H 'X-Session-Token: abc123...' \
+  -d '{"signature": "-- \nSent from Emmmail"}' | jq
+```
+
+**Parameters:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `signature` | string | yes | Signature text (max 10000 chars, empty string to clear) |
+
+**Response:**
+
+```json
+{ "ok": true, "data": { "signature": "-- \nSent from Emmmail" } }
+```
 
 ### Sync
 

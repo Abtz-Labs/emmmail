@@ -266,6 +266,13 @@ CREATE TABLE IF NOT EXISTS message_tags (
     PRIMARY KEY (message_id, tag_id)
 );
 CREATE INDEX IF NOT EXISTS idx_message_tags_tag ON message_tags(tag_id);
+
+CREATE TABLE IF NOT EXISTS settings (
+    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    value TEXT NOT NULL,
+    PRIMARY KEY (account_id, name)
+);
 SQL;
 
 function initDatabase(PDO $pdo): void
@@ -3088,6 +3095,81 @@ function actionCreateTag(): void
     jsonResponse(['ok' => true, 'data' => ['id' => (int) $pdo->lastInsertId(), 'name' => $name, 'color' => $color]]);
 }
 
+function getSettingsArray(PDO $pdo, int $accountId): array
+{
+    $defaults = [
+        'signature' => '',
+        'theme' => 'dark',
+        'show_remote_images' => false,
+        'sync_on_load' => true,
+    ];
+    $rows = fetchAll($pdo, 'SELECT name, value FROM settings WHERE account_id = ?', [$accountId]);
+    foreach ($rows as $r) {
+        $k = $r['name'];
+        if (!array_key_exists($k, $defaults)) continue;
+        $v = $r['value'];
+        if (in_array($k, ['show_remote_images', 'sync_on_load'], true)) {
+            $v = $v === '1';
+        }
+        $defaults[$k] = $v;
+    }
+    return $defaults;
+}
+
+function actionGetSettings(): void
+{
+    $accountId = currentAccountId();
+    if ($accountId <= 0) fail('No account found. Run auth first.');
+    $pdo = db();
+    jsonResponse(['ok' => true, 'data' => ['settings' => getSettingsArray($pdo, $accountId)]]);
+}
+
+function actionUpdateSettings(): void
+{
+    $accountId = currentAccountId();
+    if ($accountId <= 0) fail('No account found. Run auth first.');
+    $input = getInput();
+    $pdo = db();
+
+    $allowed = ['theme', 'show_remote_images', 'sync_on_load'];
+    $applied = false;
+
+    foreach ($allowed as $k) {
+        if (!array_key_exists($k, $input)) continue;
+        $v = $input[$k];
+        if ($k === 'theme') {
+            $v = strtolower(trim((string) $v));
+            if (!in_array($v, ['dark', 'light'], true)) fail('Invalid theme value. Must be dark or light.');
+        } else {
+            $v = in_array($v, [true, 1, '1', 'true', 'on'], true) ? '1' : '0';
+        }
+        $pdo->prepare('INSERT INTO settings (account_id, name, value) VALUES (?, ?, ?) ON CONFLICT(account_id, name) DO UPDATE SET value = excluded.value')
+            ->execute([$accountId, $k, (string) $v]);
+        $applied = true;
+    }
+
+    if (!$applied) fail('No fields to update.');
+
+    jsonResponse(['ok' => true, 'data' => ['settings' => getSettingsArray($pdo, $accountId)]]);
+}
+
+function actionUpdateSignature(): void
+{
+    $accountId = currentAccountId();
+    if ($accountId <= 0) fail('No account found. Run auth first.');
+    $input = getInput();
+
+    if (!array_key_exists('signature', $input)) fail('Missing required field: signature.');
+    $signature = (string) ($input['signature'] ?? '');
+    if (mb_strlen($signature) > 10000) fail('Signature too long (max 10000 characters).');
+
+    $pdo = db();
+    $pdo->prepare('INSERT INTO settings (account_id, name, value) VALUES (?, ?, ?) ON CONFLICT(account_id, name) DO UPDATE SET value = excluded.value')
+        ->execute([$accountId, 'signature', $signature]);
+
+    jsonResponse(['ok' => true, 'data' => ['signature' => $signature]]);
+}
+
 /* ---------------------------------------------------------------------------
  * Front Controller
  * ------------------------------------------------------------------------ */
@@ -3187,6 +3269,15 @@ function handleRequest(): void
             break;
         case 'create_tag':
             actionCreateTag();
+            break;
+        case 'get_settings':
+            actionGetSettings();
+            break;
+        case 'update_settings':
+            actionUpdateSettings();
+            break;
+        case 'update_signature':
+            actionUpdateSignature();
             break;
         default:
             fail('Unknown action: ' . ($action ?: '(none)'));

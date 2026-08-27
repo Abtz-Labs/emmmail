@@ -1871,6 +1871,112 @@ function testCreateTag(): void
     assertEquals(false, $res['ok'] ?? null, 'create_tag rejects invalid session');
 }
 
+function testGetSettings(): void
+{
+    group('get_settings');
+
+    $session = createTestAccountAndSession();
+    $token = $session['token'];
+
+    $res = apiRequest('get_settings', [], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['ok'] ?? null, 'get_settings returns ok:true');
+    $settings = $res['data']['settings'] ?? [];
+    assertEquals('', $settings['signature'] ?? 'x', 'get_settings default signature');
+    assertEquals('dark', $settings['theme'] ?? 'x', 'get_settings default theme');
+    assertEquals(false, $settings['show_remote_images'] ?? true, 'get_settings default show_remote_images');
+    assertEquals(true, $settings['sync_on_load'] ?? false, 'get_settings default sync_on_load');
+    assertTest(is_bool($settings['show_remote_images'] ?? null), 'get_settings show_remote_images is bool');
+    assertTest(is_bool($settings['sync_on_load'] ?? null), 'get_settings sync_on_load is bool');
+
+    $session2 = createTestAccountAndSession();
+    $token2 = $session2['token'];
+    apiRequest('update_settings', ['theme' => 'light'], 'POST', ['X-Session-Token' => $token2]);
+    $res = apiRequest('get_settings', [], 'POST', ['X-Session-Token' => $token]);
+    assertEquals('dark', $res['data']['settings']['theme'] ?? 'x', 'get_settings per-account isolation');
+
+    $res = apiRequest('get_settings', [], 'POST', ['X-Session-Token' => 'invalid']);
+    assertEquals(false, $res['ok'] ?? null, 'get_settings rejects invalid session');
+}
+
+function testUpdateSettings(): void
+{
+    group('update_settings');
+
+    $session = createTestAccountAndSession();
+    $token = $session['token'];
+
+    $res = apiRequest('update_settings', ['theme' => 'light'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['ok'] ?? null, 'update_settings returns ok:true');
+    assertEquals('light', $res['data']['settings']['theme'] ?? 'x', 'update_settings updates theme');
+
+    $res = apiRequest('update_settings', ['theme' => 'invalid'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['ok'] ?? null, 'update_settings rejects invalid theme');
+
+    $res = apiRequest('update_settings', ['show_remote_images' => true], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['data']['settings']['show_remote_images'] ?? false, 'update_settings bool true');
+    assertEquals('light', $res['data']['settings']['theme'] ?? 'x', 'update_settings preserves other settings');
+
+    $res = apiRequest('update_settings', ['show_remote_images' => false], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['data']['settings']['show_remote_images'] ?? true, 'update_settings bool false');
+
+    $res = apiRequest('update_settings', ['show_remote_images' => 'false'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['data']['settings']['show_remote_images'] ?? true, 'update_settings string "false" is false');
+
+    $res = apiRequest('update_settings', ['show_remote_images' => 'true'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['data']['settings']['show_remote_images'] ?? false, 'update_settings string "true" is true');
+
+    $res = apiRequest('update_settings', ['show_remote_images' => '0'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['data']['settings']['show_remote_images'] ?? true, 'update_settings string "0" is false');
+
+    $res = apiRequest('update_settings', ['show_remote_images' => '1'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['data']['settings']['show_remote_images'] ?? false, 'update_settings string "1" is true');
+
+    $res = apiRequest('update_settings', [], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['ok'] ?? null, 'update_settings fails for empty payload');
+
+    $res = apiRequest('update_settings', ['unknown_key' => 'value'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['ok'] ?? null, 'update_settings fails for unknown keys only');
+
+    $res = apiRequest('update_settings', ['signature' => 'hijack'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['ok'] ?? null, 'update_settings rejects signature key');
+
+    $res = apiRequest('update_settings', ['theme' => 'light'], 'POST', ['X-Session-Token' => 'invalid']);
+    assertEquals(false, $res['ok'] ?? null, 'update_settings rejects invalid session');
+}
+
+function testUpdateSignature(): void
+{
+    group('update_signature');
+
+    $session = createTestAccountAndSession();
+    $token = $session['token'];
+
+    $res = apiRequest('update_signature', ['signature' => '-- \nSent from Emmmail'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['ok'] ?? null, 'update_signature returns ok:true');
+    assertEquals('-- \nSent from Emmmail', $res['data']['signature'] ?? 'x', 'update_signature stores signature');
+
+    $res = apiRequest('get_settings', [], 'POST', ['X-Session-Token' => $token]);
+    assertEquals('-- \nSent from Emmmail', $res['data']['settings']['signature'] ?? 'x', 'update_signature persisted in settings');
+
+    $res = apiRequest('update_signature', ['signature' => ''], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['ok'] ?? null, 'update_signature clears signature');
+    assertEquals('', $res['data']['signature'] ?? 'x', 'update_signature cleared value');
+
+    $res = apiRequest('update_signature', [], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['ok'] ?? null, 'update_signature fails when key missing');
+
+    $longSig = str_repeat('a', 10001);
+    $res = apiRequest('update_signature', ['signature' => $longSig], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['ok'] ?? null, 'update_signature rejects oversized signature');
+
+    $res = apiRequest('update_signature', ['signature' => 123], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['ok'] ?? null, 'update_signature handles numeric input');
+    assertEquals('123', $res['data']['signature'] ?? 'x', 'update_signature numeric cast to string');
+
+    $res = apiRequest('update_signature', ['signature' => 'test'], 'POST', ['X-Session-Token' => 'invalid']);
+    assertEquals(false, $res['ok'] ?? null, 'update_signature rejects invalid session');
+}
+
 /* ---------------------------------------------------------------------------
  * MAIN
  * ------------------------------------------------------------------------ */
@@ -1926,5 +2032,8 @@ testListContacts();
 testSearchContacts();
 testListTags();
 testCreateTag();
+testGetSettings();
+testUpdateSettings();
+testUpdateSignature();
 
 summary();

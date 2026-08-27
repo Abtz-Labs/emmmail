@@ -106,7 +106,48 @@
 - Message tagging (tag_message/untag_message) deferred to future phase
 - 382 tests passing, 0 failures, 3 skipped
 
+## Session 11 (2026-08-26) — Settings endpoints
+- Implemented 3 endpoints: get_settings, update_settings, update_signature
+- Plan reviewed by 2 subagents; 17 findings addressed (per-account scoping, bool coercion, type safety, etc.)
+- Added `settings` table: `(account_id, name, value)` with `PRIMARY KEY (account_id, name)`
+- All settings per-account — different accounts have different preferences
+- `getSettingsArray()` — whitelist-based, skips unknown keys, explicit bool coercion (`=== '1'`)
+- `update_settings` — validates theme against `['dark', 'light']`, normalizes bools explicitly
+- `update_signature` — requires key present, caps at 10000 chars (mb_strlen), returns error not silent truncation
+- 415 tests passing, 0 failures, 3 skipped
+
+## API Endpoints (complete)
+- `auth` — test IMAP/SMTP, create/update account (public)
+- `login` — authenticate, create session (public)
+- `logout` — destroy session (authenticated)
+- `session` — check session status (public)
+- `sync` — fetch folders/messages from IMAP (authenticated)
+- `list_folders` — list folders with unread/total counts (authenticated)
+- `list_messages` — paginated message list per folder (authenticated)
+- `get_message` — full message with body and attachments (authenticated)
+- `get_thread` — thread metadata + all messages (authenticated)
+- `set_flags` — mark read/starred, move to folder (authenticated)
+- `batch_action` — bulk read/unread/star/unstar/delete/archive/move (authenticated)
+- `search` — FTS5 full-text search (authenticated)
+- `list_accounts` — list all accounts for switcher UI (authenticated)
+- `add_account` — add new account, returns session token (authenticated)
+- `delete_account` — delete current account + all data (authenticated)
+- `detect_server` — auto-detect IMAP/SMTP from email domain (public)
+- `test_connection` — test IMAP/SMTP without saving (public)
+- `compose` — send email or save draft (authenticated)
+- `drafts` — list drafts (authenticated)
+- `draft` — get single draft (authenticated)
+- `update_draft` — update draft (authenticated)
+- `delete_draft` — delete draft (authenticated)
+- `download_attachment` — download attachment file (authenticated)
+- `message_attachments` — list message attachments (authenticated)
+- `list_contacts` — list contacts by use count (authenticated)
+- `search_contacts` — prefix-match contacts for autocomplete (authenticated)
+- `list_tags` — list tags sorted by name (authenticated)
+- `create_tag` — create tag with name and color (authenticated)
+- `get_settings` — get per-account settings (authenticated)
+- `update_settings` — update theme/bools (authenticated)
+- `update_signature` — update email signature (authenticated)
+
 ## Next
 - Build UI/UX
-- Add settings endpoints
-- Add contacts/tags/settings endpoints
