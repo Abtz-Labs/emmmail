@@ -612,11 +612,22 @@ function testSyncEndpointReal(): void
     $authPayload = ['email' => $email, 'password' => $password];
     if ($preset !== '') $authPayload['preset'] = $preset;
     $authRes = apiRequest('auth', $authPayload);
-    assertEquals(true, $authRes['ok'] ?? null, 'auth ok:true before sync');
-    $accountId = $authRes['data']['account_id'] ?? 0;
-    assertTest($accountId > 0, 'account_id obtained from auth');
+    if (!($authRes['ok'] ?? false) && str_contains($authRes['error'] ?? '', 'already exists')) {
+        // Account already exists from previous run — that's fine
+    } else {
+        assertEquals(true, $authRes['ok'] ?? null, 'auth ok:true before sync');
+    }
 
-    $res = apiRequest('sync', ['account_id' => $accountId]);
+    $loginRes = apiRequest('login', ['email' => $email, 'password' => $password]);
+    assertEquals(true, $loginRes['ok'] ?? null, 'login ok:true before sync');
+    $token = $loginRes['data']['session_token'] ?? '';
+    assertTest($token !== '', 'session_token obtained from login');
+
+    $sessionRes = apiRequest('session', [], 'POST', ['X-Session-Token' => $token]);
+    $accountId = $sessionRes['data']['account_id'] ?? 0;
+    assertTest($accountId > 0, 'account_id obtained from session');
+
+    $res = apiRequest('sync', ['account_id' => $accountId], 'POST', ['X-Session-Token' => $token]);
     assertEquals(true, $res['ok'] ?? null, 'sync ok:true');
     assertTest(($res['data']['folders_synced'] ?? 0) > 0, 'folders_synced > 0');
     assertTest(($res['data']['messages_synced'] ?? 0) > 0, 'messages_synced > 0');
@@ -648,13 +659,13 @@ function testSyncEndpointReal(): void
         assertTest($firstMsg['thread_id'] > 0, 'message linked to thread');
     }
 
-    $res2 = apiRequest('sync', ['account_id' => $accountId, 'folder' => 'INBOX']);
+    $res2 = apiRequest('sync', ['account_id' => $accountId, 'folder' => 'INBOX'], 'POST', ['X-Session-Token' => $token]);
     assertEquals(true, $res2['ok'] ?? null, 'incremental sync (specific folder) ok:true');
 
     $res3 = apiRequest('sync', [
         'account_id' => $accountId,
         'since' => gmdate('Y-m-d\TH:i:s\Z', strtotime('-7 days')),
-    ]);
+    ], 'POST', ['X-Session-Token' => $token]);
     assertEquals(true, $res3['ok'] ?? null, 'sync with since parameter ok:true');
 }
 
@@ -924,42 +935,56 @@ function testDraftEndpointReal(): void
 {
     group('Draft Endpoint (Real Server)');
 
-    if (getenv('EMMMAIL_TEST_EMAIL') === false || getenv('EMMMAIL_TEST_EMAIL') === '' || getenv('EMMMAIL_TEST_PASSWORD') === false || getenv('EMMMAIL_TEST_PASSWORD') === '') {
+    $email = getenv('EMMMAIL_TEST_EMAIL') ?: '';
+    $password = getenv('EMMMAIL_TEST_PASSWORD') ?: '';
+    $preset = getenv('EMMMAIL_TEST_PRESET') ?: 'migadu';
+
+    if ($email === '' || $password === '') {
         skipTest('EMMMAIL_TEST_EMAIL and EMMMAIL_TEST_PASSWORD not set — skipping');
         return;
     }
 
-    $res = apiRequest('auth', [
-        'preset' => getenv('EMMMAIL_TEST_PRESET') ?: 'migadu',
-        'email' => getenv('EMMMAIL_TEST_EMAIL'),
-        'password' => getenv('EMMMAIL_TEST_PASSWORD'),
-    ]);
-    if (!($res['ok'] ?? false)) {
+    $authPayload = ['email' => $email, 'password' => $password];
+    if ($preset !== '') $authPayload['preset'] = $preset;
+    $res = apiRequest('auth', $authPayload);
+    if (!($res['ok'] ?? false) && str_contains($res['error'] ?? '', 'already exists')) {
+        // Account already exists — that's fine
+    } elseif (!($res['ok'] ?? false)) {
         assertTest(false, 'auth ok:true with real credentials');
         echo '    ' . colorRed('error: ' . ($res['error'] ?? 'unknown')) . "\n";
         return;
     }
-    $accountId = $res['data']['account_id'];
 
+    $loginRes = apiRequest('login', ['email' => $email, 'password' => $password]);
+    if (!($loginRes['ok'] ?? false)) {
+        assertTest(false, 'login ok:true with real credentials');
+        echo '    ' . colorRed('error: ' . ($loginRes['error'] ?? 'unknown')) . "\n";
+        return;
+    }
+    $token = $loginRes['data']['session_token'];
+
+    $sessionRes = apiRequest('session', [], 'POST', ['X-Session-Token' => $token]);
+    $accountId = $sessionRes['data']['account_id'] ?? 0;
+
+    $subject = 'Test Draft ' . uniqid();
     $res = apiRequest('compose', [
-        'account_id' => $accountId,
-        'to' => [getenv('EMMMAIL_TEST_EMAIL')],
-        'subject' => 'Test Draft ' . uniqid(),
+        'to' => [$email],
+        'subject' => $subject,
         'body' => 'This is a test draft.',
         'draft' => true,
-    ]);
+    ], 'POST', ['X-Session-Token' => $token]);
     assertEquals(true, $res['ok'] ?? null, 'compose saves draft');
-    $draftId = $res['data']['draft_id'];
+    $draftId = $res['data']['draft_id'] ?? 0;
 
-    $res = apiRequest('drafts', ['account_id' => $accountId]);
+    $res = apiRequest('drafts', [], 'POST', ['X-Session-Token' => $token]);
     assertEquals(true, $res['ok'] ?? null, 'list drafts ok');
     assertTest(count($res['data']['drafts'] ?? []) > 0, 'drafts list not empty');
 
-    $res = apiRequest('draft', ['draft_id' => $draftId]);
+    $res = apiRequest('draft', ['draft_id' => $draftId], 'POST', ['X-Session-Token' => $token]);
     assertEquals(true, $res['ok'] ?? null, 'get draft ok');
-    assertEquals('Test Draft ' . substr($draftId, -6), $res['data']['subject'] ?? '', 'get draft subject');
+    assertEquals($subject, $res['data']['subject'] ?? '', 'get draft subject');
 
-    $res = apiRequest('delete_draft', ['draft_id' => $draftId]);
+    $res = apiRequest('delete_draft', ['draft_id' => $draftId], 'POST', ['X-Session-Token' => $token]);
     assertEquals(true, $res['ok'] ?? null, 'delete draft ok');
 }
 
