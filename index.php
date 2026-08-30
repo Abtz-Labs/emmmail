@@ -3170,6 +3170,258 @@ function actionUpdateSignature(): void
     jsonResponse(['ok' => true, 'data' => ['signature' => $signature]]);
 }
 
+function actionPing(): void
+{
+    jsonResponse(['ok' => true, 'data' => ['pong' => true, 'version' => EMMMAIL_VERSION, 'time' => gmdate('c')]]);
+}
+
+function actionSetup(): void
+{
+    $pdo = db();
+    $count = fetchOne($pdo, 'SELECT COUNT(*) AS c FROM accounts');
+    $setup = ((int) ($count['c'] ?? 0)) === 0;
+    jsonResponse(['ok' => true, 'data' => ['setup' => $setup]]);
+}
+
+function actionRenameTag(): void
+{
+    $accountId = currentAccountId();
+    if ($accountId <= 0) fail('No account found. Run auth first.');
+    $input = getInput();
+
+    $id = (int) ($input['id'] ?? 0);
+    $name = trim((string) ($input['name'] ?? ''));
+    if ($id <= 0) fail('Missing required field: id.');
+    if ($name === '') fail('Missing required field: name.');
+
+    $pdo = db();
+    $tag = fetchOne($pdo, 'SELECT id FROM tags WHERE id = ? AND account_id = ?', [$id, $accountId]);
+    if (!$tag) fail('Tag not found.', 404);
+
+    try {
+        $pdo->prepare('UPDATE tags SET name = ? WHERE id = ? AND account_id = ?')->execute([$name, $id, $accountId]);
+    } catch (Throwable $e) {
+        fail('A tag with this name already exists.');
+    }
+
+    jsonResponse(['ok' => true, 'data' => ['id' => $id, 'name' => $name]]);
+}
+
+function actionDeleteTag(): void
+{
+    $accountId = currentAccountId();
+    if ($accountId <= 0) fail('No account found. Run auth first.');
+    $input = getInput();
+
+    $id = (int) ($input['id'] ?? 0);
+    if ($id <= 0) fail('Missing required field: id.');
+
+    $pdo = db();
+    $tag = fetchOne($pdo, 'SELECT id FROM tags WHERE id = ? AND account_id = ?', [$id, $accountId]);
+    if (!$tag) fail('Tag not found.', 404);
+
+    $pdo->prepare('DELETE FROM tags WHERE id = ? AND account_id = ?')->execute([$id, $accountId]);
+    jsonResponse(['ok' => true, 'data' => ['deleted' => true]]);
+}
+
+function actionTagMessage(): void
+{
+    $accountId = currentAccountId();
+    if ($accountId <= 0) fail('No account found. Run auth first.');
+    $input = getInput();
+
+    $messageId = (int) ($input['message_id'] ?? 0);
+    $tagId = (int) ($input['tag_id'] ?? 0);
+    if ($messageId <= 0) fail('Missing required field: message_id.');
+    if ($tagId <= 0) fail('Missing required field: tag_id.');
+
+    $pdo = db();
+    $msg = fetchOne($pdo, 'SELECT id FROM messages WHERE id = ? AND account_id = ?', [$messageId, $accountId]);
+    if (!$msg) fail('Message not found.', 404);
+    $tag = fetchOne($pdo, 'SELECT id FROM tags WHERE id = ? AND account_id = ?', [$tagId, $accountId]);
+    if (!$tag) fail('Tag not found.', 404);
+
+    $pdo->prepare('INSERT OR IGNORE INTO message_tags (message_id, tag_id) VALUES (?, ?)')->execute([$messageId, $tagId]);
+    jsonResponse(['ok' => true, 'data' => ['tagged' => true]]);
+}
+
+function actionUntagMessage(): void
+{
+    $accountId = currentAccountId();
+    if ($accountId <= 0) fail('No account found. Run auth first.');
+    $input = getInput();
+
+    $messageId = (int) ($input['message_id'] ?? 0);
+    $tagId = (int) ($input['tag_id'] ?? 0);
+    if ($messageId <= 0) fail('Missing required field: message_id.');
+    if ($tagId <= 0) fail('Missing required field: tag_id.');
+
+    $pdo = db();
+    $msg = fetchOne($pdo, 'SELECT id FROM messages WHERE id = ? AND account_id = ?', [$messageId, $accountId]);
+    if (!$msg) fail('Message not found.', 404);
+    $tag = fetchOne($pdo, 'SELECT id FROM tags WHERE id = ? AND account_id = ?', [$tagId, $accountId]);
+    if (!$tag) fail('Tag not found.', 404);
+
+    $pdo->prepare('DELETE FROM message_tags WHERE message_id = ? AND tag_id = ?')->execute([$messageId, $tagId]);
+    jsonResponse(['ok' => true, 'data' => ['untagged' => true]]);
+}
+
+function actionBatchTag(): void
+{
+    $accountId = currentAccountId();
+    if ($accountId <= 0) fail('No account found. Run auth first.');
+    $input = getInput();
+
+    $messageIds = array_values(array_unique(array_map('intval', $input['message_ids'] ?? [])));
+    $tagIds = array_values(array_unique(array_map('intval', $input['tag_ids'] ?? [])));
+    $remove = !empty($input['remove']);
+    if (!$messageIds) fail('Missing required field: message_ids.');
+    if (!$tagIds) fail('Missing required field: tag_ids.');
+
+    $pdo = db();
+    $placeholders = implode(',', array_fill(0, count($messageIds), '?'));
+    $msgs = fetchAll($pdo, "SELECT id FROM messages WHERE id IN ($placeholders) AND account_id = ?", [...$messageIds, $accountId]);
+    $validMsgIds = array_map(fn($m) => (int) $m['id'], $msgs);
+    if (!$validMsgIds) fail('No valid messages found.', 404);
+
+    $pdo->beginTransaction();
+    try {
+        foreach ($validMsgIds as $mid) {
+            foreach ($tagIds as $tagId) {
+                if ($remove) {
+                    $pdo->prepare('DELETE FROM message_tags WHERE message_id = ? AND tag_id = ?')->execute([$mid, $tagId]);
+                } else {
+                    $pdo->prepare('INSERT OR IGNORE INTO message_tags (message_id, tag_id) VALUES (?, ?)')->execute([$mid, $tagId]);
+                }
+            }
+        }
+        $pdo->commit();
+    } catch (Throwable $e) {
+        $pdo->rollBack();
+        throw $e;
+    }
+
+    jsonResponse(['ok' => true, 'data' => ['updated' => true]]);
+}
+
+function actionExpungeFolder(): void
+{
+    $accountId = currentAccountId();
+    if ($accountId <= 0) fail('No account found. Run auth first.');
+    $input = getInput();
+
+    $folder = trim((string) ($input['folder_name'] ?? ''));
+    if ($folder === '') fail('Missing required field: folder_name.');
+
+    $pdo = db();
+    $acct = fetchOne($pdo, 'SELECT * FROM accounts WHERE id = ?', [$accountId]);
+    if (!$acct) fail('Account not found.', 404);
+
+    $key = getEncryptionKey();
+    $password = decryptPassword($acct, $key);
+    if ($password === '') fail('Could not decrypt stored password.', 500);
+
+    try {
+        $imap = new ImapClient($acct['imap_host'], (int) $acct['imap_port'], (int) $acct['imap_tls'], $acct['email'], $password, 20);
+        $imap->connect();
+        $imap->login();
+        $imap->selectFolder($folder);
+        $imap->expunge();
+        $imap->logout();
+    } catch (Throwable $e) {
+        fail('Expunge failed: ' . $e->getMessage(), 500);
+    }
+
+    jsonResponse(['ok' => true, 'data' => ['expunged' => true]]);
+}
+
+function actionUploadAttachment(): void
+{
+    $accountId = currentAccountId();
+    if ($accountId <= 0) fail('No account found. Run auth first.');
+
+    if (empty($_FILES['file'])) fail('No file uploaded.');
+    $f = $_FILES['file'];
+    if ((int) $f['error'] !== UPLOAD_ERR_OK) fail('Upload failed.');
+    if ((int) $f['size'] > EMMMAIL_MAX_ATTACH_SIZE) fail('File too large (max 25MB).');
+
+    $filename = sanitizeFilename((string) ($f['name'] ?? 'attachment'));
+    if ($filename === '') $filename = 'attachment.bin';
+    if (isBlockedAttachment($filename)) $filename .= '.txt';
+
+    $tmpDir = EMMMAIL_ATTACH_DIR . '/tmp';
+    if (!is_dir($tmpDir)) @mkdir($tmpDir, 0755, true);
+    $tmpPath = $tmpDir . '/' . bin2hex(random_bytes(16));
+    if (!move_uploaded_file($f['tmp_name'], $tmpPath)) fail('Could not store upload.');
+
+    $ct = 'application/octet-stream';
+    if (function_exists('mime_content_type')) {
+        $detected = @mime_content_type($tmpPath);
+        if ($detected !== false && $detected !== '') $ct = $detected;
+    } elseif (!empty($f['type'])) {
+        $ct = $f['type'];
+    }
+
+    jsonResponse(['ok' => true, 'data' => ['filename' => $filename, 'content_type' => $ct, 'size' => (int) $f['size'], 'tmp_path' => $tmpPath]]);
+}
+
+function actionCheckUpdate(): void
+{
+    $pdo = db();
+    $accountId = currentAccountId();
+    $updateUrl = '';
+
+    if ($accountId > 0) {
+        $row = fetchOne($pdo, 'SELECT value FROM settings WHERE account_id = ? AND name = ?', [$accountId, 'update_url']);
+        $updateUrl = $row ? trim((string) $row['value']) : '';
+    }
+
+    jsonResponse(['ok' => true, 'data' => [
+        'current' => EMMMAIL_VERSION,
+        'latest' => EMMMAIL_VERSION,
+        'update_available' => false,
+        'update_url' => $updateUrl,
+    ]]);
+}
+
+function actionApplyUpdate(): void
+{
+    $pdo = db();
+    $accountId = currentAccountId();
+    if ($accountId <= 0) fail('No account found. Run auth first.');
+
+    $row = fetchOne($pdo, 'SELECT value FROM settings WHERE account_id = ? AND name = ?', [$accountId, 'update_url']);
+    $url = $row ? trim((string) $row['value']) : '';
+    if ($url === '') fail('No update source configured. Set the "update_url" setting first.');
+
+    $ctx = stream_context_create(['http' => ['timeout' => 20, 'follow_location' => 1, 'user_agent' => 'Emmmail/' . EMMMAIL_VERSION]]);
+    $newCode = @file_get_contents($url, false, $ctx);
+    if ($newCode === false || $newCode === '') fail('Could not download update.');
+
+    $tmp = EMMMAIL_ROOT . '/.update-' . bin2hex(random_bytes(8)) . '.php';
+    file_put_contents($tmp, $newCode, LOCK_EX);
+
+    exec('php -l ' . escapeshellarg($tmp) . ' 2>&1', $out, $code);
+    if ($code !== 0) {
+        @unlink($tmp);
+        fail('Downloaded file failed PHP syntax check: ' . implode(' ', $out));
+    }
+
+    if (!str_contains($newCode, 'EMMMAIL_VERSION')) {
+        @unlink($tmp);
+        fail('Downloaded file does not look like an Emmmail build.');
+    }
+
+    $backup = EMMMAIL_ROOT . '/index.php.bak';
+    @copy(EMMMAIL_ROOT . '/index.php', $backup);
+    if (!@rename($tmp, EMMMAIL_ROOT . '/index.php')) {
+        @unlink($tmp);
+        fail('Could not replace index.php.', 500);
+    }
+
+    jsonResponse(['ok' => true, 'data' => ['updated' => true, 'version' => EMMMAIL_VERSION, 'backup' => basename($backup)]]);
+}
+
 /* ---------------------------------------------------------------------------
  * Front Controller
  * ------------------------------------------------------------------------ */
@@ -3180,7 +3432,7 @@ function handleRequest(): void
 
     $action = $_GET['action'] ?? '';
 
-    $publicActions = ['login', 'session', 'auth', 'detect_server', 'test_connection'];
+    $publicActions = ['login', 'session', 'auth', 'detect_server', 'test_connection', 'ping', 'setup'];
     if (!in_array($action, $publicActions, true)) {
         requireSession();
     }
@@ -3278,6 +3530,39 @@ function handleRequest(): void
             break;
         case 'update_signature':
             actionUpdateSignature();
+            break;
+        case 'ping':
+            actionPing();
+            break;
+        case 'setup':
+            actionSetup();
+            break;
+        case 'rename_tag':
+            actionRenameTag();
+            break;
+        case 'delete_tag':
+            actionDeleteTag();
+            break;
+        case 'tag_message':
+            actionTagMessage();
+            break;
+        case 'untag_message':
+            actionUntagMessage();
+            break;
+        case 'batch_tag':
+            actionBatchTag();
+            break;
+        case 'expunge_folder':
+            actionExpungeFolder();
+            break;
+        case 'upload_attachment':
+            actionUploadAttachment();
+            break;
+        case 'check_update':
+            actionCheckUpdate();
+            break;
+        case 'apply_update':
+            actionApplyUpdate();
             break;
         default:
             fail('Unknown action: ' . ($action ?: '(none)'));

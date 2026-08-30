@@ -2003,6 +2003,321 @@ function testUpdateSignature(): void
 }
 
 /* ---------------------------------------------------------------------------
+ * GROUP: Ping Endpoint
+ * ------------------------------------------------------------------------ */
+
+function testPingEndpoint(): void
+{
+    group('Ping Endpoint');
+
+    $res = apiRequest('ping', []);
+    assertEquals(true, $res['ok'] ?? null, 'ping ok:true');
+    assertEquals(true, $res['data']['pong'] ?? null, 'ping returns pong:true');
+    assertTest(!empty($res['data']['version']), 'ping returns version');
+    assertTest(!empty($res['data']['time']), 'ping returns time');
+}
+
+/* ---------------------------------------------------------------------------
+ * GROUP: Setup Endpoint
+ * ------------------------------------------------------------------------ */
+
+function testSetupEndpoint(): void
+{
+    group('Setup Endpoint');
+
+    $res = apiRequest('setup', []);
+    assertEquals(true, $res['ok'] ?? null, 'setup ok:true');
+    assertEquals(false, $res['data']['setup'] ?? null, 'setup false when accounts exist');
+
+    $res = apiRequest('setup', [], 'GET');
+    assertEquals(true, $res['ok'] ?? null, 'setup ok:true via GET');
+}
+
+/* ---------------------------------------------------------------------------
+ * GROUP: Rename Tag Endpoint
+ * ------------------------------------------------------------------------ */
+
+function testRenameTag(): void
+{
+    group('Rename Tag Endpoint');
+
+    $session = createTestAccountAndSession();
+    $token = $session['token'];
+
+    $res = apiRequest('create_tag', ['name' => 'OldName', 'color' => '#ff0000'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['ok'] ?? null, 'create_tag ok');
+    $tagId = $res['data']['id'];
+
+    $res = apiRequest('rename_tag', ['id' => $tagId, 'name' => 'NewName'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['ok'] ?? null, 'rename_tag ok');
+
+    $res = apiRequest('list_tags', [], 'POST', ['X-Session-Token' => $token]);
+    $found = false;
+    foreach ($res['data']['tags'] ?? [] as $t) {
+        if ($t['id'] === $tagId && $t['name'] === 'NewName') { $found = true; break; }
+    }
+    assertTest($found, 'tag renamed to NewName');
+
+    $res = apiRequest('rename_tag', [], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['ok'] ?? null, 'rename_tag rejects missing id');
+
+    $res = apiRequest('rename_tag', ['id' => $tagId], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['ok'] ?? null, 'rename_tag rejects missing name');
+
+    $res = apiRequest('rename_tag', ['id' => 99999, 'name' => 'X'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['ok'] ?? null, 'rename_tag rejects nonexistent tag');
+
+    $res = apiRequest('rename_tag', ['id' => $tagId, 'name' => 'NewName'], 'POST', ['X-Session-Token' => 'invalid']);
+    assertEquals(false, $res['ok'] ?? null, 'rename_tag rejects invalid session');
+}
+
+/* ---------------------------------------------------------------------------
+ * GROUP: Delete Tag Endpoint
+ * ------------------------------------------------------------------------ */
+
+function testDeleteTag(): void
+{
+    group('Delete Tag Endpoint');
+
+    $session = createTestAccountAndSession();
+    $token = $session['token'];
+
+    $res = apiRequest('create_tag', ['name' => 'ToDelete', 'color' => '#00ff00'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['ok'] ?? null, 'create_tag ok');
+    $tagId = $res['data']['id'];
+
+    $res = apiRequest('delete_tag', ['id' => $tagId], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['ok'] ?? null, 'delete_tag ok');
+
+    $res = apiRequest('list_tags', [], 'POST', ['X-Session-Token' => $token]);
+    $found = false;
+    foreach ($res['data']['tags'] ?? [] as $t) {
+        if ($t['id'] === $tagId) { $found = true; break; }
+    }
+    assertTest(!$found, 'tag deleted');
+
+    $res = apiRequest('delete_tag', [], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['ok'] ?? null, 'delete_tag rejects missing id');
+
+    $res = apiRequest('delete_tag', ['id' => 99999], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['ok'] ?? null, 'delete_tag rejects nonexistent tag');
+
+    $res = apiRequest('delete_tag', ['id' => $tagId], 'POST', ['X-Session-Token' => 'invalid']);
+    assertEquals(false, $res['ok'] ?? null, 'delete_tag rejects invalid session');
+}
+
+/* ---------------------------------------------------------------------------
+ * GROUP: Tag Message Endpoint
+ * ------------------------------------------------------------------------ */
+
+function testTagMessage(): void
+{
+    group('Tag Message Endpoint');
+
+    $session = createTestAccountAndSession();
+    $token = $session['token'];
+
+    $res = apiRequest('create_tag', ['name' => 'TestTag', 'color' => '#ff0000'], 'POST', ['X-Session-Token' => $token]);
+    $tagId = $res['data']['id'];
+
+    $pdo = db();
+    $pdo->prepare('INSERT INTO messages (account_id, folder_name, uid, subject, from_address, date, is_read, is_starred, has_attachments) VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0)')
+        ->execute([$session['account_id'], 'INBOX', 9001, 'Test', 'a@b.com', '2026-01-01T00:00:00Z']);
+    $msgId = (int) $pdo->lastInsertId();
+
+    $res = apiRequest('tag_message', ['message_id' => $msgId, 'tag_id' => $tagId], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['ok'] ?? null, 'tag_message ok');
+
+    $row = fetchOne($pdo, 'SELECT * FROM message_tags WHERE message_id = ? AND tag_id = ?', [$msgId, $tagId]);
+    assertTest($row !== null, 'message tagged in database');
+
+    $res = apiRequest('tag_message', ['message_id' => $msgId, 'tag_id' => $tagId], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['ok'] ?? null, 'tag_message idempotent (no duplicate error)');
+
+    $res = apiRequest('tag_message', [], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['ok'] ?? null, 'tag_message rejects missing message_id');
+
+    $res = apiRequest('tag_message', ['message_id' => $msgId], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['ok'] ?? null, 'tag_message rejects missing tag_id');
+
+    $res = apiRequest('tag_message', ['message_id' => $msgId, 'tag_id' => $tagId], 'POST', ['X-Session-Token' => 'invalid']);
+    assertEquals(false, $res['ok'] ?? null, 'tag_message rejects invalid session');
+}
+
+/* ---------------------------------------------------------------------------
+ * GROUP: Untag Message Endpoint
+ * ------------------------------------------------------------------------ */
+
+function testUntagMessage(): void
+{
+    group('Untag Message Endpoint');
+
+    $session = createTestAccountAndSession();
+    $token = $session['token'];
+
+    $res = apiRequest('create_tag', ['name' => 'RemoveTag', 'color' => '#0000ff'], 'POST', ['X-Session-Token' => $token]);
+    $tagId = $res['data']['id'];
+
+    $pdo = db();
+    $pdo->prepare('INSERT INTO messages (account_id, folder_name, uid, subject, from_address, date, is_read, is_starred, has_attachments) VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0)')
+        ->execute([$session['account_id'], 'INBOX', 9002, 'Test', 'a@b.com', '2026-01-01T00:00:00Z']);
+    $msgId = (int) $pdo->lastInsertId();
+
+    $pdo->prepare('INSERT OR IGNORE INTO message_tags (message_id, tag_id) VALUES (?, ?)')->execute([$msgId, $tagId]);
+
+    $res = apiRequest('untag_message', ['message_id' => $msgId, 'tag_id' => $tagId], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['ok'] ?? null, 'untag_message ok');
+
+    $row = fetchOne($pdo, 'SELECT * FROM message_tags WHERE message_id = ? AND tag_id = ?', [$msgId, $tagId]);
+    assertTest($row === null, 'message untagged in database');
+
+    $res = apiRequest('untag_message', [], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['ok'] ?? null, 'untag_message rejects missing message_id');
+
+    $res = apiRequest('untag_message', ['message_id' => $msgId], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['ok'] ?? null, 'untag_message rejects missing tag_id');
+
+    $res = apiRequest('untag_message', ['message_id' => $msgId, 'tag_id' => $tagId], 'POST', ['X-Session-Token' => 'invalid']);
+    assertEquals(false, $res['ok'] ?? null, 'untag_message rejects invalid session');
+}
+
+/* ---------------------------------------------------------------------------
+ * GROUP: Batch Tag Endpoint
+ * ------------------------------------------------------------------------ */
+
+function testBatchTag(): void
+{
+    group('Batch Tag Endpoint');
+
+    $session = createTestAccountAndSession();
+    $token = $session['token'];
+
+    $res = apiRequest('create_tag', ['name' => 'BatchTag1', 'color' => '#ff0000'], 'POST', ['X-Session-Token' => $token]);
+    $tagId1 = $res['data']['id'];
+    $res = apiRequest('create_tag', ['name' => 'BatchTag2', 'color' => '#00ff00'], 'POST', ['X-Session-Token' => $token]);
+    $tagId2 = $res['data']['id'];
+
+    $pdo = db();
+    $msgIds = [];
+    for ($i = 0; $i < 3; $i++) {
+        $pdo->prepare('INSERT INTO messages (account_id, folder_name, uid, subject, from_address, date, is_read, is_starred, has_attachments) VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0)')
+            ->execute([$session['account_id'], 'INBOX', 9010 + $i, 'Batch ' . $i, 'a@b.com', '2026-01-01T00:00:00Z']);
+        $msgIds[] = (int) $pdo->lastInsertId();
+    }
+
+    $res = apiRequest('batch_tag', ['message_ids' => $msgIds, 'tag_ids' => [$tagId1, $tagId2]], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['ok'] ?? null, 'batch_tag ok');
+
+    foreach ($msgIds as $mid) {
+        $r1 = fetchOne($pdo, 'SELECT * FROM message_tags WHERE message_id = ? AND tag_id = ?', [$mid, $tagId1]);
+        $r2 = fetchOne($pdo, 'SELECT * FROM message_tags WHERE message_id = ? AND tag_id = ?', [$mid, $tagId2]);
+        assertTest($r1 !== null, 'message ' . $mid . ' has tag1');
+        assertTest($r2 !== null, 'message ' . $mid . ' has tag2');
+    }
+
+    $res = apiRequest('batch_tag', ['message_ids' => $msgIds, 'tag_ids' => [$tagId1], 'remove' => true], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['ok'] ?? null, 'batch_tag remove ok');
+
+    foreach ($msgIds as $mid) {
+        $r1 = fetchOne($pdo, 'SELECT * FROM message_tags WHERE message_id = ? AND tag_id = ?', [$mid, $tagId1]);
+        assertTest($r1 === null, 'message ' . $mid . ' tag1 removed');
+    }
+
+    $res = apiRequest('batch_tag', [], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['ok'] ?? null, 'batch_tag rejects missing message_ids');
+
+    $res = apiRequest('batch_tag', ['message_ids' => $msgIds], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['ok'] ?? null, 'batch_tag rejects missing tag_ids');
+
+    $res = apiRequest('batch_tag', ['message_ids' => $msgIds, 'tag_ids' => [$tagId1]], 'POST', ['X-Session-Token' => 'invalid']);
+    assertEquals(false, $res['ok'] ?? null, 'batch_tag rejects invalid session');
+}
+
+/* ---------------------------------------------------------------------------
+ * GROUP: Expunge Folder Endpoint
+ * ------------------------------------------------------------------------ */
+
+function testExpungeFolder(): void
+{
+    group('Expunge Folder Endpoint');
+
+    $session = createTestAccountAndSession();
+    $token = $session['token'];
+
+    $res = apiRequest('expunge_folder', ['folder_name' => 'Trash'], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['ok'] ?? null, 'expunge_folder fails with fake credentials');
+    assertTest(str_contains($res['error'] ?? '', 'Expunge failed'), 'expunge_folder returns error message');
+
+    $res = apiRequest('expunge_folder', [], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['ok'] ?? null, 'expunge_folder rejects missing folder_name');
+
+    $res = apiRequest('expunge_folder', ['folder_name' => ''], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['ok'] ?? null, 'expunge_folder rejects empty folder_name');
+
+    $res = apiRequest('expunge_folder', ['folder_name' => 'Trash'], 'POST', ['X-Session-Token' => 'invalid']);
+    assertEquals(false, $res['ok'] ?? null, 'expunge_folder rejects invalid session');
+}
+
+/* ---------------------------------------------------------------------------
+ * GROUP: Upload Attachment Endpoint
+ * ------------------------------------------------------------------------ */
+
+function testUploadAttachment(): void
+{
+    group('Upload Attachment Endpoint');
+
+    $session = createTestAccountAndSession();
+    $token = $session['token'];
+
+    $res = apiRequest('upload_attachment', [], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['ok'] ?? null, 'upload_attachment rejects missing file');
+
+    $res = apiRequest('upload_attachment', [], 'POST', ['X-Session-Token' => 'invalid']);
+    assertEquals(false, $res['ok'] ?? null, 'upload_attachment rejects invalid session');
+}
+
+/* ---------------------------------------------------------------------------
+ * GROUP: Check Update Endpoint
+ * ------------------------------------------------------------------------ */
+
+function testCheckUpdate(): void
+{
+    group('Check Update Endpoint');
+
+    $session = createTestAccountAndSession();
+    $token = $session['token'];
+
+    $res = apiRequest('check_update', [], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(true, $res['ok'] ?? null, 'check_update ok');
+    assertTest(!empty($res['data']['current']), 'check_update returns current version');
+    assertTest(!empty($res['data']['latest']), 'check_update returns latest version');
+    assertEquals(false, $res['data']['update_available'] ?? null, 'check_update returns update_available');
+    assertTest(array_key_exists('update_url', $res['data']), 'check_update returns update_url');
+
+    $res = apiRequest('check_update', [], 'POST', ['X-Session-Token' => 'invalid']);
+    assertEquals(false, $res['ok'] ?? null, 'check_update rejects invalid session');
+}
+
+/* ---------------------------------------------------------------------------
+ * GROUP: Apply Update Endpoint
+ * ------------------------------------------------------------------------ */
+
+function testApplyUpdate(): void
+{
+    group('Apply Update Endpoint');
+
+    $session = createTestAccountAndSession();
+    $token = $session['token'];
+
+    $res = apiRequest('apply_update', [], 'POST', ['X-Session-Token' => $token]);
+    assertEquals(false, $res['ok'] ?? null, 'apply_update fails without update_url');
+    assertTest(str_contains($res['error'] ?? '', 'update_url'), 'apply_update returns error about update_url');
+
+    $res = apiRequest('apply_update', [], 'POST', ['X-Session-Token' => 'invalid']);
+    assertEquals(false, $res['ok'] ?? null, 'apply_update rejects invalid session');
+}
+
+/* ---------------------------------------------------------------------------
  * MAIN
  * ------------------------------------------------------------------------ */
 
@@ -2060,5 +2375,16 @@ testCreateTag();
 testGetSettings();
 testUpdateSettings();
 testUpdateSignature();
+testPingEndpoint();
+testSetupEndpoint();
+testRenameTag();
+testDeleteTag();
+testTagMessage();
+testUntagMessage();
+testBatchTag();
+testExpungeFolder();
+testUploadAttachment();
+testCheckUpdate();
+testApplyUpdate();
 
 summary();

@@ -34,9 +34,14 @@ The entire application (backend logic, frontend markup, CSS, and JavaScript) liv
 - Server auto-detection (presets + MX lookup)
 - Connection testing without saving
 - Contact management (auto-populated from messages, search, autocomplete)
-- Tag management (create, list, case-insensitive uniqueness)
+- Tag management (create, rename, delete, case-insensitive uniqueness)
+- Message tagging (tag, untag, batch tag/untag)
 - Per-account settings (theme, signature, preferences)
-- Full test suite (TDD, 415 assertions)
+- File upload for compose attachments
+- IMAP EXPUNGE for permanent deletion
+- Health check and setup detection endpoints
+- Self-update with syntax validation and backup
+- Full test suite (TDD, 476 assertions)
 - [TODO] Keyboard shortcuts
 - [TODO] Dark/light theme
 - [TODO] Mobile-first responsive design
@@ -95,6 +100,48 @@ php -S localhost:2525 index.php
 ## API
 
 All endpoints are called via `index.php?action=<action>`. Requests use JSON POST bodies with `Content-Type: application/json`.
+
+### Health Check
+
+#### `ping`
+
+Health check endpoint. Returns version and server time. Public (no session required).
+
+```bash
+curl -s http://localhost:2525/?action=ping | jq
+```
+
+**Response:**
+
+```json
+{
+  "ok": true,
+  "data": {
+    "pong": true,
+    "version": "1.0.0",
+    "time": "2026-08-26T12:00:00+00:00"
+  }
+}
+```
+
+#### `setup`
+
+Check if first-time setup is needed (no accounts configured). Public (no session required).
+
+```bash
+curl -s http://localhost:2525/?action=setup | jq
+```
+
+**Response:**
+
+```json
+{
+  "ok": true,
+  "data": {
+    "setup": true
+  }
+}
+```
 
 ### Authentication
 
@@ -719,6 +766,126 @@ curl -s http://localhost:2525/?action=create_tag \
 { "ok": true, "data": { "id": 1, "name": "Important", "color": "#ff0000" } }
 ```
 
+#### `rename_tag`
+
+Rename an existing tag.
+
+```bash
+curl -s http://localhost:2525/?action=rename_tag \
+  -H 'Content-Type: application/json' \
+  -H 'X-Session-Token: abc123...' \
+  -d '{"id": 1, "name": "Very Important"}' | jq
+```
+
+**Parameters:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `id` | int | yes | Tag ID |
+| `name` | string | yes | New tag name |
+
+**Response:**
+
+```json
+{ "ok": true, "data": { "id": 1, "name": "Very Important" } }
+```
+
+#### `delete_tag`
+
+Delete a tag. Also removes all message associations.
+
+```bash
+curl -s http://localhost:2525/?action=delete_tag \
+  -H 'Content-Type: application/json' \
+  -H 'X-Session-Token: abc123...' \
+  -d '{"id": 1}' | jq
+```
+
+**Parameters:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `id` | int | yes | Tag ID |
+
+**Response:**
+
+```json
+{ "ok": true, "data": { "deleted": true } }
+```
+
+#### `tag_message`
+
+Add a tag to a message. Idempotent (no error if already tagged).
+
+```bash
+curl -s http://localhost:2525/?action=tag_message \
+  -H 'Content-Type: application/json' \
+  -H 'X-Session-Token: abc123...' \
+  -d '{"message_id": 1, "tag_id": 1}' | jq
+```
+
+**Parameters:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `message_id` | int | yes | Message ID |
+| `tag_id` | int | yes | Tag ID |
+
+**Response:**
+
+```json
+{ "ok": true, "data": { "tagged": true } }
+```
+
+#### `untag_message`
+
+Remove a tag from a message.
+
+```bash
+curl -s http://localhost:2525/?action=untag_message \
+  -H 'Content-Type: application/json' \
+  -H 'X-Session-Token: abc123...' \
+  -d '{"message_id": 1, "tag_id": 1}' | jq
+```
+
+**Parameters:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `message_id` | int | yes | Message ID |
+| `tag_id` | int | yes | Tag ID |
+
+**Response:**
+
+```json
+{ "ok": true, "data": { "untagged": true } }
+```
+
+#### `batch_tag`
+
+Add or remove tags from multiple messages at once.
+
+```bash
+curl -s http://localhost:2525/?action=batch_tag \
+  -H 'Content-Type: application/json' \
+  -H 'X-Session-Token: abc123...' \
+  -d '{"message_ids": [1, 2, 3], "tag_ids": [1, 2]}' | jq
+```
+
+**Parameters:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `message_ids` | int[] | yes | Array of message IDs |
+| `tag_ids` | int[] | yes | Array of tag IDs |
+| `remove` | bool | no | If `true`, remove tags instead of adding |
+
+**Response:**
+
+```json
+{ "ok": true, "data": { "updated": true } }
+```
+
 ### Settings
 
 #### `get_settings`
@@ -790,6 +957,64 @@ curl -s http://localhost:2525/?action=update_signature \
 { "ok": true, "data": { "signature": "-- \nSent from Emmmail" } }
 ```
 
+### Updates
+
+#### `check_update`
+
+Check if a new version is available. Returns current and latest version numbers.
+
+```bash
+curl -s http://localhost:2525/?action=check_update \
+  -H 'X-Session-Token: abc123...' | jq
+```
+
+**Response:**
+
+```json
+{
+  "ok": true,
+  "data": {
+    "current": "1.0.0",
+    "latest": "1.0.0",
+    "update_available": false,
+    "update_url": ""
+  }
+}
+```
+
+#### `apply_update`
+
+Download and apply an update from the configured `update_url` setting. The downloaded file is validated (PHP syntax check + Emmmail build marker) before replacing the current `index.php`. A backup is created at `index.php.bak`.
+
+```bash
+curl -s http://localhost:2525/?action=apply_update \
+  -H 'X-Session-Token: abc123...' | jq
+```
+
+**Prerequisites:** The `update_url` setting must be configured via `update_settings`.
+
+**Response (success):**
+
+```json
+{
+  "ok": true,
+  "data": {
+    "updated": true,
+    "version": "1.0.0",
+    "backup": "index.php.bak"
+  }
+}
+```
+
+**Response (no update_url):**
+
+```json
+{
+  "ok": false,
+  "error": "No update source configured. Set the \"update_url\" setting first."
+}
+```
+
 ### Sync
 
 #### `sync`
@@ -822,6 +1047,29 @@ curl -s http://localhost:2525/?action=sync \
     "last_sync_at": "2026-08-26T12:00:00Z"
   }
 }
+```
+
+#### `expunge_folder`
+
+Permanently delete messages marked for deletion in a folder (IMAP EXPUNGE). Typically used on the Trash folder.
+
+```bash
+curl -s http://localhost:2525/?action=expunge_folder \
+  -H 'Content-Type: application/json' \
+  -H 'X-Session-Token: abc123...' \
+  -d '{"folder_name": "Trash"}' | jq
+```
+
+**Parameters:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `folder_name` | string | yes | Folder name to expunge |
+
+**Response:**
+
+```json
+{ "ok": true, "data": { "expunged": true } }
 ```
 
 ### Compose
@@ -1009,6 +1257,38 @@ curl -s http://localhost:2525/?action=download_attachment \
   -H 'Content-Type: application/json' \
   -d '{"attachment_id": 1}' --output document.pdf
 ```
+
+#### `upload_attachment`
+
+Upload a file for use in compose. Returns file metadata for inclusion in the `compose` endpoint's `attachments` array.
+
+```bash
+curl -s http://localhost:2525/?action=upload_attachment \
+  -H 'X-Session-Token: abc123...' \
+  -F 'file=@document.pdf' | jq
+```
+
+**Parameters:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `file` | file | yes | File to upload (multipart/form-data) |
+
+**Response:**
+
+```json
+{
+  "ok": true,
+  "data": {
+    "filename": "document.pdf",
+    "content_type": "application/pdf",
+    "size": 32000,
+    "tmp_path": "/path/to/tmp/file"
+  }
+}
+```
+
+The `tmp_path` is temporary. Include the file metadata in the `compose` endpoint's `attachments` array to send it.
 
 ## User Manual
 

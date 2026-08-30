@@ -149,5 +149,69 @@
 - `update_settings` — update theme/bools (authenticated)
 - `update_signature` — update email signature (authenticated)
 
+## Session 12 (2026-08-26) — Missing endpoints for frontend
+- Implemented 9 endpoints: ping, setup, rename_tag, delete_tag, tag_message, untag_message, batch_tag, expunge_folder, upload_attachment
+- `ping` — public health check (version + time)
+- `setup` — public check if first-time setup needed (no accounts)
+- `rename_tag` — rename tag (account-scoped, checks existence)
+- `delete_tag` — delete tag (account-scoped, checks existence)
+- `tag_message` — add tag to message (INSERT OR IGNORE, idempotent)
+- `untag_message` — remove tag from message
+- `batch_tag` — batch tag/untag multiple messages (transaction)
+- `expunge_folder` — IMAP EXPUNGE (connects to real server)
+- `upload_attachment` — upload file for compose (multipart/form-data)
+- 467 tests passing, 0 failures, 3 skipped
+
+## Session 13 (2026-08-26) — Self-update endpoints
+- Implemented 2 endpoints: check_update, apply_update
+- `check_update` — returns current/latest version, update_available flag, update_url from settings
+- `apply_update` — downloads new code from update_url, validates PHP syntax, checks for EMMMAIL_VERSION marker, backs up current file, replaces it
+- `apply_update` reads `update_url` from per-account settings
+- 476 tests passing, 0 failures, 3 skipped
+
+## API Endpoints (complete — 42 endpoints)
+- `ping` — health check (public)
+- `setup` — check if first-time setup needed (public)
+- `auth` — test IMAP/SMTP, create/update account (public)
+- `login` — authenticate, create session (public)
+- `logout` — destroy session (authenticated)
+- `session` — check session status (public)
+- `sync` — fetch folders/messages from IMAP (authenticated)
+- `list_folders` — list folders with unread/total counts (authenticated)
+- `list_messages` — paginated message list per folder (authenticated)
+- `get_message` — full message with body and attachments (authenticated)
+- `get_thread` — thread metadata + all messages (authenticated)
+- `set_flags` — mark read/starred, move to folder (authenticated)
+- `batch_action` — bulk read/unread/star/unstar/delete/archive/move (authenticated)
+- `search` — FTS5 full-text search (authenticated)
+- `list_accounts` — list all accounts for switcher UI (authenticated)
+- `add_account` — add new account, returns session token (authenticated)
+- `delete_account` — delete current account + all data (authenticated)
+- `detect_server` — auto-detect IMAP/SMTP from email domain (public)
+- `test_connection` — test IMAP/SMTP without saving (public)
+- `compose` — send email or save draft (authenticated)
+- `drafts` — list drafts (authenticated)
+- `draft` — get single draft (authenticated)
+- `update_draft` — update draft (authenticated)
+- `delete_draft` — delete draft (authenticated)
+- `download_attachment` — download attachment file (authenticated)
+- `upload_attachment` — upload file for compose (authenticated)
+- `message_attachments` — list message attachments (authenticated)
+- `list_contacts` — list contacts by use count (authenticated)
+- `search_contacts` — prefix-match contacts for autocomplete (authenticated)
+- `list_tags` — list tags sorted by name (authenticated)
+- `create_tag` — create tag with name and color (authenticated)
+- `rename_tag` — rename tag (authenticated)
+- `delete_tag` — delete tag (authenticated)
+- `tag_message` — add tag to message (authenticated)
+- `untag_message` — remove tag from message (authenticated)
+- `batch_tag` — batch tag/untag messages (authenticated)
+- `expunge_folder` — IMAP EXPUNGE (authenticated)
+- `get_settings` — get per-account settings (authenticated)
+- `update_settings` — update theme/bools (authenticated)
+- `update_signature` — update email signature (authenticated)
+- `check_update` — check for new version (authenticated)
+- `apply_update` — download and apply update (authenticated)
+
 ## Next
 - Build UI/UX
