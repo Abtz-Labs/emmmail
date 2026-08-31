@@ -41,7 +41,11 @@ The entire application (backend logic, frontend markup, CSS, and JavaScript) liv
 - IMAP EXPUNGE for permanent deletion
 - Health check and setup detection endpoints
 - Self-update with syntax validation and backup
-- Full test suite (TDD, 476 assertions)
+- Complete SPA frontend (login, setup, message list, thread view, compose, settings, contacts, search)
+- Dark/light theme with CSS variables
+- Keyboard shortcuts (c=compose, r=reply, e=archive, #=delete, s=star, j/k=navigate, /=search)
+- Mobile-first responsive design with bottom tabs
+- Full test suite (TDD, 500 assertions)
 - [TODO] Keyboard shortcuts
 - [TODO] Dark/light theme
 - [TODO] Mobile-first responsive design

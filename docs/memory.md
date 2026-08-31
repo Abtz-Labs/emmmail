@@ -213,5 +213,70 @@
 - `check_update` — check for new version (authenticated)
 - `apply_update` — download and apply update (authenticated)
 
+## Session 14 (2026-08-26) — Frontend UI
+- Implemented complete SPA frontend in `serveFrontend()` (~2000 LOC HTML/CSS/JS)
+- Hash-based routing: #login, #setup, #inbox, #sent, #drafts, #starred, #all, #tag/:id, #thread/:id, #compose, #reply/:id, #forward/:id, #search, #settings, #contacts
+- Login page with email/password, theme toggle, error display
+- Setup wizard with test connection flow
+- Sidebar: account switcher, folder navigation, tags, contacts/settings links
+- Message list: unread indicators, star toggle, avatars, date formatting, sync status
+- Thread view: message cards, collapse/expand, reply/reply-all/forward, archive/delete/star
+- Compose window: from selector, to/cc/bcc with recipient chips, rich text editor, draft autosave
+- Settings: account management, signature editor, theme toggle, preferences
+- Contacts: search, click-to-compose
+- Search: full-text with from/to/subject filters
+- Theme: dark/light with CSS variables, localStorage persistence
+- Keyboard shortcuts: c=compose, r=reply, a=reply-all, f=forward, e=archive, #=delete, s=star, j/k=navigate, o=enter, /=search, Cmd+Enter=send, Escape=close
+- Responsive: mobile sidebar, bottom tabs, full-screen compose on mobile
+- Session management: token stored in localStorage, sent via X-Session-Token header
+- 500 tests passing, 0 failures, 3 skipped
+
+## Session 15 (2026-08-31) — Frontend routing fix
+- Bug: opening `http://localhost:2525/` returned `{"ok":false,"error":"Authentication required..."}` instead of the SPA
+- Root cause: `handleRequest()` had no route for empty `action` — `''` was not in `$publicActions`, so `requireSession()` rejected every bare `/` request before any HTML was served
+- Fix: `handleRequest()` now serves `serveFrontend()` and returns when `$action === ''` (before the session gate)
+- Added `testFrontendRoute()` regression tests (bare request serves HTML, not blocked by session, works with invalid session)
+- Verified live: `curl :2525/` → HTTP 200, 93KB HTML; `action=ping` and session-protected routes unaffected
+- 504 tests passing, 0 failures, 3 skipped
+
+## Session 16 (2026-08-31) — Fix icons + JS syntax (frontend dead on arrival)
+- Symptom: UI shell renders but (1) no icons, (2) no login/onboarding ever triggers
+- Root cause 1 — broken JS: `App` bundle had a stray `}` in `bindGlobal` (`focusSearch()})},`) plus a missing `}` for the `if(bar){` block; JS never parsed, so `App.init()` never ran → no login/setup, no dynamic icons
+  - Correct tail: `this.el('#btn-search').addEventListener('click',()=>this.focusSearch());}}` then `,`
+  - Found via acorn (installed in /tmp) after node --check pointed at `renderTextBody`'s `/\\r\\n/` regex (caret was misleading)
+- Root cause 2 — icons: CDN URL used non-existent package `@tabler-icons-webfont` (HTTP 400). Real package: `@tabler/icons-webfont` (HTTP 200, real font-face)
+- Regression guards added to `testFrontend()`:
+  - asserts CDN link uses `@tabler/icons-webfont`
+  - extracts inline app script and runs real `node --check` (SKIPs when node missing)
+- Verified live: `curl :2525/` serves fixed HTML; all inline scripts parse via node; icon CSS loads
+- Also fixed: `handleRequest()` now serves `serveFrontend()` for empty `action` (Session 15 bug)
+- 507 tests passing, 0 failures, 3 skipped
+
+## Session 17 (2026-08-31) — Setup wizard: presets + custom server fields
+- Symptom: onboarding screen only had Email+Password — no preset picker, no custom IMAP/SMTP host/port/TLS; "Test connection" always failed (it sent only email/password, backend requires imap_host → error toast → Finish stayed disabled), so setup could not complete
+- Fix (frontend-only, in `serveFrontend()`):
+  - Added `<select data-spreset>` (gmail/yahoo/outlook/migadu/icloud/custom) that fills IMAP/SMTP host/port/TLS fields from a new JS `PROVIDERS` map (values mirror server `getPresets()`); custom = edit manually
+  - Added editable fields `data-simap-host/-port/-tls` and `data-ssmtp-host/-port/-tls` (TLS: 1=SSL/TLS, 2=STARTTLS, 0=None) in new `.field-row` grids + `.setup-server-title` CSS
+  - `testConnection` now sends the full IMAP/SMTP config to `test_connection`; success enables Finish
+  - `submitSetup` sends full config to `auth`, then calls `login` to obtain a `session_token` (auth returns none), stores it in `localStorage['emmmail-session']`, then `init()` → `#inbox`. Fixes "first-run setup leaves you logged out"
+- 12 new frontend assertions in `testFrontend()` (preset selector, 6 server fields, PROVIDERS map, TLS labels, config in payload, login-token flow)
+- Also widened `.auth-card` to `max-width:560px` on desktop with `@media(max-width:640px)` override to `100%` (mobile-friendly); footer matches
+- Polish (same day, TDD, all in `testFrontend()` + `serveFrontend()`):
+  - "Test connection" stays disabled with "Connected" label on success (no more `finally` re-enable)
+  - Preset selection focuses the email input
+  - New `setBtnState(btn,on,label)` helper → Save signature / Add account show loading + restore on failure; success/error toasts normalized
+  - Toast `z-index` 90→120 — was rendering BELOW the `#fullscreen` overlay (settings/contacts), so toasts were invisible from those screens
+  - `sync_on_load` was stored but never acted on → new `syncOnLoad()` fires `sync` in `init()` when enabled, refreshes base data + current folder; toggle now toasts feedback
+- 534 tests passing, 0 failures, 3 skipped
+- Manual sync robustness (same day, TDD):
+  - Root-cause: first full sync = 269 per-message IMAP round trips ≈ 93s; `fetchMessages()`/`searchSince()` were UNGUARDED per-folder (only `selectFolder` + per-message fetch were) — one folder error aborted the entire sync; auto-sync could also run concurrently with manual sync (providers reject simultaneous logins)
+  - Backend: each folder's `fetchMessages`/`searchSince` now wrapped in try/catch → skip folder, keep syncing
+  - Frontend: `_syncing` lock — `syncOnLoad` skips + manual sync toasts "Sync already in progress" when a sync is running; lock released in `finally`
+- 538 tests passing, 0 failures, 3 skipped
+
 ## Next
-- Build UI/UX
+- Smoke-test first access in browser: fresh DB → #setup wizard (preset + server fields); with accounts → #login
+- Polish UI/UX
+- Add attachment upload to compose
+- Add drag-and-drop to compose
+- Add undo for batch actions

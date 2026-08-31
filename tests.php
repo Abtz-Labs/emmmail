@@ -133,11 +133,13 @@ function imapReflector(): object
         $imap = new ImapClient('localhost', 993, 1, 'test@test.com', 'pass');
         $tokenize = new ReflectionMethod($imap, 'tokenize');
         $parseFetchItems = new ReflectionMethod($imap, 'parseFetchItems');
+        $parseBodies = new ReflectionMethod($imap, 'parseBodies');
         if (PHP_VERSION_ID < 80100) {
             $tokenize->setAccessible(true);
             $parseFetchItems->setAccessible(true);
+            $parseBodies->setAccessible(true);
         }
-        $pair = (object) ['imap' => $imap, 'tokenize' => $tokenize, 'parseFetchItems' => $parseFetchItems];
+        $pair = (object) ['imap' => $imap, 'tokenize' => $tokenize, 'parseFetchItems' => $parseFetchItems, 'parseBodies' => $parseBodies];
     }
     return $pair;
 }
@@ -329,6 +331,90 @@ function testImapRoleDetection(): void
     assertEquals('junk', ImapClient::detectRole('Spam', []), 'detectRole fallback by name ("Spam")');
     assertEquals('archive', ImapClient::detectRole('All Mail', []), 'detectRole fallback by name ("All Mail")');
     assertEquals(null, ImapClient::detectRole('Random Folder', []), 'detectRole returns null for unknown');
+}
+
+/* ---------------------------------------------------------------------------
+ * GROUP: IMAP Fetch Bodies Parser (via ReflectionMethod)
+ * ------------------------------------------------------------------------ */
+
+function testImapFetchBodiesParser(): void
+{
+    group('IMAP Fetch Bodies Parser (via ReflectionMethod)');
+
+    $r = imapReflector();
+
+    $lines = [
+        ['type' => 'line', 'text' => '* 1 FETCH (UID 1 BODY[] {5}'],
+        ['type' => 'literal', 'text' => 'hello'],
+        ['type' => 'line', 'text' => ' FLAGS (\\Seen))'],
+        ['type' => 'line', 'text' => '* 2 FETCH (UID 2 BODY[] {0}'],
+        ['type' => 'literal', 'text' => ''],
+        ['type' => 'line', 'text' => ' FLAGS (\\Seen \\Flagged))'],
+        ['type' => 'line', 'text' => '* 3 FETCH (UID 7 BODY[] {6}'],
+        ['type' => 'literal', 'text' => 'world!'],
+        ['type' => 'line', 'text' => ' FLAGS ()'],
+        ['type' => 'line', 'text' => 'A1 OK Success'],
+    ];
+
+    $bodies = $r->parseBodies->invoke($r->imap, $lines);
+    assertEquals(3, count($bodies), 'parseBodies returns one entry per fetched message');
+    assertEquals(1, $bodies[0]['uid'], 'parseBodies keeps first uid');
+    assertEquals('hello', $bodies[0]['raw'], 'parseBodies keeps body from the literal');
+    assertEquals(['\Seen'], $bodies[0]['flags'], 'parseBodies keeps flags after the literal');
+    assertEquals(2, $bodies[1]['uid'], 'parseBodies keeps second uid');
+    assertEquals('', $bodies[1]['raw'], 'parseBodies handles an empty literal body');
+    assertEquals(['\Seen', '\Flagged'], $bodies[1]['flags'], 'parseBodies keeps multiple flags');
+    assertEquals(7, $bodies[2]['uid'], 'parseBodies keeps arbitrary (non-consecutive) uid');
+    assertEquals('world!', $bodies[2]['raw'], 'parseBodies keeps last body');
+    assertEquals([], $bodies[2]['flags'], 'parseBodies keeps empty flags list');
+
+    assertEquals([], $r->parseBodies->invoke($r->imap, [['type' => 'line', 'text' => 'A1 OK Success']]), 'parseBodies returns [] with no fetch entries');
+
+    assertEquals([], $r->parseBodies->invoke($r->imap, []), 'parseBodies returns [] with empty lines');
+}
+
+/* ---------------------------------------------------------------------------
+ * GROUP: IMAP Connect Retry (throwing subclass)
+ * ------------------------------------------------------------------------ */
+
+class RetryImap extends ImapClient
+{
+    public int $calls = 0;
+    public bool $failAlways = false;
+
+    public function connect(): void
+    {
+        $this->calls++;
+        if ($this->failAlways || $this->calls <= 2) {
+            throw new RuntimeException('boom');
+        }
+    }
+
+    public function login(): void
+    {
+        if ($this->failAlways) {
+            throw new RuntimeException('boom');
+        }
+    }
+}
+
+function testImapConnectRetry(): void
+{
+    group('IMAP Connect Retry (throwing subclass)');
+
+    $ok = new RetryImap('localhost', 993, 1, 'a@b.c', 'x');
+    $ok->connectWithRetry(3);
+    assertEquals(3, $ok->calls, 'connectWithRetry retries after transient failures');
+
+    $bad = new RetryImap('localhost', 993, 1, 'a@b.c', 'x');
+    $bad->failAlways = true;
+    $thrown = false;
+    try {
+        $bad->connectWithRetry(2);
+    } catch (RuntimeException $e) {
+        $thrown = $e->getMessage() === 'boom';
+    }
+    assertTest($thrown, 'connectWithRetry throws after exhausting attempts');
 }
 
 /* ---------------------------------------------------------------------------
@@ -2318,6 +2404,132 @@ function testApplyUpdate(): void
 }
 
 /* ---------------------------------------------------------------------------
+ * GROUP: Frontend
+ * ------------------------------------------------------------------------ */
+
+function appScriptFromHtml(string $html): ?string
+{
+    preg_match_all('/<script>([\s\S]*?)<\/script>/', $html, $m);
+    $blocks = $m[1] ?? [];
+    if (count($blocks) < 2) return null;
+    return end($blocks);
+}
+
+function nodeJsCheck(string $js): ?bool
+{
+    static $node = null;
+    if ($node === null) {
+        $node = (bool) @exec('command -v node 2>/dev/null', $o, $code);
+    }
+    if (!$node) return null;
+
+    $file = tempnam(sys_get_temp_dir(), 'emm_js_') . '.js';
+    file_put_contents($file, $js);
+    @exec(escapeshellarg(PHP_BINARY === 'php' ? 'node' : 'node') . ' --check ' . escapeshellarg($file) . ' 2>&1', $out, $exit);
+    @unlink($file);
+    return $exit === 0;
+}
+
+function testFrontend(): void
+{
+    group('Frontend');
+
+    require_once __DIR__ . '/index.php';
+    $html = serveFrontend();
+
+    assertTest(is_string($html), 'serveFrontend returns string');
+    assertTest(strlen($html) > 1000, 'serveFrontend returns substantial HTML');
+
+    assertTest(str_contains($html, '<!DOCTYPE html>'), 'HTML has doctype');
+    assertTest(str_contains($html, '<html'), 'HTML has html tag');
+    assertTest(str_contains($html, '</html>'), 'HTML has closing html tag');
+    assertTest(str_contains($html, '<head>'), 'HTML has head tag');
+    assertTest(str_contains($html, '<body'), 'HTML has body tag');
+
+    assertTest(str_contains($html, 'id="app"'), 'HTML has #app container');
+    assertTest(str_contains($html, 'class="topbar"'), 'HTML has topbar');
+    assertTest(str_contains($html, 'class="sidebar"'), 'HTML has sidebar');
+    assertTest(str_contains($html, 'pane-list'), 'HTML has pane-list');
+    assertTest(str_contains($html, 'pane-detail'), 'HTML has pane-detail');
+
+    assertTest(str_contains($html, 'data-login-form'), 'HTML has login form');
+    assertTest(str_contains($html, 'type="email"'), 'HTML has email input');
+    assertTest(str_contains($html, 'type="password"'), 'HTML has password input');
+
+    assertTest(str_contains($html, 'data-spreset'), 'setup form has provider preset selector');
+    assertTest(str_contains($html, 'data-simap-host'), 'setup form has IMAP host field');
+    assertTest(str_contains($html, 'data-simap-port'), 'setup form has IMAP port field');
+    assertTest(str_contains($html, 'data-simap-tls'), 'setup form has IMAP TLS select');
+    assertTest(str_contains($html, 'data-ssmtp-host'), 'setup form has SMTP host field');
+    assertTest(str_contains($html, 'data-ssmtp-port'), 'setup form has SMTP port field');
+    assertTest(str_contains($html, 'data-ssmtp-tls'), 'setup form has SMTP TLS select');
+    assertTest(str_contains($html, 'PROVIDERS'), 'JavaScript has PROVIDERS preset map');
+    assertTest(str_contains($html, 'SSL/TLS'), 'TLS options include SSL/TLS');
+    assertTest(str_contains($html, 'STARTTLS'), 'TLS options include STARTTLS');
+    assertTest(str_contains($html, 'imap_port:+form.querySelector'), 'testConnection/submitSetup send IMAP server config');
+    assertTest(str_contains($html, 'this.api(\'login\',{email:form.querySelector(\'[data-semail]\')'), 'submitSetup obtains session token via login');
+    assertTest(str_contains($html, 'testBtn.textContent=\'Connected\''), 'test connection stays disabled after success');
+    assertTest(str_contains($html, 'form.querySelector(\'[data-semail]\').focus()'), 'preset selection focuses email input');
+    assertTest(str_contains($html, 'setBtnState:function(btn,on,label)'), 'app has normalized button loading helper');
+    assertTest(str_contains($html, 'this.setBtnState(btn,true'), 'async submit buttons show loading state');
+    assertTest(str_contains($html, 'this.showToast(\'Signature saved\')'), 'save signature confirms success via toast');
+    assertTest(str_contains($html, 'this.showToast(\'Account added\')'), 'add account confirms success via toast');
+    assertTest(str_contains($html, '.toast-container{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(24px + env(safe-area-inset-bottom));z-index:120;'), 'toasts render above fullscreen overlays');
+    assertTest(str_contains($html, 'syncOnLoad:async function'), 'app performs sync on load');
+    assertTest(str_contains($html, 'if(this._syncing)return'), 'sync on load skips when a sync is already running');
+    assertTest(str_contains($html, 'Sync already in progress'), 'manual sync reports when a sync is already running');
+    assertTest(str_contains($html, 'finally{this._syncing=false}'), 'sync lock is released after completing');
+    assertTest(str_contains($html, 'this.api(\'sync\',{account_id:this.currentAccountId})'), 'sync on load calls sync endpoint');
+    assertTest(str_contains($html, 'history.replaceState(null,\'\',h)'), 'navigate keeps URL hash in sync');
+    assertTest(str_contains($html, 'this.syncOnLoad()'), 'sync on load is invoked from init');
+    assertTest(str_contains($html, 'this.settings.sync_on_load'), 'sync on load reads the setting');
+    assertTest(str_contains($html, 'this.showToast(\'Auto-sync \''), 'sync on load toggle gives toast feedback');
+    assertTest(!str_contains($html, 'finally{testBtn.disabled=false'), 'test connection does not re-enable button in finally');
+
+    assertTest(str_contains($html, 'data-theme'), 'HTML has theme attribute');
+    assertTest(str_contains($html, '--bg:'), 'CSS has dark theme variables');
+    assertTest(str_contains($html, '[data-theme="light"]'), 'CSS has light theme');
+    assertTest(str_contains($html, 'max-width:560px'), 'auth card is larger on desktop');
+    assertTest(str_contains($html, '@media(max-width:640px){.auth-card{max-width:100%'), 'auth card shrinks to full width on mobile');
+
+    assertTest(str_contains($html, 'const App'), 'JavaScript has App object');
+    assertTest(str_contains($html, 'App.init'), 'JavaScript has App.init');
+    assertTest(str_contains($html, 'navigate:function') || str_contains($html, 'App.navigate'), 'JavaScript has navigate');
+    assertTest(str_contains($html, 'api:async') || str_contains($html, 'App.api'), 'JavaScript has api');
+
+    assertTest(str_contains($html, '@tabler/icons-webfont'), 'Tabler Icons CDN URL uses valid package');
+    assertTest(str_contains($html, 'tabler-icons'), 'HTML loads Tabler Icons');
+    assertTest(str_contains($html, 'Emmmail'), 'HTML has app name');
+
+    $appScript = appScriptFromHtml($html);
+    assertTest($appScript !== null, 'HTML has inline app script block');
+    if ($appScript !== null) {
+        $ok = nodeJsCheck($appScript);
+        if ($ok === null) {
+            skipTest('app JavaScript syntax check needs node (not found)');
+        } else {
+            assertTest($ok, 'app JavaScript passes node --check (no syntax errors)');
+        }
+    }
+}
+
+function testFrontendRoute(): void
+{
+    group('Frontend Route');
+
+    $res = apiRequest('', [], 'POST');
+    $raw = $res['_raw'] ?? '';
+
+    assertTest(str_contains($raw, '<!DOCTYPE html>'), 'bare request without action serves frontend HTML');
+    assertTest(!str_contains($raw, 'Authentication required'), 'bare request without action is not blocked by session');
+    assertTest(!str_contains($raw, 'Unknown action'), 'bare request without action does not hit unknown-action error');
+
+    $res = apiRequest('', [], 'POST', ['X-Session-Token' => 'invalid']);
+    $raw = $res['_raw'] ?? '';
+    assertTest(str_contains($raw, '<!DOCTYPE html>'), 'bare request serves frontend HTML even with invalid session');
+}
+
+/* ---------------------------------------------------------------------------
  * MAIN
  * ------------------------------------------------------------------------ */
 
@@ -2329,6 +2541,8 @@ testDatabaseSchema();
 testImapRoleDetection();
 testImapTokenizer();
 testImapFetchItemsParser();
+testImapFetchBodiesParser();
+testImapConnectRetry();
 testAuthEndpoint();
 testProviderPresets();
 testAuthEndpointReal();
@@ -2386,5 +2600,7 @@ testExpungeFolder();
 testUploadAttachment();
 testCheckUpdate();
 testApplyUpdate();
+testFrontend();
+testFrontendRoute();
 
 summary();
