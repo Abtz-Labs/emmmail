@@ -2559,7 +2559,8 @@ function actionListMessages(): void
 
     $input = getInput();
     $folder = $input['folder'] ?? '';
-    if ($folder === '') fail('Missing required field: folder');
+    $tagId = $input['tag_id'] ?? null;
+    if ($folder === '' && $tagId === null) fail('Missing required field: folder');
 
     $limit = (int) ($input['limit'] ?? 50);
     $limit = max(1, min(100, $limit));
@@ -2567,7 +2568,18 @@ function actionListMessages(): void
     $cursor = $input['cursor'] ?? null;
     $pdo = db();
 
-    if ($cursor !== null && str_contains($cursor, '|')) {
+    if ($tagId !== null) {
+        $sql = 'SELECT m.id, m.uid, m.message_id, m.subject, m.from_address, m.from_name, m.to_addresses, m.date, m.is_read, m.is_starred, m.has_attachments, m.thread_id, SUBSTR(m.text_body, 1, 200) AS preview FROM messages m JOIN message_tags mt ON m.id = mt.message_id WHERE m.account_id = ? AND mt.tag_id = ?';
+        $params = [$accountId, $tagId];
+        if ($cursor !== null && str_contains($cursor, '|')) {
+            [$cursorDate, $cursorId] = explode('|', $cursor, 2);
+            $sql .= ' AND (m.date < ? OR (m.date = ? AND m.id < ?))';
+            $params = array_merge($params, [$cursorDate, $cursorDate, (int) $cursorId]);
+        }
+        $sql .= ' ORDER BY m.date DESC, m.id DESC LIMIT ?';
+        $params[] = $limit + 1;
+        $rows = fetchAll($pdo, $sql, $params);
+    } elseif ($cursor !== null && str_contains($cursor, '|')) {
         [$cursorDate, $cursorId] = explode('|', $cursor, 2);
         $cursorDate = (string) $cursorDate;
         $cursorId = (int) $cursorId;
