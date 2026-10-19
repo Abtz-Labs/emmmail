@@ -1,5 +1,7 @@
 # Emmmail
 
+![Emmmail inbox](docs/screenshot-inbox.png)
+
 A single-file, self-hosted webmail client built with PHP and SQLite.
 
 No frameworks. No Composer. No build tools. One file, one database, done.
