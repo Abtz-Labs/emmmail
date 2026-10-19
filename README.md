@@ -1,71 +1,263 @@
 # Emmmail
 
-A single-file, self-hosted email client built with PHP and SQLite.
+A single-file, self-hosted webmail client built with PHP and SQLite.
 
 No frameworks. No Composer. No build tools. One file, one database, done.
 
 ## Concept
 
-Emmmail was born from a desire for simplicity. Most web email clients are bloated, require complex infrastructure, or lock your data behind a subscription. Emmmail takes the opposite approach: drop one PHP file on any server with PHP 8.1+ and you have a fully functional email client with IMAP/SMTP support, thread grouping, search, and a Gmail-inspired interface.
+Emmmail takes the opposite approach to bloated web mail clients: drop one PHP
+file on any server running PHP 8+ and you have a functional email client with
+IMAP/SMTP support, compose/send, search, and a Gmail-inspired interface.
 
-The entire application (backend logic, frontend markup, CSS, and JavaScript) lives in a single `index.php` file. The database is a SQLite file created automatically on first run. Attachments go into a single directory. That's the whole stack.
+The entire application — backend logic, markup, CSS, and JavaScript — lives in a
+single `index.php`. The data lives in a single SQLite file created on first use.
+That's the whole stack.
 
 ## Features
 
-- Pure PHP IMAP and SMTP clients (no ext-imap dependency)
-- IMAP/SMTP login (credentials validated against the mail server)
-- AES-256-GCM password encryption (key stored in `.env`)
-- Thread grouping by subject
-- Compose and send emails via SMTP
-- Draft management (save, list, update, delete)
-- Attachment storage and download
-- Provider presets (Gmail, Yahoo, Outlook, Migadu, iCloud)
-- Session-based authentication with IP binding
-- Rate limiting for login attempts
-- SSRF protection (blocks private/reserved IPs)
-- CRLF injection prevention
-- Message listing with cursor-based pagination
-- Full message retrieval with body and attachments
-- Thread view with all messages
-- Flag management (read/starred) and message moves
-- Bulk operations (batch read, star, delete, archive, move)
-- Full-text search (FTS5)
-- Multi-account support (add, switch, delete)
-- Server auto-detection (presets + MX lookup)
-- Connection testing without saving
-- Contact management (auto-populated from messages, search, autocomplete)
-- Tag management (create, rename, delete, case-insensitive uniqueness)
-- Message tagging (tag, untag, batch tag/untag)
-- Per-account settings (theme, signature, preferences)
-- File upload for compose attachments
-- IMAP EXPUNGE for permanent deletion
-- Health check and setup detection endpoints
-- Self-update with syntax validation and backup
-- Complete SPA frontend (login, setup, message list, thread view, compose, settings, contacts, search)
-- Dark/light theme with CSS variables
-- Keyboard shortcuts (c=compose, r=reply, e=archive, #=delete, s=star, j/k=navigate, /=search)
-- Mobile-first responsive design with bottom tabs
-- Full test suite (TDD, 500 assertions)
-- [TODO] Keyboard shortcuts
-- [TODO] Dark/light theme
-- [TODO] Mobile-first responsive design
+- IMAP and SMTP over the PHP `imap` extension and raw stream sockets
+- Login with credentials validated directly against the mail server
+- Provider presets (Gmail, Yahoo, Outlook, Migadu, iCloud) or a custom
+  IMAP/SMTP server configuration
+- Inbox, folder, and single-message (read) views with pagination
+- Inbox sorted by received time (newest first)
+- Folders ordered sensibly: Inbox, Drafts, Sent, Spam, Archive | Trash | others
+- Compose, send (SMTP), reply, reply all, and forward, with attachments
+- Markdown composer that formats as you type (see [Composer](#composer)); the
+  recipient gets HTML, and the Markdown source is the plain-text part
+- Cc and Bcc (Bcc travels in the SMTP envelope only; it is recorded solely on
+  the copy filed in Sent)
+- Save drafts, and reopen one in the composer to continue it
+- Create and delete folders from the sidebar (Inbox, Drafts, Sent, Spam and
+  Trash are protected)
+- First-access onboarding maps the system roles to your real folder names: the
+  app auto-detects Sent/Drafts/Spam/Trash/Archive from your IMAP server and
+  opens a pre-filled dialog the first time you log in (dismissible, no dead end)
+- Attach inline/uploaded files with size limits
+- Move to Trash, restore, and empty Trash or Spam (permanent delete)
+- Move a message into any folder
+- Mark as spam (moves to the Junk mailbox; never deletes)
+- Mark as read / unread
+- Bulk selection and actions on the list view: tick rows, or select-all, then
+  mark them read or unread, move them to any folder, or delete them. The
+  actions post **one** request for the whole batch (up to 200 messages, and a
+  handful of IMAP commands total rather than a few per message) and the rows are
+  patched optimistically. A refused batch restores every row, the list count and
+  the sidebar badge. `x` or Space picks the row under the keyboard cursor. The bar
+  sits in the mailbox header, so it does not push the list down. On a touch
+  screen, tap a sender's avatar to start a selection. A background
+   poll does not reload the list while rows are picked, so a selection is never
+   thrown away mid-batch
+- Conversations: replies group into one row, with a count, and open as a
+  thread. A reply you filed in Sent joins its Inbox conversation. See
+  [Conversations](#conversations)
+- Unread counters in the sidebar (Drafts shows how many drafts are waiting; Sent,
+  Trash and Archive show none). Other folders refresh with one STATUS each, at
+  most once a minute, during the background sync
+- Unread Inbox count in the tab title, `(3) Inbox — Emmmail`, and no prefix at
+  zero
+- A background poll on every signed-in page, not only the folder listings: it
+  syncs the Inbox, and the open folder too when you are looking at one. Once a
+  minute, which is not a setting. New mail refreshes the open
+  list only when you are not in the middle of something; otherwise it waits for
+  a later tick. A tab you have not touched for two hours stops asking, and the
+  next click or keystroke starts it again
+- Optional browser notifications (Settings → Notifications), per browser and off
+  by default: a count of new Inbox messages and nothing else, only while the tab
+  is hidden or the window is not focused, replaced rather than stacked, and
+  cleared when you come back. Desktop browsers only, and best effort — see
+  [Notifications](#notifications)
+- Remote images blocked by default, with a per-message reveal and a trusted-sender
+  list (exact addresses). Covers `<img src>`, `background=` and CSS `url()`
+- Every click that costs a round trip says so at once: opening a message spins its
+  row, and a reader action (Back, Reply, Forward, Unread, Move, Spam, Delete),
+  a search, the server-side search offer, or Send/Save draft in the composer spins
+  its own control while a progress bar runs in the top bar
+- Search across a folder (local cache first, then IMAP)
+- Contacts auto-populated from recipients, with autocomplete
+- Per-account settings (messages per page, display name, signature, automatic check,
+  undo send, remote images, protected-folder map)
+- Session-based authentication with IP binding and rate-limit on logins;
+  the login page remembers the last email used and the mail-server settings
+  (the preset, or your own IMAP/SMTP fields), focuses the field you still
+  need to fill, and spins the Sign in button while it works
+- Floating toast notifications (success/error) that never shift the layout
+  and never sit translucent over the message: server flashes, login errors
+  and refused actions all arrive as fixed toasts that fade out on their own
+- HTML sanitization for safe message rendering
+- CSRF protection, CSP, and hardened session settings
+- Embedded (offline) icon set — no external requests
+
+## Composer
+
+You write in Markdown. The composer formats the text as you type, with no
+toolbar and no external library. It sends the message as HTML, with the Markdown
+source as the plain-text part. With JavaScript off, you get a plain textarea and
+the same Markdown is rendered on send. "Supports simplified Markdown syntax",
+above the buttons, opens the same list of options in a modal.
+
+| Type at the start of a line | Result |
+|---|---|
+| `# ` … `###### ` | Heading 1 to 6 |
+| `- `, `* ` or `• ` | Bullet list |
+| `1. ` | Numbered list |
+| `> ` | Quote (quotes nest: `> > `) |
+| ```` ``` ```` + space | Code block (Enter on an empty last line leaves it) |
+| `---`, `***` or `___` + Enter | Horizontal rule |
+
+| Type anywhere | Result |
+|---|---|
+| `**bold**` | **bold** |
+| `*italic*` or `_italic_` | *italic* |
+| `~~strike~~` | ~~strike~~ |
+| `` `code` `` | `code` |
+| `[text](https://…)` | Link (`http`, `https` and `mailto` only) |
+| `![alt](https://…)` | Remote image (`https` only) |
+| a bare `https://…` | Link |
+
+- ⌘B / Ctrl+B and ⌘I / Ctrl+I toggle bold and italic.
+- Backspace right after a line-start rule gives back the characters you typed.
+  Undo (⌘Z) also works: it takes two steps.
+- One Enter starts a new line; an empty line separates paragraphs.
+- Ordinary text stays as it is: `snake_case`, `2 * 3`, `#hashtag`, `~5 min` and
+  `1986. was a year` are not formatted. A backslash makes a character literal
+  (`\*`).
+- In a reply or a forward, the original message is quoted as text. Its own
+  Markdown, link labels and images are never rendered, so a quoted image
+  cannot load when you click Reply.
+
+### Limitations
+
+These are decisions for this version. Each one has a regression test (group
+`markdown v1 limitations`).
+
+1. Lists are flat. An indented item joins the same list at the same level.
+2. `-- `, `** ` and `•• ` are not nested-list markers. They stay as text.
+3. Tab is not captured. It moves the focus out of the composer.
+4. Raw HTML is not rendered. `<b>x</b>` is sent as that text.
+5. No tables, task lists or footnotes.
+6. Images must be `https` remote URLs. You cannot upload or embed an image in
+   the body; attach it instead. Many mail clients block remote images by default.
+7. Paste and drop insert plain text. Pasted Markdown is not formatted.
+8. No link dialog (⌘K). ⌘U does nothing, because Markdown has no underline.
+9. There is no setting to turn Markdown off.
+10. If the browser restores a form after a reload, the composer shows the
+    server's copy of the message, not the restored text.
+
+The composer was verified in Chromium. Safari, Firefox and mobile keyboards
+(iOS Smart Punctuation, Android composition) need a manual check.
+
+## Notifications
+
+The tab title always carries the unread Inbox count. Browser notifications are
+opt-in, per browser, and switched on from Settings → Notifications (outside the
+settings form, because the button acts at once and that form only saves on
+Save). The flag lives in this browser's `localStorage`; nothing about it is sent
+to the server, so each browser and each device decides for itself.
+
+When it is on and new mail reaches the Inbox, the browser says how many messages
+arrived, and only while the tab is hidden or the window is not focused — a
+notification for a tab you are looking at is noise. Clicking it focuses the tab
+and clears the count. The banner carries a fixed tag, so a second tab or a
+second poll replaces it instead of stacking a queue.
+
+This is a poll, not a push service, and it is best effort:
+
+- **The tab must be open.** There is no service worker and no Web Push, so a
+  closed tab knows nothing.
+- **Desktop browsers only.** iOS Safari needs an installed app (`Add to Home
+  Screen`) before `Notification` exists, and the card is hidden without it.
+- **Phones freeze background tabs.** iOS and Android will suspend a tab you are
+  not looking at, and Safari may suspend a desktop tab too, so the poll can stop
+  without warning.
+- **Chrome slows hidden tabs** to roughly one timer a minute, which is also the
+  interval, so the two line up.
+- **A card that cannot work is not shown.** No `Notification` API, or a page
+  served over plain HTTP, and the card is removed. If the browser grants
+  permission and then refuses to build a notification (Android Chrome does), the
+  flag is turned back off and the card says so.
+- **Two hours idle stops the poll**, so a forgotten window does not hold your
+  session (and the mail password in it) open. Click or type and it starts again.
+- **There is no sound.** The operating system plays its own notification sound,
+  and a sound from a web page is not something a browser lets us control.
+
+## Conversations
+
+A conversation's root is the first `References` message-id, else `In-Reply-To`, else the
+message's own `Message-ID`. Every cached message whose root matches groups into one row,
+and the row opens at `?page=thread`. A reply you sent joins the conversation because its
+copy in Sent carries the same `References`, and the send path keeps them. The reader
+shows the newest 30 messages, oldest first, with the newest open.
+
+This is a v1 with deliberate limits:
+
+1. **A folder is grouped only when its whole message set is cached** (up to the newest
+   500, the sync window). A larger folder lists flat, exactly as before, so no page ever
+   mixes conversations with a live tail.
+2. **Cross-folder members are whatever is cached.** Sent is kept warm by the background
+   poll, so a reply you sent appears; a member of a folder that has not synced does not.
+   Drafts, Trash and Junk never join a conversation.
+3. **Search results are flat.** So are Drafts.
+4. **A reply that carries only `In-Reply-To`** (no `References`) and answers a *middle*
+   message can be grouped with its parent instead of the root. Clients that send
+   `References` (Emmail, Gmail, Outlook, Apple Mail) do not show this.
+5. **The reader shows the newest 30 messages** of a conversation and says how many older
+   ones it left out.
+6. **The upgrade rebuilds the header cache once** (schema v4), and a folder the cache
+   still holds rows without a conversation key for (a cache written before the key
+   existed) re-syncs itself once on the next visit.
+7. A message auto-saved to Sent by the server *and* filed by Emmmail can appear twice.
 
 ## Requirements
 
 - PHP 8.1 or later
-- SQLite3 extension (usually bundled with PHP)
-- OpenSSL extension (for AES-256-GCM encryption)
+- `ext-imap` (IMAP client)
+- `ext-mbstring` (multibyte string handling)
+- `ext-sodium` (encryption)
+- `ext-pdo_sqlite` (SQLite database)
+- `ext-dom` (HTML sanitization)
+- `ext-openssl` (TLS connections)
 - A web server (Apache, Nginx, or PHP's built-in server for development)
+
+> Note: the IMAP extension was removed from PHP core at 8.4 and is now split
+> out as PECL. See [Installing ext-imap](#installing-ext-imap) below.
 
 ## Installation
 
 1. Copy `index.php` to your web root (or any directory served by PHP).
-2. Make sure the directory is writable (for the SQLite database and `.env` file).
-3. Open it in a browser. The setup screen will walk you through adding your first email account.
+2. Make sure the directory is writable so the SQLite database can be created.
+3. Open it in a browser and log in with your email account.
 
 That's it.
 
-For development (requires [just](https://github.com/casey/just)):
+### Installing ext-imap
+
+The app requires the PHP `imap` extension.
+
+- **macOS (Homebrew)**:
+  ```
+  brew tap shivammathur/extensions
+  brew trust shivammathur/extensions
+  brew install shivammathur/extensions/imap@8.5
+  ```
+- **Debian / Ubuntu** (ondrej/php PPA/DPA): `php8.4-imap` / `php8.5-imap`
+- **Any PHP 8.4+** via PECL (needs `libc-client-dev`):
+  ```
+  pecl install imap
+  ```
+- **Docker** (official PHP images) with
+  `mlocati/docker-php-extension-installer`:
+  ```
+  install-php-extensions imap
+  ```
+  Note: Debian *Trixie* removed `libc-client2007e`; pin the base image to
+  *bookworm*.
+- **Alpine**: `apk add phpXX-imap`
+
+### Development
+
+With [just](https://github.com/casey/just):
 
 ```
 just start
@@ -83,7 +275,7 @@ Run in background:
 just start background
 ```
 
-Both options combined:
+Both combined:
 
 ```
 just start 3000 background
@@ -95,1315 +287,227 @@ Stop the server:
 just stop
 ```
 
-Or directly:
+Or run PHP's built-in server directly:
 
 ```
 php -S localhost:2525 index.php
 ```
 
-## API
-
-All endpoints are called via `index.php?action=<action>`. Requests use JSON POST bodies with `Content-Type: application/json`.
-
-### Health Check
-
-#### `ping`
-
-Health check endpoint. Returns version and server time. Public (no session required).
-
-```bash
-curl -s http://localhost:2525/?action=ping | jq
-```
-
-**Response:**
-
-```json
-{
-  "ok": true,
-  "data": {
-    "pong": true,
-    "version": "1.0.0",
-    "time": "2026-08-26T12:00:00+00:00"
-  }
-}
-```
-
-#### `setup`
-
-Check if first-time setup is needed (no accounts configured). Public (no session required).
-
-```bash
-curl -s http://localhost:2525/?action=setup | jq
-```
-
-**Response:**
-
-```json
-{
-  "ok": true,
-  "data": {
-    "setup": true
-  }
-}
-```
-
-### Authentication
-
-#### `auth`
-
-Test IMAP and SMTP connections with the given credentials. On success, persists (or updates) the account in the database.
-
-**With a preset** (recommended):
-
-```bash
-curl -s http://localhost:2525/?action=auth \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "preset": "migadu",
-    "email": "you@example.com",
-    "password": "your-password"
-  }' | jq
-```
-
-**With custom server config** (no preset):
-
-```bash
-curl -s http://localhost:2525/?action=auth \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "imap_host": "mail.example.com",
-    "imap_port": 993,
-    "imap_tls": 1,
-    "smtp_host": "mail.example.com",
-    "smtp_port": 587,
-    "smtp_tls": 2,
-    "email": "you@example.com",
-    "password": "your-password"
-  }' | jq
-```
-
-**Available presets:** `gmail`, `yahoo`, `outlook`, `migadu`, `icloud`
-
-| Preset | IMAP | SMTP |
-|--------|------|------|
-| `gmail` | imap.gmail.com:993 (SSL) | smtp.gmail.com:465 (SSL) |
-| `yahoo` | imap.mail.yahoo.com:993 (SSL) | smtp.mail.yahoo.com:465 (SSL) |
-| `outlook` | outlook.office365.com:993 (SSL) | smtp.office365.com:587 (STARTTLS) |
-| `migadu` | imap.migadu.com:993 (SSL) | smtp.migadu.com:465 (SSL) |
-| `icloud` | imap.mail.me.com:993 (SSL) | smtp.mail.me.com:587 (STARTTLS) |
-
-Response (success):
-
-```json
-{
-  "ok": true,
-  "data": {
-    "account_id": 1,
-    "email": "you@example.com",
-    "imap": {
-      "ok": true,
-      "error": "",
-      "folders": [
-        {"name": "INBOX", "flags": ["\\HasNoChildren", "\\Inbox"]}
-      ]
-    },
-    "smtp": {
-      "ok": true,
-      "error": ""
-    }
-  }
-}
-```
-
-Response (failure):
-
-```json
-{
-  "ok": false,
-  "error": "IMAP: connection failed; SMTP: connection failed"
-}
-```
-
-**Parameters:**
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `preset` | string | no | Provider preset name (see table above). When provided, IMAP/SMTP settings are auto-resolved. |
-| `email` | string | yes | Full email address |
-| `password` | string | yes | Account password |
-| `imap_host` | string | if no preset | IMAP server hostname |
-| `imap_port` | int | if no preset | IMAP port (usually 993 for SSL) |
-| `imap_tls` | int | if no preset | TLS mode: `0` = none, `1` = SSL, `2` = STARTTLS |
-| `smtp_host` | string | if no preset | SMTP server hostname |
-| `smtp_port` | int | if no preset | SMTP port (usually 465 for SSL, 587 for STARTTLS) |
-| `smtp_tls` | int | if no preset | TLS mode: `0` = none, `1` = SSL, `2` = STARTTLS |
-
-#### `login`
-
-Authenticate with email and password. Returns a session token.
-
-```bash
-curl -s http://localhost:2525/?action=login \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "email": "you@example.com",
-    "password": "your-password"
-  }' | jq
-```
-
-**Response:**
-
-```json
-{
-  "ok": true,
-  "data": {
-    "session_token": "abc123...",
-    "account_id": 1,
-    "email": "you@example.com",
-    "display_name": "Your Name"
-  }
-}
-```
-
-#### `logout`
-
-Destroy the current session.
-
-```bash
-curl -s http://localhost:2525/?action=logout \
-  -H 'X-Session-Token: abc123...' | jq
-```
-
-#### `session`
-
-Check if the current session is authenticated.
-
-```bash
-curl -s http://localhost:2525/?action=session \
-  -H 'X-Session-Token: abc123...' | jq
-```
-
-**Response (authenticated):**
-
-```json
-{
-  "ok": true,
-  "data": {
-    "authenticated": true,
-    "account_id": 1,
-    "email": "you@example.com",
-    "display_name": "Your Name"
-  }
-}
-```
-
-**Response (not authenticated):**
-
-```json
-{
-  "ok": true,
-  "data": {
-    "authenticated": false
-  }
-}
-```
-
-### Session Management
-
-All endpoints except `auth`, `login`, and `session` require a valid session token. The token can be provided via:
-
-1. `X-Session-Token` header (recommended)
-2. `EMMMAILSESSID` cookie
-
-Sessions are bound to the IP address that created them and expire after 30 minutes of inactivity or 24 hours absolute.
-
-### Sync
-
-#### `list_folders`
-
-List all folders for the authenticated account, sorted by role priority.
-
-```bash
-curl -s http://localhost:2525/?action=list_folders \
-  -H 'X-Session-Token: abc123...' | jq
-```
-
-**Response:**
-
-```json
-{
-  "ok": true,
-  "data": {
-    "folders": [
-      { "id": 1, "name": "INBOX", "role": "inbox", "unread_count": 5, "total_count": 120 },
-      { "id": 2, "name": "Sent", "role": "sent", "unread_count": 0, "total_count": 40 }
-    ]
-  }
-}
-```
-
-#### `list_messages`
-
-List messages in a folder with cursor-based pagination.
-
-```bash
-curl -s http://localhost:2525/?action=list_messages \
-  -H 'Content-Type: application/json' \
-  -H 'X-Session-Token: abc123...' \
-  -d '{"folder": "INBOX", "limit": 20}' | jq
-```
-
-**Parameters:**
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `folder` | string | yes | Folder name (e.g., `INBOX`) |
-| `limit` | int | no | Max messages per page (1-100, default 50) |
-| `cursor` | string | no | Pagination cursor from previous response |
-
-**Response:**
-
-```json
-{
-  "ok": true,
-  "data": {
-    "messages": [
-      { "id": 1, "uid": 42, "subject": "Hi", "from_address": "a@b.com",
-        "from_name": "Alice", "to_addresses": ["x@y.com"], "date": "2026-08-26T10:00:00Z",
-        "is_read": 0, "is_starred": 0, "has_attachments": 1, "thread_id": 5,
-        "preview": "Hey, check this out..." }
-    ],
-    "has_more": true,
-    "next_cursor": "2026-08-25T09:00:00Z|38"
-  }
-}
-```
-
-#### `get_message`
-
-Get a single message with full body and attachments.
-
-```bash
-curl -s http://localhost:2525/?action=get_message \
-  -H 'Content-Type: application/json' \
-  -H 'X-Session-Token: abc123...' \
-  -d '{"message_id": 1}' | jq
-```
-
-**Parameters:**
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `message_id` | int | yes | Message database ID |
-
-**Response:**
-
-```json
-{
-  "ok": true,
-  "data": {
-    "message": {
-      "id": 1, "subject": "Hello", "from_address": "a@b.com",
-      "text_body": "Plain text...", "html_body": "<p>HTML...</p>",
-      "to_addresses": ["x@y.com"], "cc_addresses": ["z@w.com"],
-      "is_read": 1, "is_starred": 0, "has_attachments": 1
-    },
-    "attachments": [
-      { "id": 1, "filename": "report.pdf", "content_type": "application/pdf", "size": 32000 }
-    ]
-  }
-}
-```
-
-#### `get_thread`
-
-Get thread metadata and all messages in the thread, ordered by date.
-
-```bash
-curl -s http://localhost:2525/?action=get_thread \
-  -H 'Content-Type: application/json' \
-  -H 'X-Session-Token: abc123...' \
-  -d '{"thread_id": 5}' | jq
-```
-
-**Parameters:**
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `thread_id` | int | yes | Thread database ID |
-
-**Response:**
-
-```json
-{
-  "ok": true,
-  "data": {
-    "thread": { "id": 5, "subject": "Hello", "message_count": 3, "preview": "...", "is_read": 0, "is_starred": 1, "last_message_at": "2026-08-26T10:00:00Z" },
-    "messages": [
-      { "id": 1, "date": "2026-08-25T08:00:00Z", "from_address": "a@b.com", "text_body": "...", "to_addresses": ["x@y.com"], "cc_addresses": [] }
-    ]
-  }
-}
-```
-
-#### `set_flags`
-
-Update message flags (read/starred) or move to a different folder.
-
-```bash
-curl -s http://localhost:2525/?action=set_flags \
-  -H 'Content-Type: application/json' \
-  -H 'X-Session-Token: abc123...' \
-  -d '{"message_id": 1, "is_read": 1, "is_starred": 1}' | jq
-```
-
-**Parameters:**
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `message_id` | int | yes | Message database ID |
-| `is_read` | int | no | 0 or 1 |
-| `is_starred` | int | no | 0 or 1 |
-| `folder_name` | string | no | Move to this folder (requires IMAP) |
-
-#### `batch_action`
-
-Bulk operations on multiple messages.
-
-```bash
-curl -s http://localhost:2525/?action=batch_action \
-  -H 'Content-Type: application/json' \
-  -H 'X-Session-Token: abc123...' \
-  -d '{"message_ids": [1, 2, 3], "action": "read"}' | jq
-```
-
-**Parameters:**
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `message_ids` | int[] | yes | Array of message IDs (max 200) |
-| `action` | string | yes | `read`, `unread`, `star`, `unstar`, `delete`, `archive`, `move` |
-| `folder_name` | string | if action=move | Destination folder name |
-
-**Response:**
-
-```json
-{ "ok": true, "data": { "affected": 3 } }
-```
-
-#### `search`
-
-Full-text search across messages using FTS5.
-
-```bash
-curl -s http://localhost:2525/?action=search \
-  -H 'Content-Type: application/json' \
-  -H 'X-Session-Token: abc123...' \
-  -d '{"query": "quarterly report"}' | jq
-```
-
-**Parameters:**
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `query` | string | yes | Search terms |
-| `folder` | string | no | Limit to folder |
-| `limit` | int | no | Max results (1-100, default 50) |
-
-**Response:** Same shape as `list_messages` (without `has_more`/`next_cursor`).
-
-### Accounts
-
-#### `list_accounts`
-
-List all configured email accounts (for account switcher UI).
-
-```bash
-curl -s http://localhost:2525/?action=list_accounts \
-  -H 'X-Session-Token: abc123...' | jq
-```
-
-**Response:**
-
-```json
-{
-  "ok": true,
-  "data": {
-    "accounts": [
-      { "id": 1, "email": "you@example.com", "display_name": "You",
-        "imap_host": "imap.migadu.com", "smtp_host": "smtp.migadu.com",
-        "is_active": 1, "last_sync_at": "2026-08-26T10:00:00Z", "created_at": "2026-08-25T08:00:00Z" }
-    ]
-  }
-}
-```
-
-#### `add_account`
-
-Add a new email account. Tests IMAP/SMTP connectivity and returns a session token for the new account.
-
-```bash
-curl -s http://localhost:2525/?action=add_account \
-  -H 'Content-Type: application/json' \
-  -H 'X-Session-Token: abc123...' \
-  -d '{
-    "preset": "migadu",
-    "email": "other@example.com",
-    "password": "your-password"
-  }' | jq
-```
-
-**Parameters:** Same as `auth` (preset or manual IMAP/SMTP config, email, password).
-
-**Response:**
-
-```json
-{
-  "ok": true,
-  "data": {
-    "account_id": 2,
-    "session_token": "def456...",
-    "email": "other@example.com",
-    "imap": { "ok": true, "error": "", "folders": [...] },
-    "smtp": { "ok": true, "error": "" }
-  }
-}
-```
-
-#### `delete_account`
-
-Delete the current session's account and all associated data (messages, folders, attachments, sessions).
-
-```bash
-curl -s http://localhost:2525/?action=delete_account \
-  -H 'X-Session-Token: abc123...' | jq
-```
-
-**Response:**
-
-```json
-{ "ok": true, "data": { "deleted": true, "account_id": 1 } }
-```
-
-Note: This destroys the current session. The client must handle the logged-out state.
-
-#### `detect_server`
-
-Auto-detect IMAP/SMTP servers from an email address. Public endpoint (no session required).
-
-```bash
-curl -s http://localhost:2525/?action=detect_server \
-  -H 'Content-Type: application/json' \
-  -d '{"email": "user@gmail.com"}' | jq
-```
-
-**Parameters:**
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `email` | string | yes | Email address to detect servers for |
-
-**Response (known provider):**
-
-```json
-{
-  "ok": true,
-  "data": {
-    "detected": true,
-    "preset": "gmail",
-    "imap_host": "imap.gmail.com", "imap_port": 993, "imap_tls": 1,
-    "smtp_host": "smtp.gmail.com", "smtp_port": 465, "smtp_tls": 1
-  }
-}
-```
-
-**Response (unknown domain):**
-
-```json
-{
-  "ok": true,
-  "data": {
-    "detected": false,
-    "preset": null,
-    "imap_host": "imap.example.com", "imap_port": 993, "imap_tls": 1,
-    "smtp_host": "smtp.example.com", "smtp_port": 587, "smtp_tls": 2
-  }
-}
-```
-
-#### `test_connection`
-
-Test IMAP/SMTP connectivity without saving the account. Public endpoint (no session required).
-
-```bash
-curl -s http://localhost:2525/?action=test_connection \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "preset": "migadu",
-    "email": "you@example.com",
-    "password": "your-password"
-  }' | jq
-```
-
-**Parameters:** Same as `auth`.
-
-**Response:**
-
-```json
-{
-  "ok": true,
-  "data": {
-    "email": "you@example.com",
-    "imap": { "ok": true, "error": "", "folders": ["INBOX", "Sent", ...] },
-    "smtp": { "ok": true, "error": "" }
-  }
-}
-```
-
-### Contacts & Tags
-
-#### `list_contacts`
-
-List contacts sorted by use count (most-used first). Contacts are auto-populated from message addresses during sync.
-
-```bash
-curl -s http://localhost:2525/?action=list_contacts \
-  -H 'Content-Type: application/json' \
-  -H 'X-Session-Token: abc123...' \
-  -d '{"q": "alice", "limit": 50}' | jq
-```
-
-**Parameters:**
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `q` | string | no | Search by email or name (substring match) |
-| `limit` | int | no | Max results (1-500, default 300) |
-
-**Response:**
-
-```json
-{
-  "ok": true,
-  "data": {
-    "contacts": [
-      { "email": "alice@example.com", "name": "Alice", "use_count": 15 }
-    ]
-  }
-}
-```
-
-#### `search_contacts`
-
-Search contacts for autocomplete (prefix match, sorted by use count).
-
-```bash
-curl -s http://localhost:2525/?action=search_contacts \
-  -H 'Content-Type: application/json' \
-  -H 'X-Session-Token: abc123...' \
-  -d '{"q": "ali"}' | jq
-```
-
-**Parameters:**
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `q` | string | yes | Search prefix |
-| `limit` | int | no | Max results (1-20, default 10) |
-
-**Response:**
-
-```json
-{
-  "ok": true,
-  "data": {
-    "contacts": [
-      { "email": "alice@example.com", "name": "Alice" }
-    ]
-  }
-}
-```
-
-#### `list_tags`
-
-List all tags for the account, sorted by name.
-
-```bash
-curl -s http://localhost:2525/?action=list_tags \
-  -H 'X-Session-Token: abc123...' | jq
-```
-
-**Response:**
-
-```json
-{
-  "ok": true,
-  "data": {
-    "tags": [
-      { "id": 1, "name": "Important", "color": "#6366f1" }
-    ]
-  }
-}
-```
-
-#### `create_tag`
-
-Create a new tag.
-
-```bash
-curl -s http://localhost:2525/?action=create_tag \
-  -H 'Content-Type: application/json' \
-  -H 'X-Session-Token: abc123...' \
-  -d '{"name": "Important", "color": "#ff0000"}' | jq
-```
-
-**Parameters:**
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `name` | string | yes | Tag name (max 100 chars, case-insensitive unique) |
-| `color` | string | no | Hex color (default `#6366f1`) |
-
-**Response:**
-
-```json
-{ "ok": true, "data": { "id": 1, "name": "Important", "color": "#ff0000" } }
-```
-
-#### `rename_tag`
-
-Rename an existing tag.
-
-```bash
-curl -s http://localhost:2525/?action=rename_tag \
-  -H 'Content-Type: application/json' \
-  -H 'X-Session-Token: abc123...' \
-  -d '{"id": 1, "name": "Very Important"}' | jq
-```
-
-**Parameters:**
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `id` | int | yes | Tag ID |
-| `name` | string | yes | New tag name |
-
-**Response:**
-
-```json
-{ "ok": true, "data": { "id": 1, "name": "Very Important" } }
-```
-
-#### `delete_tag`
-
-Delete a tag. Also removes all message associations.
-
-```bash
-curl -s http://localhost:2525/?action=delete_tag \
-  -H 'Content-Type: application/json' \
-  -H 'X-Session-Token: abc123...' \
-  -d '{"id": 1}' | jq
-```
-
-**Parameters:**
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `id` | int | yes | Tag ID |
-
-**Response:**
-
-```json
-{ "ok": true, "data": { "deleted": true } }
-```
-
-#### `tag_message`
-
-Add a tag to a message. Idempotent (no error if already tagged).
-
-```bash
-curl -s http://localhost:2525/?action=tag_message \
-  -H 'Content-Type: application/json' \
-  -H 'X-Session-Token: abc123...' \
-  -d '{"message_id": 1, "tag_id": 1}' | jq
-```
-
-**Parameters:**
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `message_id` | int | yes | Message ID |
-| `tag_id` | int | yes | Tag ID |
-
-**Response:**
-
-```json
-{ "ok": true, "data": { "tagged": true } }
-```
-
-#### `untag_message`
-
-Remove a tag from a message.
-
-```bash
-curl -s http://localhost:2525/?action=untag_message \
-  -H 'Content-Type: application/json' \
-  -H 'X-Session-Token: abc123...' \
-  -d '{"message_id": 1, "tag_id": 1}' | jq
-```
-
-**Parameters:**
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `message_id` | int | yes | Message ID |
-| `tag_id` | int | yes | Tag ID |
-
-**Response:**
-
-```json
-{ "ok": true, "data": { "untagged": true } }
-```
-
-#### `batch_tag`
-
-Add or remove tags from multiple messages at once.
-
-```bash
-curl -s http://localhost:2525/?action=batch_tag \
-  -H 'Content-Type: application/json' \
-  -H 'X-Session-Token: abc123...' \
-  -d '{"message_ids": [1, 2, 3], "tag_ids": [1, 2]}' | jq
-```
-
-**Parameters:**
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `message_ids` | int[] | yes | Array of message IDs |
-| `tag_ids` | int[] | yes | Array of tag IDs |
-| `remove` | bool | no | If `true`, remove tags instead of adding |
-
-**Response:**
-
-```json
-{ "ok": true, "data": { "updated": true } }
-```
-
-### Settings
-
-#### `get_settings`
-
-Get all settings for the current account with defaults applied.
-
-```bash
-curl -s http://localhost:2525/?action=get_settings \
-  -H 'X-Session-Token: abc123...' | jq
-```
-
-**Response:**
-
-```json
-{
-  "ok": true,
-  "data": {
-    "settings": {
-      "signature": "",
-      "theme": "dark",
-      "show_remote_images": false,
-      "sync_on_load": true
-    }
-  }
-}
-```
-
-#### `update_settings`
-
-Update settings for the current account. Only whitelisted keys are accepted.
-
-```bash
-curl -s http://localhost:2525/?action=update_settings \
-  -H 'Content-Type: application/json' \
-  -H 'X-Session-Token: abc123...' \
-  -d '{"theme": "light", "show_remote_images": true}' | jq
-```
-
-**Parameters:**
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `theme` | string | no | `dark` or `light` |
-| `show_remote_images` | bool | no | Show remote images in messages |
-| `sync_on_load` | bool | no | Auto-sync on app load |
-
-**Response:** Returns full settings after update.
-
-#### `update_signature`
-
-Update the email signature for the current account.
-
-```bash
-curl -s http://localhost:2525/?action=update_signature \
-  -H 'Content-Type: application/json' \
-  -H 'X-Session-Token: abc123...' \
-  -d '{"signature": "-- \nSent from Emmmail"}' | jq
-```
-
-**Parameters:**
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `signature` | string | yes | Signature text (max 10000 chars, empty string to clear) |
-
-**Response:**
-
-```json
-{ "ok": true, "data": { "signature": "-- \nSent from Emmmail" } }
-```
-
-### Updates
-
-#### `check_update`
-
-Check if a new version is available. Returns current and latest version numbers.
-
-```bash
-curl -s http://localhost:2525/?action=check_update \
-  -H 'X-Session-Token: abc123...' | jq
-```
-
-**Response:**
-
-```json
-{
-  "ok": true,
-  "data": {
-    "current": "1.0.0",
-    "latest": "1.0.0",
-    "update_available": false,
-    "update_url": ""
-  }
-}
-```
-
-#### `apply_update`
-
-Download and apply an update from the configured `update_url` setting. The downloaded file is validated (PHP syntax check + Emmmail build marker) before replacing the current `index.php`. A backup is created at `index.php.bak`.
-
-```bash
-curl -s http://localhost:2525/?action=apply_update \
-  -H 'X-Session-Token: abc123...' | jq
-```
-
-**Prerequisites:** The `update_url` setting must be configured via `update_settings`.
-
-**Response (success):**
-
-```json
-{
-  "ok": true,
-  "data": {
-    "updated": true,
-    "version": "1.0.0",
-    "backup": "index.php.bak"
-  }
-}
-```
-
-**Response (no update_url):**
-
-```json
-{
-  "ok": false,
-  "error": "No update source configured. Set the \"update_url\" setting first."
-}
-```
-
-### Sync
-
-#### `sync`
-
-Trigger a manual sync for an account. Fetches folders and messages from IMAP.
-
-```bash
-curl -s http://localhost:2525/?action=sync \
-  -H 'Content-Type: application/json' \
-  -d '{"account_id": 1}' | jq
-```
-
-**Parameters:**
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `account_id` | int | no | Account ID. If omitted, syncs the first account. |
-| `folder` | string | no | Sync only this folder (e.g., `INBOX`). |
-| `since` | string | no | Only fetch messages since this date (ISO 8601). |
-
-**Response:**
-
-```json
-{
-  "ok": true,
-  "data": {
-    "account_id": 1,
-    "folders_synced": 5,
-    "messages_synced": 142,
-    "last_sync_at": "2026-08-26T12:00:00Z"
-  }
-}
-```
-
-#### `expunge_folder`
-
-Permanently delete messages marked for deletion in a folder (IMAP EXPUNGE). Typically used on the Trash folder.
-
-```bash
-curl -s http://localhost:2525/?action=expunge_folder \
-  -H 'Content-Type: application/json' \
-  -H 'X-Session-Token: abc123...' \
-  -d '{"folder_name": "Trash"}' | jq
-```
-
-**Parameters:**
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `folder_name` | string | yes | Folder name to expunge |
-
-**Response:**
-
-```json
-{ "ok": true, "data": { "expunged": true } }
-```
-
-### Compose
-
-#### `compose`
-
-Send an email or save as draft.
-
-**Send immediately:**
-
-```bash
-curl -s http://localhost:2525/?action=compose \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "account_id": 1,
-    "to": ["recipient@example.com"],
-    "subject": "Hello",
-    "body": "This is a test email."
-  }' | jq
-```
-
-**Save as draft:**
-
-```bash
-curl -s http://localhost:2525/?action=compose \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "account_id": 1,
-    "to": ["recipient@example.com"],
-    "subject": "Hello",
-    "body": "This is a draft.",
-    "draft": true
-  }' | jq
-```
-
-**Parameters:**
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `account_id` | int | yes | Account ID to send from |
-| `to` | array | yes | Recipient email addresses |
-| `cc` | array | no | CC recipients |
-| `bcc` | array | no | BCC recipients |
-| `subject` | string | yes* | Email subject (*required if body is empty) |
-| `body` | string | yes* | Plain text body (*required if subject is empty) |
-| `body_html` | string | no | HTML body (optional, sent as multipart) |
-| `attachments` | array | no | Array of `{filename, content_type, content}` (base64 encoded) |
-| `in_reply_to` | string | no | Message ID this is replying to |
-| `draft` | bool | no | If `true`, save as draft instead of sending |
-
-**Response (sent):**
-
-```json
-{
-  "ok": true,
-  "data": {
-    "sent": true,
-    "to": ["recipient@example.com"],
-    "cc": [],
-    "bcc": [],
-    "subject": "Hello"
-  }
-}
-```
-
-**Response (draft saved):**
-
-```json
-{
-  "ok": true,
-  "data": {
-    "draft_id": 1,
-    "saved": true
-  }
-}
-```
-
-### Drafts
-
-#### `drafts`
-
-List all drafts for an account.
-
-```bash
-curl -s http://localhost:2525/?action=drafts \
-  -H 'Content-Type: application/json' \
-  -d '{"account_id": 1}' | jq
-```
-
-**Response:**
-
-```json
-{
-  "ok": true,
-  "data": {
-    "drafts": [
-      {
-        "id": 1,
-        "to_addresses": ["recipient@example.com"],
-        "cc_addresses": [],
-        "subject": "Hello",
-        "body": "This is a draft.",
-        "body_html": null,
-        "in_reply_to": null,
-        "created_at": "2026-08-26 12:00:00",
-        "updated_at": "2026-08-26 12:00:00"
-      }
-    ]
-  }
-}
-```
-
-#### `draft`
-
-Get a single draft by ID.
-
-```bash
-curl -s http://localhost:2525/?action=draft \
-  -H 'Content-Type: application/json' \
-  -d '{"draft_id": 1}' | jq
-```
-
-#### `update_draft`
-
-Update draft fields.
-
-```bash
-curl -s http://localhost:2525/?action=update_draft \
-  -H 'Content-Type: application/json' \
-  -d '{"draft_id": 1, "subject": "Updated Subject", "body": "Updated body."}' | jq
-```
-
-**Updatable fields:** `to_addresses`, `cc_addresses`, `bcc_addresses`, `subject`, `body`, `body_html`, `attachments`, `in_reply_to`
-
-#### `delete_draft`
-
-Delete a draft.
-
-```bash
-curl -s http://localhost:2525/?action=delete_draft \
-  -H 'Content-Type: application/json' \
-  -d '{"draft_id": 1}' | jq
-```
-
-### Attachments
-
-#### `message_attachments`
-
-List all attachments for a message.
-
-```bash
-curl -s http://localhost:2525/?action=message_attachments \
-  -H 'Content-Type: application/json' \
-  -d '{"message_id": 1}' | jq
-```
-
-**Response:**
-
-```json
-{
-  "ok": true,
-  "data": {
-    "attachments": [
-      {
-        "id": 1,
-        "filename": "document.pdf",
-        "content_type": "application/pdf",
-        "size": 1024
-      }
-    ]
-  }
-}
-```
-
-#### `download_attachment`
-
-Download an attachment file.
-
-```bash
-# Direct download
-curl -O -J 'http://localhost:2525/?action=download_attachment&attachment_id=1'
-
-# Or via POST
-curl -s http://localhost:2525/?action=download_attachment \
-  -H 'Content-Type: application/json' \
-  -d '{"attachment_id": 1}' --output document.pdf
-```
-
-#### `upload_attachment`
-
-Upload a file for use in compose. Returns file metadata for inclusion in the `compose` endpoint's `attachments` array.
-
-```bash
-curl -s http://localhost:2525/?action=upload_attachment \
-  -H 'X-Session-Token: abc123...' \
-  -F 'file=@document.pdf' | jq
-```
-
-**Parameters:**
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `file` | file | yes | File to upload (multipart/form-data) |
-
-**Response:**
-
-```json
-{
-  "ok": true,
-  "data": {
-    "filename": "document.pdf",
-    "content_type": "application/pdf",
-    "size": 32000,
-    "tmp_path": "/path/to/tmp/file"
-  }
-}
-```
-
-The `tmp_path` is temporary. Include the file metadata in the `compose` endpoint's `attachments` array to send it.
-
-## User Manual
-
-[TODO — Add user manual sections as features are built.]
-
-## Deployment
-
-For production, use Apache or Nginx with PHP-FPM. The key security considerations:
-
-- **Database location.** By default the SQLite file (`emmmail.sqlite`) is created in the same directory as `index.php`. Set the `EMMMAIL_DB` environment variable to place it outside the web root (recommended). Make sure the path is within PHP's `open_basedir` (common on shared hosting — ask your provider if unsure). Examples:
-
-  ```bash
-  # PHP built-in server (dev)
-  EMMMAIL_DB=/path/to/data/emmmail.sqlite php -S localhost:2525 index.php
-
-  # Apache (.htaccess or vhost)
-  SetEnv EMMMAIL_DB /var/data/emmmail.sqlite
-
-  # Nginx + PHP-FPM (server or location block)
-  fastcgi_param EMMMAIL_DB /var/data/emmmail.sqlite;
-
-  # Docker / systemd
-  Environment=EMMMAIL_DB=/var/data/emmmail.sqlite
-  ```
-
-  On shared hosting, a safe location is often a `private/` subdirectory inside your web root (e.g. `/home/user/web/example.com/private/emmmail.sqlite`). This directory is typically outside the web root and within `open_basedir`.
-
-- **Encryption key.** The `.env` file stores the AES-256-GCM key used to encrypt stored passwords. Keep it outside the web root in production, or set the `EMMMAIL_KEY` environment variable.
-
-- **Deny direct file access.** The application blocks requests to `.sqlite`, `.env`, and `.git` paths internally, but your web server should also enforce this as a second layer.
-
-- **Do not deploy `tests.php` to production.** It is a development-only file.
-
-### Apache
-
-A `.htaccess` file is included in the repository. It routes requests through `index.php`, blocks access to database and sensitive files, and denies access to `tests.php`. No extra setup needed if your Apache has `mod_rewrite` and `AllowOverride All`.
-
-### Nginx
-
-```nginx
-location ~ \.(sqlite|sqlite3|db|sql|env|bak)$ {
-    deny all;
-}
-
-location ~ /\.git {
-    deny all;
-}
-
-location / {
-    try_files $uri /index.php$is_args$args;
-}
-```
+## Configuration
+
+Config is via environment variables read at startup.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `EMMMAIL_DB_PATH` | `./emmmail.sqlite` | SQLite database location |
+| `EMMMAIL_MAIL_SERVER` | (empty) | Lock the app to one host for both IMAP and SMTP (see [Locking a deployment](#locking-a-deployment)) |
+| `EMMMAIL_PROVIDER` | (empty) | Lock the app to one preset: `gmail`, `yahoo`, `outlook`, `icloud` or `migadu` |
+| `EMMMAIL_IMAP_HOST` | (empty) | Lock the IMAP host (needs an SMTP host too) |
+| `EMMMAIL_SMTP_HOST` | (empty) | Lock the SMTP host (needs an IMAP host too) |
+| `EMMMAIL_ALLOWED_DOMAINS` | (empty) | Comma-separated email domains allowed to sign in; empty = any |
+| `EMMMAIL_IMAP_PORT` | `993` | Default IMAP port |
+| `EMMMAIL_SMTP_PORT` | `587` | Default SMTP port |
+| `EMMMAIL_IMAP_ENCRYPTION` | `ssl` | Default IMAP transport (`ssl` or `tls`) |
+| `EMMMAIL_SMTP_ENCRYPTION` | `tls` | Default SMTP transport (`tls`) |
+| `EMMMAIL_VERIFY_CERT` | `1` | Set `0` to skip TLS certificate verification |
+| `EMMMAIL_CAFILE` | (system) | Path to a CA bundle for SMTP TLS verification |
+| `EMMMAIL_ENCRYPTION_KEY` | dev default | Secret used to encrypt the session password |
+| `EMMMAIL_DEBUG` | `0` | Set `1` to surface PHP errors in the response |
+
+Logins are stored per-provider and reused as prefill for the next login.
+
+### Locking a deployment
+
+An operator can pin the app to one mail server, one sign-in domain, or both.
+
+- **One server.** Set `EMMMAIL_PROVIDER` to a preset key, or set
+  `EMMMAIL_IMAP_HOST` and `EMMMAIL_SMTP_HOST`. The host pair uses the
+  `EMMMAIL_*_PORT` and `EMMMAIL_*_ENCRYPTION` values. `EMMMAIL_MAIL_SERVER`
+  also locks: it fills whichever host is not set. While locked, the login page
+  shows only email and password. Any preset or server fields in the POST are
+  ignored.
+- **Fails closed.** These settings are treated as a broken lock: an unknown
+  provider, a provider set together with a host, or only one of the two hosts.
+  The login page then shows an error, and every sign-in is refused. It never
+  falls back to the dropdown.
+- **Allowed domains.** `EMMMAIL_ALLOWED_DOMAINS=example.com,example.org` (commas
+  or spaces, case-insensitive) limits sign-in to those domains. Subdomains do not
+  count. An address from any other domain gets a friendly error. No connection
+  is made to the mail server, and the attempt does not count toward the login
+  rate limit. The check runs at sign-in only, so a session that already exists
+  is not ended.
+
+### Per-account settings
+
+Each account configures its own copy of these (Settings page, stored per user):
+
+- Messages per page (5–200)
+- Display name, shown on sent mail
+- Signature, inserted at the top of the compose editor, above any quoted reply
+  or forward
+- Protected folders: a map of the system roles (Sent, Drafts, Spam, Trash,
+  Archive) to the account's actual folder names. Pre-filled from auto-detection
+  until you save your own map; the first login walks you through it
+- Remote images: off by default (loading one leaks that you opened the message,
+  and when and from where); trusted senders always load
+- Check for new mail automatically: on by default. While a page is open the app
+  asks the server once a minute; turn this off and it asks only when you click
+  the sync button. The interval is fixed, and a server-side throttle stops a
+  burst of clicks from becoming a burst of IMAP work
+- Undo send: hold sent messages for a short window so a send can be recalled
+
+Per browser, on the same page but outside that form, because it acts at once and
+never leaves the browser: notifications (see
+[Notifications](#notifications)).
+
+## Projects / Pages
+
+Routing is `index.php?page=<page>`:
+
+- `login`, `logout`
+- `inbox`, `folder`, `read`, `thread` (one conversation)
+- `compose`, `reply`, `replyAll`, `forward`, `saveDraft`
+- `createFolder`, `deleteFolder`
+- `delete`, `restore`, `spam` (move to the Junk mailbox)
+- `move` (file into any folder), `emptyFolder` (wipe Trash or Spam only)
+- `download`, `markRead`, `markUnread`
+- `search`, `settings`, `contacts` (JSON autocomplete), `trustSender`
+- `saveOnboarding` (JSON; first-access folder-map onboarding save)
+- `sync` (JSON; background header sync, called by the client every minute, when
+  the tab becomes visible, and when the sync chip is clicked)
+
+## Database
+
+`emmmail.sqlite` holds eight tables. The schema is versioned with SQLite's
+`PRAGMA user_version` and migrated forward automatically on first open; there is
+no down path.
+
+- `settings` — per-user key/value settings
+- `contacts` — auto-populated contacts (search/autocomplete)
+- `search_cache` — mail search snippets for fast local search
+- `login_attempts` — rate-limit bookkeeping
+- `messages` — cached message **headers** (subject, sender, date, flags,
+  attachment presence, a short body snippet for messages you have opened, and
+  `thread_key`, the conversation root a row groups by)
+- `folder_state` — per-folder sync bookkeeping (UIDVALIDITY, UIDNEXT, counts)
+- `folder_list_cache` — the folder list, so the sidebar needs no IMAP round trip.
+  The folder listings re-read it every 15 minutes; every other page renders the
+  last copy whatever its age, because they have no way to refresh it.
+- `folder_counts` — the sidebar counters (unseen and total per folder)
+
+Message **bodies** are not stored; they are always read live from IMAP. Headers
+*are* cached on disk so that list views render without contacting the server, and
+opening a message stores a short plain-text snippet to make local search useful.
+That cached metadata survives logout, exactly as a desktop mail client's would.
+
+Because of this, put the database outside your document root
+(`EMMMAIL_DB_PATH`) — see Security below.
 
 ## Running Tests
 
-```
-just test
-```
-
-Or directly:
+Every suite lives in `tests/`. Run them all:
 
 ```
-php tests.php
+just test          # or: php tests/run.php
 ```
 
-The test suite uses a temporary database and cleans up after itself. Real-server auth tests are skipped unless credentials are provided.
+`tests/run.php` requires each suite in turn, lets their output through as-is, and
+prints one total at the end. Any suite also runs on its own:
 
-To run real-server auth tests, pass a preset and email. You'll be prompted for the password (kept out of bash history):
+```
+php tests/unit.php    # pure functions + SQLite models
+php tests/imap.php    # offline IMAP tests against a local stub server
+php tests/smoke.php   # live server (skips without credentials)
+```
+
+| File | What it is |
+|---|---|
+| `tests/run.php` | Runner hub; requires every suite and prints one total |
+| `tests/unit.php` | Pure functions and SQLite models |
+| `tests/imap.php` | Real `MailImap` code paths against `_imap_stub.php`; asserts behaviour *and* exact IMAP round-trip counts |
+| `tests/smoke.php` | Live IMAP/SMTP against your own mailbox |
+| `tests/_harness.php` | Shared bootstrap and assertions (support file) |
+| `tests/_imap_stub.php` | Wire-level IMAP server used by `imap.php` (support file) |
+
+Files starting with `_` are support code, not suites. `test_suite('<name>')` gives
+each suite its own throwaway SQLite database (removed on exit), so suites cannot
+see each other's rows and the real `emmmail.sqlite` is never touched.
+
+Adding a suite: create `tests/<name>.php`, start it with
+`require_once __DIR__ . '/_harness.php'; test_suite('<name>');`, end it with
+`summary();`, and add the name to the list in `tests/run.php`.
+
+To run the live-server smoke tests (Tier 3), pass a preset and email. You'll be
+prompted for the password (kept out of the shell history):
 
 ```
 just test migadu you@example.com
 ```
 
-Available presets: `gmail`, `yahoo`, `outlook`, `migadu`, `icloud`.
+Available presets: `gmail`, `yahoo`, `outlook`, `migadu`, `icloud`. The smoke
+suite skips gracefully when no credentials are provided.
 
-Or set the environment variables directly:
+## Security
 
-```
-EMMMAIL_TEST_PRESET=migadu EMMMAIL_TEST_EMAIL=you@example.com EMMMAIL_TEST_PASSWORD=your-password php tests.php
-```
+- Strict Content-Security-Policy, `X-Frame-Options: DENY`, `nosniff`,
+  `strict-origin` referrer policy, and HSTS when served over HTTPS
+- HTML message bodies are sanitized with an allowlist and rendered in a
+  sandboxed iframe
+- State-changing requests require a per-request CSRF token
+- Session hardening: HTTP-only, SameSite=Strict, secure flag over HTTPS,
+  strict mode, and IP binding
+- Login brute-force rate limiting with a sliding window
+- SMTP message-building sanitizes/encodes headers against CRLF and header
+  injection
+- Sensitive secrets are never echoed back after login
+
+## Deployment
+
+For production, serve `index.php` through Apache or Nginx with PHP-FPM. Points
+to consider:
+
+- **Database location.** By default the SQLite file (`emmmail.sqlite`) is
+  created next to `index.php`. Set `EMMMAIL_DB_PATH` to place it outside the
+  web root (recommended) and make sure it is within PHP's `open_basedir`,
+  e.g.:
+
+  ```bash
+  # PHP built-in server (dev)
+  EMMMAIL_DB_PATH=/path/to/data/emmmail.sqlite php -S localhost:2525 index.php
+
+  # Apache
+  SetEnv EMMMAIL_DB_PATH /var/data/emmmail.sqlite
+
+  # Nginx + PHP-FPM
+  fastcgi_param EMMMAIL_DB_PATH /var/data/emmmail.sqlite;
+  ```
+
+- **Encryption key.** Set `EMMMAIL_ENCRYPTION_KEY` to a long random secret. It
+  is used to encrypt the account password held in the server-side session. The
+  built-in default is for development only.
+
+- **Do not deploy the `tests/` directory** to production. It is development-only.
 
 ## Contributing
 
-Contributions are welcome. Please keep these principles in mind:
+Contributions are welcome. Keep these principles in mind:
 
-1. **Single-file architecture.** All application code stays in `index.php`. This is a deliberate constraint, not a limitation to work around.
-
-2. **No external PHP dependencies.** No Composer, no autoloaders. If you need a library, either implement the necessary logic directly or reconsider the approach.
-
-3. **Write tests.** New features should include corresponding tests in `tests.php`. Use TDD when possible (write failing tests first, then implement).
-
-4. **Keep it simple.** If 50 lines of straightforward code solve the problem, don't write 200 lines of abstracted code. Match the existing style.
-
-5. **Surgical changes.** A pull request should do one thing. Don't bundle unrelated cleanups or formatting changes.
-
-### How to Contribute
-
-1. Fork the repository.
-2. Create a feature branch.
-3. Write tests for your change.
-4. Implement the change (make tests pass).
-5. Submit a pull request with a clear description of what and why.
+1. **Single-file architecture.** All application code stays in `index.php`.
+   This is a deliberate constraint.
+2. **No external PHP dependencies.** No Composer, no autoloaders.
+3. **Write tests.** New behavior gets tests in `tests.php`. Use TDD — failing
+   tests first, then the implementation.
+4. **Keep it simple.** Match the existing style; prefer straightforward code
+   over abstraction.
+5. **Surgical changes.** A pull request should do one thing.
 
 ### Reporting Issues
 
-Open an issue with steps to reproduce. Include your PHP version, browser, and any relevant error messages.
+Open an issue with steps to reproduce, your PHP version, browser, and any
+relevant error messages.
 
 ## License
 
 [O'SAASy](https://osaasy.dev/). See [LICENSE](LICENSE) for details.
 
-In short: use it, modify it, self-host it, distribute it. Just don't offer it as a competing hosted service where the software itself is the primary value.
-
-Designed and built by [Rogerio Taques](https://x.com/rogeriotaques), the guy behind [Abtz Labs](https://abtz.co).
+Designed and built by [Rogerio Taques](https://x.com/rogeriotaques).
