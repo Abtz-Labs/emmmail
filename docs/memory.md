@@ -1,282 +1,144 @@
 # Emmmail — Session Memory
 
-## Project Overview
-- **Goal:** One-file, mobile-first, Gmail-inspired web email client with IMAP/SMTP
-- **Tech:** PHP 8.1+, pure PHP IMAP/SMTP (stream_socket_client), Vanilla JS, SQLite
-- **Auth:** Session-based authentication with IP binding
-- **Philosophy:** Single `index.php`, zero deps, TDD
+**This file is a pointer sheet, not a knowledge base.** Durable, topic-scoped invariants live
+in `docs/knowledge/` — start at [docs/knowledge/README.md](knowledge/README.md). Keep that
+knowledge **out** of this file; add it there and link it from here. Budget: 150 lines.
 
-## Session 5 (2026-08-25) — Rewrite: API-first
-- Started from scratch (old files renamed to `*.old`)
-- API: `index.php?action=<action>`, JSON POST body
-- Phase 1: `auth` endpoint — tests IMAP + SMTP connection, persists account to SQLite
-- Infrastructure: `.env` parser, AES-256-GCM encryption, SQLite schema (accounts, login_attempts), IMAP/SMTP clients, utility functions
-- Front controller guard: `if (php_sapi_name() !== 'cli' || isset($_GET['action']))` — prevents `exit` during test bootstrap
-- `apiRequest()` test helper reads from exec stdout (not file) since `exit` kills subprocess before file write
-- 82 tests passing: .env parser, encryption, DB schema, IMAP role detection/tokenizer/fetch parser, auth endpoint, unknown action, HTML escaping, display names, address parsing, filename sanitization, date normalization, subject normalization, blocked attachments, rate limiting
+## Project
+- One-file Gmail-style webmail (IMAP/SMTP), mobile-first. PHP 8.1+, ext-imap, raw stream
+  sockets for SMTP, vanilla JS, SQLite (PDO). Single `index.php`, routes via `?page=<page>`
+  (full list in `README.md`; unknown -> 404, empty -> inbox/login).
+- DB `emmmail.sqlite` (`EMMMAIL_DB_PATH`), forward-only `PRAGMA user_version`
+  (  `SCHEMA_VERSION`). 8 tables: settings, contacts, search_cache (unused), login_attempts,
+  messages (+ `thread_key`, v4), folder_state, folder_list_cache, folder_counts (v3). Bodies are never stored;
+  headers are cached and `read_mark_seen()` keeps a 500-char snippet. The cache survives
+  logout by design.
+- TDD, zero deps. `just test` == `php tests/run.php`; suites `unit js imap smoke`; one with
+  `php tests/<name>.php`. **No subset runner** — `run.php` ignores `$argv`, so naming suites
+  runs all four. `_`-prefixed files are support, not suites. `smoke` is live (skips w/o
+  creds), `js` skips w/o `node`.
 
-## Session 6 (2026-08-26) — tests.php code review
-- Full review of tests.php against index.php; suite passes 197/0/3 by default
-- Latent bugs (only trigger when EMMMAIL_TEST_* set): testSyncEndpointReal + testDraftEndpointReal call protected endpoints without session token (will always fail); testDraftEndpointReal subject assert uses `substr($draftId,-6)` vs saved `uniqid()` subject (can never pass)
-- testDatabaseSchema "idempotency" is a false pass (static $done in initDatabase prevents re-run)
-- SSRF only unit-tested; endpoints always run with EMMMAIL_DISABLE_SSRF_CHECK=1 inherited
-- No MIME parser, MIME builder, or storeMessage/thread helper unit tests
+## Knowledge map
+| Area | Read |
+|---|---|
+| IMAP/c-client traps, sync, folder counts | [knowledge/imap.md](knowledge/imap.md) |
+| PHP/HTML gotchas, includes, redirect | [knowledge/php-html.md](knowledge/php-html.md) |
+| Sanitizers, iframe sandbox, remote images, gates | [knowledge/security.md](knowledge/security.md) |
+| The `$` toolkit, busy states, optimistic actions, the poll chain | [knowledge/frontend.md](knowledge/frontend.md) |
+| Tokens, specificity, tooltips, toolbars, composer | [knowledge/css-ui.md](knowledge/css-ui.md) |
+| TDD loop, source guards, the js stub | [knowledge/testing.md](knowledge/testing.md) |
+| Markdown, threading, drafts, undo send | [knowledge/composing.md](knowledge/composing.md) |
+| imap ext install, CA bundle, Migadu hosts | [knowledge/environment.md](knowledge/environment.md) |
 
-## Session 7 (2026-08-26) — Security fixes
-- Code review found 16 index.php issues + 8 test issues
-- Phase 1 (Critical): Account takeover blocked (auth requires session to update existing accounts), IDOR fixed (all actions derive account_id from session)
-- Phase 2 (High): CRLF injection prevented (sanitizeHeader), login rate limiting added, sessions bound to IP
-- Phase 3 (Medium): IPv4-mapped IPv6 blocked in SSRF, try/finally for socket cleanup, encryption key race fixed with flock, max message size (10MB), Bcc removed from MIME headers, orphaned attachment cleanup
-- Phase 4 (Low): Path containment on download, Content-Type sanitization, email validation, session cleanup
-- Phase 5: Added 6 security tests (account takeover, IDOR, CRLF, rate limiting, IP binding, path containment)
-- 207 tests passing, 0 failures, 3 skipped
+## Decisions in force
+- Password only in the session, libsodium secretbox, key server-global
+  (`EMMMAIL_ENCRYPTION_KEY`). One CSRF token per request, shared by all forms
+  (`csrf_page_token()`). Login is a preset dropdown only, default `migadu`, unless the env
+  locks it (see [knowledge/security.md](knowledge/security.md)). No jQuery, no CDN.
+- **The CSP is `script-src 'self' 'unsafe-inline'`** (render_page emits an inline `<script>`),
+  so it is **not** a script barrier. Never treat it as one — see
+  [knowledge/security.md](knowledge/security.md).
+- **Folder names are `urlencode()`d into every href and hidden input**, and every handler reads
+  them with `urldecode()`. Both layers are required; never remove one without the other.
+- Zero-dep `$` toolkit on `window.$`; **no `getElementById`, no per-page inline `<script>`, no
+  native `confirm()`** — all three test-guarded. All `js_inline()` code stays stub-guarded.
+- Perf shape: `folder_view_data()` takes an IMAP **factory**, so nothing connects unless the
+  cache cannot answer. The header cache took a render from 52 IMAP commands (~2310ms) to 0
+  (~30ms warm).
 
-## Session 8 (2026-08-26) — Core API endpoints
-- Implemented 7 endpoints: list_folders, list_messages, get_message, get_thread, set_flags, batch_action, search
-- Plan reviewed by 2 subagents; 25 findings addressed (FTS5 migration strategy, composite cursor pagination, FTS query escaping, folder role resolution, etc.)
-- FTS5 migration via `migrateDatabase()` with `PRAGMA user_version` gating (separate from EMMMAIL_SCHEMA to avoid trigger body splitter issues)
-- `escapeFtsQuery()` wraps user tokens in double quotes for literal FTS5 matching
-- Composite cursor pagination: `(date, id)` keyset for list_messages
-- set_flags/batch_action: flag-only changes are local-only (sync reconciles); moves/deletes use folder role resolution
-- 290 tests passing, 0 failures, 3 skipped
+## Plan status
+- **Code complete, browser pass NOT run:** `2026-10-19-server-lock-and-allowed-domains.md`.
+  Env server lock + domain allow-list, fail closed.
+- **Done, manually verified:** `2026-10-06-footer.md` — one `view_footer()` credit line
+  (author + Use Bare links, `utm_content=APP_VERSION`, `#<version> &copy; Abtz Labs`, both
+  links `target="_blank" rel="noopener noreferrer"`), mounted in `.login-footer` (centered,
+  outside `.login-box`) and `.sidebar-footer` (pinned with `margin-top:auto`, left aligned).
+  `just test` 3024 passed, 2 smoke skips. Browser pass: login at 414px; sidebar measured at
+  264px with the footer 16px off the floor. Light theme not seen.
+- **Code complete, browser pass NOT run:** `2026-10-05-threaded-conversations.md` — all 11
+  steps done, `just test` 2997 passed, 2 smoke skips. Schema v4 clears the `messages` cache
+  once (pre-threading rows carried no `References`) and adds `thread_key` (root = first
+  `References` token, else `In-Reply-To`, else own `Message-ID`; sentinel for id-less mail).
+  `sync_folder()` computes it; `overviewRange()`/`fetchOverviews()` export the ids, and
+  c-client already fetches `References` inside the same overview FETCH (the stub now answers
+  `HEADER.FIELDS`). Listings group via `db_list_threads()` **only when the whole folder is
+  cached** (`total <= cached`, not Drafts) — a partial window would double-show against the
+  flat live tail. New `?page=thread` reader (`THREAD_MAX_MESSAGES`=30, one move dialog,
+  active-`<details>` seam for the keyboard/`readerControl`). Cross-folder works because a
+  Sent reply shares the root; `handle_sync()` keeps Sent warm. Thread rows: read toggle posts
+  `thread=<key>`, the box picks all in-folder members. Fixed a shipped bug: rows cached
+  between the v4 migration and the extractor kept `thread_key=''` and all grouped into one
+  conversation; `db_count_unthreaded()` now makes `sync_decide()` purge such a folder once
+  (reason `unthreaded`), and `folder_view_data()` checks it so the rebuild happens on the
+  render. Browser pass owed: keyboard scoping, open/close iframe re-measure, count chip in
+  both themes at phone width, a live pre-v4 cache upgrade, and a real Sent reply joining an
+  Inbox thread.
+- **Code complete, browser pass NOT run:** `2026-10-02-bulk-actions.md` — steps 0-7 done.
+  Bulk mark read/unread, move, delete on the list view: `post_uids()` (three holes closed,
+  200 cap, order preserving), four `MailImap::*Many*` batch methods returning **int**, one
+  IMAP command per batch, `.mail-pick` + select-all + `.bulk-bar`, optimistic patching with
+  an exact undo, `x` to pick the cursor row, and `pickCount()` in `syncCanSwap()`. The four
+  batch return types are test-guarded because a `bool` there silently skips every cache
+  write (`if ($count > 0)` against `true` is false). The delete confirm copy now shares the
+  handler's resolver (`MailImap::findTrashFolderIn()` via `delete_is_permanent()`), so it
+  warns "permanently" when no Trash is resolvable instead of promising a move. `just test`
+  2790 passed, 2 smoke skips. Manual pass still owed: the picked tint on an unread row under
+  the pointer, `.bulk-bar` in both themes, `j`/`x` right after clicking a checkbox, and the
+  nested-`Deleted Items` account, whose copy should now read "permanently".
+- **Code complete, live pass NOT run:** `2026-10-05-bulk-selection-polish.md` — round
+  checkboxes, a "Select all" label, Space = `x` when a cursor exists, and the bulk bar
+  moved into the mailbox head with `@container` tiers so it never moves the list; the
+  select-all label doubles as the count ("18 selected"); on touch an idle row shows no picker or
+  actions (tap the avatar to start a selection); fixed bulk mark read/unread
+  removing its rows, the head dash surviving `pickReset()`, and the
+  paperclip repainted as an envelope by `setReadIcon()`; bulk read/unread now drops the selection
+  with the repaint, not the reply; `pickReset()` unchecks the row boxes too
+  (measured at 12 widths, see [knowledge/css-ui.md](knowledge/css-ui.md)). `just test`
+  2845 passed, 2 smoke skips.
+- **Code complete, browser pass NOT run:** `2026-10-05-stale-listing-immediate-sync.md` —
+  fixed the report that a fresh login showed "Synced 6 days ago" and did not sync: the header
+  cache survives logout and `folder_view_data()` only syncs a cold cache, while the poll
+  chain's first tick is a full period away. `view_mailbox()` now stamps `data-sync-stale="1"`
+  on the `.sync` chip via the pure `sync_is_stale()`, and the client syncs a stale listing at
+  boot (then the normal 60s chain); a fresh chip still waits its period. `just test` 2856
+  passed, 2 smoke skips. Browser pass owed: log in with a >1min cache and watch it correct on
+  load.
+- **Done, manually verified:** `2026-10-02-solid-toast-and-login-memory.md` — toasts are
+  opaque (`--surface` on `--text`, the type on the border; `--success` on `--surface` is only
+  3.7:1 at `.88rem`, so the text stays uncoloured), and the login page remembers
+  `emmmail-last-preset` + `emmmail-last-custom` beside the email. The memory is client-side
+  because the server has no email to look settings up by before one is typed. `just test` 2558
+  passed, 2 smoke skips. Browser pass: restore after reload, a failed submit saving all six
+  values, and both themes' toast colours.
+- **Done, not manually verified:** `2026-10-02-empty-folder-sidebar.md` — the folder list
+  cache now has two readers: the listings honour the 15 min TTL and re-LIST, every other page
+  (`cached_folder_list()`) serves the last copy whatever its age and never connects. Plus
+  `db_set_folder_list()` refusing an unencodable payload, `kb_folder_map()` always mapping
+  `i` => `INBOX`, and `view_sidebar()` rendering a `Folders are unavailable` note.
+  `just test` 2528 passed, 2 smoke skips. The browser pass is not done: the sidebar on
+  Settings after 15+ minutes of inbox idleness, and the note's look in light and dark.
+- **Done:** `2026-09-29-browser-notifications.md` (poll chain, title counter, opt-in
+  notifications, `auto_poll` switch replacing the *Sync period* select, settings rows with
+  dividers and a right-hand control column). `just test` 2512 passed, 2 smoke skips. Manual pass
+  by the user in Brave/macOS; Firefox, Safari, plain HTTP and idle stop not reported separately.
+  macOS Focus / Do Not Disturb hides banners (they land in Notification Center).
+- **Deferred manual passes** — code done, browser check not run, because no harness can stand in
+  for a real Safari/Firefox/mobile keyboard: markdown-compose step 8 (editor verified in
+  Chromium only); keyboard-first-ux step 7 (cursor/ring, real `showModal` focus, native
+  `<select>` Enter in the move dialog, pagination cursor restore, undo-send Cmd+Enter,
+  login/touch inertness); instant-folder-switch click-through (needs IMAP creds).
+- Everything else is done. Keep each plan's `status:` header honest.
 
-## Key Decisions
-- No ext-imap (deprecated) — raw socket IMAP client
-- AES-256-GCM (not CBC) for password encryption
-- FTS5 with triggers for search, migrated via `migrateDatabase()` (user_version 1→2)
-- `normalizeSubject` strips prefix but preserves case
-- TDD: tests FIRST, then implementation
-- Session tokens via X-Session-Token header or EMMMAILSESSID cookie (not request body)
-- Sessions bound to IP address (destroyed on IP change)
-- EMMMAIL_DISABLE_SSRF_CHECK=1 for testing only
-- Composite cursor pagination: `date|id` format, keyset `(date < ?) OR (date = ? AND id < ?)`
-- FTS query escaping: wrap tokens in double quotes to prevent FTS5 syntax errors
-- Folder role resolution: `SELECT name FROM folders WHERE account_id = ? AND role = ?`
-
-## API Endpoints
-- `auth` — test IMAP/SMTP, create/update account (public)
-- `login` — authenticate, create session (public)
-- `logout` — destroy session (authenticated)
-- `session` — check session status (public)
-- `sync` — fetch folders/messages from IMAP (authenticated)
-- `list_folders` — list folders with unread/total counts (authenticated)
-- `list_messages` — paginated message list per folder (authenticated)
-- `get_message` — full message with body and attachments (authenticated)
-- `get_thread` — thread metadata + all messages (authenticated)
-- `set_flags` — mark read/starred, move to folder (authenticated)
-- `batch_action` — bulk read/unread/star/unstar/delete/archive/move (authenticated)
-- `search` — FTS5 full-text search (authenticated)
-- `list_accounts` — list all accounts for switcher UI (authenticated)
-- `add_account` — add new account, returns session token (authenticated)
-- `delete_account` — delete current account + all data (authenticated)
-- `detect_server` — auto-detect IMAP/SMTP from email domain (public)
-- `test_connection` — test IMAP/SMTP without saving (public)
-- `compose` — send email or save draft (authenticated)
-- `drafts` — list drafts (authenticated)
-- `draft` — get single draft (authenticated)
-- `update_draft` — update draft (authenticated)
-- `delete_draft` — delete draft (authenticated)
-- `download_attachment` — download attachment file (authenticated)
-- `message_attachments` — list message attachments (authenticated)
-- `list_contacts` — list contacts by use count (authenticated)
-- `search_contacts` — prefix-match contacts for autocomplete (authenticated)
-- `list_tags` — list tags sorted by name (authenticated)
-- `create_tag` — create tag with name and color (authenticated)
-
-## Session 9 (2026-08-26) — Accounts endpoints
-- Implemented 5 endpoints: list_accounts, add_account, delete_account, detect_server, test_connection
-- Plan reviewed by 2 subagents; 18 findings addressed (IDOR fix, trust model, port/TLS validation, MX detection, etc.)
-- Extracted `testImapSmtp()` helper from `actionAuth()` — shared by auth, add_account, test_connection
-- Added `validatePortAndTls()` helper — port 1-65535, TLS 0-2
-- Added `detectServersByEmail()` — domain→preset mapping + MX fallback with trailing-dot trimming
-- `actionAuth()` refactored to use `testImapSmtp()` — same behavior, less duplication
-- `detect_server`/`test_connection` added to `$publicActions` (setup wizard)
-- `delete_account` uses transaction + `deleteAccountAttachments()` (was dead code)
-- 332 tests passing, 0 failures, 3 skipped
-
-## Session 10 (2026-08-26) — Contacts & Tags endpoints
-- Implemented 4 endpoints: list_contacts, search_contacts, list_tags, create_tag
-- Plan reviewed by 2 subagents; 21 findings addressed (name wipe fix, case-insensitive tags, LIKE escaping, etc.)
-- Added 3 schema tables: contacts, tags, message_tags (in EMMMAIL_SCHEMA)
-- `sanitizeContactName()` — strips control chars, collapses whitespace, caps at 200 chars
-- `updateContacts()` — upsert hook in storeMessage, dedupes within message, preserves existing name
-- `queryContacts()` — shared helper for list_contacts/search_contacts, LIKE wildcard escaping
-- Tags use `COLLATE NOCASE` for case-insensitive uniqueness
-- Color regex: `#[0-9a-fA-F]{3,4,6,8}` (valid CSS hex lengths only)
-- Message tagging (tag_message/untag_message) deferred to future phase
-- 382 tests passing, 0 failures, 3 skipped
-
-## Session 11 (2026-08-26) — Settings endpoints
-- Implemented 3 endpoints: get_settings, update_settings, update_signature
-- Plan reviewed by 2 subagents; 17 findings addressed (per-account scoping, bool coercion, type safety, etc.)
-- Added `settings` table: `(account_id, name, value)` with `PRIMARY KEY (account_id, name)`
-- All settings per-account — different accounts have different preferences
-- `getSettingsArray()` — whitelist-based, skips unknown keys, explicit bool coercion (`=== '1'`)
-- `update_settings` — validates theme against `['dark', 'light']`, normalizes bools explicitly
-- `update_signature` — requires key present, caps at 10000 chars (mb_strlen), returns error not silent truncation
-- 415 tests passing, 0 failures, 3 skipped
-
-## API Endpoints (complete)
-- `auth` — test IMAP/SMTP, create/update account (public)
-- `login` — authenticate, create session (public)
-- `logout` — destroy session (authenticated)
-- `session` — check session status (public)
-- `sync` — fetch folders/messages from IMAP (authenticated)
-- `list_folders` — list folders with unread/total counts (authenticated)
-- `list_messages` — paginated message list per folder (authenticated)
-- `get_message` — full message with body and attachments (authenticated)
-- `get_thread` — thread metadata + all messages (authenticated)
-- `set_flags` — mark read/starred, move to folder (authenticated)
-- `batch_action` — bulk read/unread/star/unstar/delete/archive/move (authenticated)
-- `search` — FTS5 full-text search (authenticated)
-- `list_accounts` — list all accounts for switcher UI (authenticated)
-- `add_account` — add new account, returns session token (authenticated)
-- `delete_account` — delete current account + all data (authenticated)
-- `detect_server` — auto-detect IMAP/SMTP from email domain (public)
-- `test_connection` — test IMAP/SMTP without saving (public)
-- `compose` — send email or save draft (authenticated)
-- `drafts` — list drafts (authenticated)
-- `draft` — get single draft (authenticated)
-- `update_draft` — update draft (authenticated)
-- `delete_draft` — delete draft (authenticated)
-- `download_attachment` — download attachment file (authenticated)
-- `message_attachments` — list message attachments (authenticated)
-- `list_contacts` — list contacts by use count (authenticated)
-- `search_contacts` — prefix-match contacts for autocomplete (authenticated)
-- `list_tags` — list tags sorted by name (authenticated)
-- `create_tag` — create tag with name and color (authenticated)
-- `get_settings` — get per-account settings (authenticated)
-- `update_settings` — update theme/bools (authenticated)
-- `update_signature` — update email signature (authenticated)
-
-## Session 12 (2026-08-26) — Missing endpoints for frontend
-- Implemented 9 endpoints: ping, setup, rename_tag, delete_tag, tag_message, untag_message, batch_tag, expunge_folder, upload_attachment
-- `ping` — public health check (version + time)
-- `setup` — public check if first-time setup needed (no accounts)
-- `rename_tag` — rename tag (account-scoped, checks existence)
-- `delete_tag` — delete tag (account-scoped, checks existence)
-- `tag_message` — add tag to message (INSERT OR IGNORE, idempotent)
-- `untag_message` — remove tag from message
-- `batch_tag` — batch tag/untag multiple messages (transaction)
-- `expunge_folder` — IMAP EXPUNGE (connects to real server)
-- `upload_attachment` — upload file for compose (multipart/form-data)
-- 467 tests passing, 0 failures, 3 skipped
-
-## Session 13 (2026-08-26) — Self-update endpoints
-- Implemented 2 endpoints: check_update, apply_update
-- `check_update` — returns current/latest version, update_available flag, update_url from settings
-- `apply_update` — downloads new code from update_url, validates PHP syntax, checks for EMMMAIL_VERSION marker, backs up current file, replaces it
-- `apply_update` reads `update_url` from per-account settings
-- 476 tests passing, 0 failures, 3 skipped
-
-## API Endpoints (complete — 42 endpoints)
-- `ping` — health check (public)
-- `setup` — check if first-time setup needed (public)
-- `auth` — test IMAP/SMTP, create/update account (public)
-- `login` — authenticate, create session (public)
-- `logout` — destroy session (authenticated)
-- `session` — check session status (public)
-- `sync` — fetch folders/messages from IMAP (authenticated)
-- `list_folders` — list folders with unread/total counts (authenticated)
-- `list_messages` — paginated message list per folder (authenticated)
-- `get_message` — full message with body and attachments (authenticated)
-- `get_thread` — thread metadata + all messages (authenticated)
-- `set_flags` — mark read/starred, move to folder (authenticated)
-- `batch_action` — bulk read/unread/star/unstar/delete/archive/move (authenticated)
-- `search` — FTS5 full-text search (authenticated)
-- `list_accounts` — list all accounts for switcher UI (authenticated)
-- `add_account` — add new account, returns session token (authenticated)
-- `delete_account` — delete current account + all data (authenticated)
-- `detect_server` — auto-detect IMAP/SMTP from email domain (public)
-- `test_connection` — test IMAP/SMTP without saving (public)
-- `compose` — send email or save draft (authenticated)
-- `drafts` — list drafts (authenticated)
-- `draft` — get single draft (authenticated)
-- `update_draft` — update draft (authenticated)
-- `delete_draft` — delete draft (authenticated)
-- `download_attachment` — download attachment file (authenticated)
-- `upload_attachment` — upload file for compose (authenticated)
-- `message_attachments` — list message attachments (authenticated)
-- `list_contacts` — list contacts by use count (authenticated)
-- `search_contacts` — prefix-match contacts for autocomplete (authenticated)
-- `list_tags` — list tags sorted by name (authenticated)
-- `create_tag` — create tag with name and color (authenticated)
-- `rename_tag` — rename tag (authenticated)
-- `delete_tag` — delete tag (authenticated)
-- `tag_message` — add tag to message (authenticated)
-- `untag_message` — remove tag from message (authenticated)
-- `batch_tag` — batch tag/untag messages (authenticated)
-- `expunge_folder` — IMAP EXPUNGE (authenticated)
-- `get_settings` — get per-account settings (authenticated)
-- `update_settings` — update theme/bools (authenticated)
-- `update_signature` — update email signature (authenticated)
-- `check_update` — check for new version (authenticated)
-- `apply_update` — download and apply update (authenticated)
-
-## Session 14 (2026-08-26) — Frontend UI
-- Implemented complete SPA frontend in `serveFrontend()` (~2000 LOC HTML/CSS/JS)
-- Hash-based routing: #login, #setup, #inbox, #sent, #drafts, #starred, #all, #tag/:id, #thread/:id, #compose, #reply/:id, #forward/:id, #search, #settings, #contacts
-- Login page with email/password, theme toggle, error display
-- Setup wizard with test connection flow
-- Sidebar: account switcher, folder navigation, tags, contacts/settings links
-- Message list: unread indicators, star toggle, avatars, date formatting, sync status
-- Thread view: message cards, collapse/expand, reply/reply-all/forward, archive/delete/star
-- Compose window: from selector, to/cc/bcc with recipient chips, rich text editor, draft autosave
-- Settings: account management, signature editor, theme toggle, preferences
-- Contacts: search, click-to-compose
-- Search: full-text with from/to/subject filters
-- Theme: dark/light with CSS variables, localStorage persistence
-- Keyboard shortcuts: c=compose, r=reply, a=reply-all, f=forward, e=archive, #=delete, s=star, j/k=navigate, o=enter, /=search, Cmd+Enter=send, Escape=close
-- Responsive: mobile sidebar, bottom tabs, full-screen compose on mobile
-- Session management: token stored in localStorage, sent via X-Session-Token header
-- 500 tests passing, 0 failures, 3 skipped
-
-## Session 15 (2026-08-31) — Frontend routing fix
-- Bug: opening `http://localhost:2525/` returned `{"ok":false,"error":"Authentication required..."}` instead of the SPA
-- Root cause: `handleRequest()` had no route for empty `action` — `''` was not in `$publicActions`, so `requireSession()` rejected every bare `/` request before any HTML was served
-- Fix: `handleRequest()` now serves `serveFrontend()` and returns when `$action === ''` (before the session gate)
-- Added `testFrontendRoute()` regression tests (bare request serves HTML, not blocked by session, works with invalid session)
-- Verified live: `curl :2525/` → HTTP 200, 93KB HTML; `action=ping` and session-protected routes unaffected
-- 504 tests passing, 0 failures, 3 skipped
-
-## Session 16 (2026-08-31) — Fix icons + JS syntax (frontend dead on arrival)
-- Symptom: UI shell renders but (1) no icons, (2) no login/onboarding ever triggers
-- Root cause 1 — broken JS: `App` bundle had a stray `}` in `bindGlobal` (`focusSearch()})},`) plus a missing `}` for the `if(bar){` block; JS never parsed, so `App.init()` never ran → no login/setup, no dynamic icons
-  - Correct tail: `this.el('#btn-search').addEventListener('click',()=>this.focusSearch());}}` then `,`
-  - Found via acorn (installed in /tmp) after node --check pointed at `renderTextBody`'s `/\\r\\n/` regex (caret was misleading)
-- Root cause 2 — icons: CDN URL used non-existent package `@tabler-icons-webfont` (HTTP 400). Real package: `@tabler/icons-webfont` (HTTP 200, real font-face)
-- Regression guards added to `testFrontend()`:
-  - asserts CDN link uses `@tabler/icons-webfont`
-  - extracts inline app script and runs real `node --check` (SKIPs when node missing)
-- Verified live: `curl :2525/` serves fixed HTML; all inline scripts parse via node; icon CSS loads
-- Also fixed: `handleRequest()` now serves `serveFrontend()` for empty `action` (Session 15 bug)
-- 507 tests passing, 0 failures, 3 skipped
-
-## Session 17 (2026-08-31) — Setup wizard: presets + custom server fields
-- Symptom: onboarding screen only had Email+Password — no preset picker, no custom IMAP/SMTP host/port/TLS; "Test connection" always failed (it sent only email/password, backend requires imap_host → error toast → Finish stayed disabled), so setup could not complete
-- Fix (frontend-only, in `serveFrontend()`):
-  - Added `<select data-spreset>` (gmail/yahoo/outlook/migadu/icloud/custom) that fills IMAP/SMTP host/port/TLS fields from a new JS `PROVIDERS` map (values mirror server `getPresets()`); custom = edit manually
-  - Added editable fields `data-simap-host/-port/-tls` and `data-ssmtp-host/-port/-tls` (TLS: 1=SSL/TLS, 2=STARTTLS, 0=None) in new `.field-row` grids + `.setup-server-title` CSS
-  - `testConnection` now sends the full IMAP/SMTP config to `test_connection`; success enables Finish
-  - `submitSetup` sends full config to `auth`, then calls `login` to obtain a `session_token` (auth returns none), stores it in `localStorage['emmmail-session']`, then `init()` → `#inbox`. Fixes "first-run setup leaves you logged out"
-- 12 new frontend assertions in `testFrontend()` (preset selector, 6 server fields, PROVIDERS map, TLS labels, config in payload, login-token flow)
-- Also widened `.auth-card` to `max-width:560px` on desktop with `@media(max-width:640px)` override to `100%` (mobile-friendly); footer matches
-- Polish (same day, TDD, all in `testFrontend()` + `serveFrontend()`):
-  - "Test connection" stays disabled with "Connected" label on success (no more `finally` re-enable)
-  - Preset selection focuses the email input
-  - New `setBtnState(btn,on,label)` helper → Save signature / Add account show loading + restore on failure; success/error toasts normalized
-  - Toast `z-index` 90→120 — was rendering BELOW the `#fullscreen` overlay (settings/contacts), so toasts were invisible from those screens
-  - `sync_on_load` was stored but never acted on → new `syncOnLoad()` fires `sync` in `init()` when enabled, refreshes base data + current folder; toggle now toasts feedback
-- 534 tests passing, 0 failures, 3 skipped
-- Manual sync robustness (same day, TDD):
-  - Root-cause: first full sync = 269 per-message IMAP round trips ≈ 93s; `fetchMessages()`/`searchSince()` were UNGUARDED per-folder (only `selectFolder` + per-message fetch were) — one folder error aborted the entire sync; auto-sync could also run concurrently with manual sync (providers reject simultaneous logins)
-  - Backend: each folder's `fetchMessages`/`searchSince` now wrapped in try/catch → skip folder, keep syncing
-  - Frontend: `_syncing` lock — `syncOnLoad` skips + manual sync toasts "Sync already in progress" when a sync is running; lock released in `finally`
-- 538 tests passing, 0 failures, 3 skipped
-
-## Next
-- Smoke-test first access in browser: fresh DB → #setup wizard (preset + server fields); with accounts → #login
-- Polish UI/UX
-- Add attachment upload to compose
-- Add drag-and-drop to compose
-- Add undo for batch actions
+## Open items
+- Open decision: drop the unused `search_cache` table (one migration step + 3 dead helpers).
+  Destructive, so it needs an explicit yes.
+- Known, unfixed, low priority: server-side-search pagination drops `server=1`; per-row output
+  boilerplate is ~660 of 1485 bytes; `MailImap::__construct` pays a wasted TCP probe (~40ms);
+  `handle_read`/`reply`/`forward` ignore `selectFolder()`'s result (read-only, so it degrades to
+  "message not found"); cron-driven sync needs a credential story; nested `INBOX.Deleted Items`
+  is not recognised as Trash anywhere (pinned by a test; the delete copy now warns anyway).
+- Known, unfixed, from the 2026-10-02 plan: right after **Clear local cache** the sidebar is
+  empty until an inbox visit — `g i` still works, the other five roles do not. And a server
+  that sends a non-UTF-8 folder name makes every folder-list write fail, so the listings
+  re-LIST each visit. Both are documented in
+  [plans/2026-10-02-empty-folder-sidebar.md](plans/2026-10-02-empty-folder-sidebar.md).
