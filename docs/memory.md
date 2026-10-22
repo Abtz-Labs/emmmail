@@ -33,8 +33,13 @@ knowledge **out** of this file; add it there and link it from here. Budget: 150 
 ## Decisions in force
 - Password only in the session, libsodium secretbox, key server-global
   (`EMMMAIL_ENCRYPTION_KEY`). One CSRF token per request, shared by all forms
+<<<<<<< Updated upstream
   (`csrf_page_token()`). Login is a preset dropdown only, default `migadu`, unless the env
   locks it (see [knowledge/security.md](knowledge/security.md)). No jQuery, no CDN.
+=======
+  (`csrf_page_token()`). Login is a preset dropdown only, default `migadu`; deployment can pin
+  it and whitelist domains with `EMMMAIL_FORCE_PRESET` / `EMMMAIL_ALLOWED_DOMAINS`. No jQuery, no CDN.
+>>>>>>> Stashed changes
 - **The CSP is `script-src 'self' 'unsafe-inline'`** (render_page emits an inline `<script>`),
   so it is **not** a script barrier. Never treat it as one — see
   [knowledge/security.md](knowledge/security.md).
@@ -47,8 +52,15 @@ knowledge **out** of this file; add it there and link it from here. Budget: 150 
   (~30ms warm).
 
 ## Plan status
+<<<<<<< Updated upstream
 - **Code complete, browser pass NOT run:** `2026-10-19-server-lock-and-allowed-domains.md`.
   Env server lock + domain allow-list, fail closed.
+=======
+- **Code complete, deploy not run:** `2026-10-22-deploy-and-login-lock.md` — env-driven login
+  lock (`EMMMAIL_ALLOWED_DOMAINS`, `EMMMAIL_FORCE_PRESET`), `bare.config.json` for
+  `webmail.abtz.co` (git-ignored, DB in `private/`), dry-run passes; suite has one pre-existing
+  footer failure (`&copy;` vs the test's `(c)`).
+>>>>>>> Stashed changes
 - **Done, manually verified:** `2026-10-06-footer.md` — one `view_footer()` credit line
   (author + Use Bare links, `utm_content=APP_VERSION`, `#<version> &copy; Abtz Labs`, both
   links `target="_blank" rel="noopener noreferrer"`), mounted in `.login-footer` (centered,

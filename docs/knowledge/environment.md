@@ -18,6 +18,17 @@ non-blank path is set.
 the email domain** — the login page uses a preset dropdown only, default `migadu`, with no
 auto-detect.
 
+## Production deployment (webmail.abtz.co)
+- `vps-4` under `abtz2`, Hestia layout: releases in
+  `/home/abtz2/web/webmail.abtz.co`, document root `public_html`, data in `private/`.
+- `bare.config.json` is **git-ignored**: it carries the production
+  `EMMMAIL_ENCRYPTION_KEY` used by the deploy post-script.
+- `SetEnv` does **not** reach PHP-FPM through `mod_proxy_fcgi`. The post-script
+  appends `ProxyFCGISetEnvIf "true" NAME "value"` to each release's `.htaccess`
+  instead. Hestia runs this domain on PHP 8.1 with `ext-imap`.
+- Production lock: `EMMMAIL_ALLOWED_DOMAINS=abtz.co` and
+  `EMMMAIL_FORCE_PRESET=migadu`. Both are read per request.
+
 ## TCP timeouts
 `imap_open()` blocks forever on an unreachable host and segfaults PHP at shutdown, and c-client
 ignores `default_socket_timeout` for TCP connect. See [imap.md](imap.md) for the bounded probe

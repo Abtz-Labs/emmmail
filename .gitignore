@@ -11,6 +11,9 @@ attachments/
 # Environment
 .env
 
+# Deploy config (holds the production encryption key)
+bare.config.json
+
 # Misc
 *.pid
 .DS_Store

@@ -356,6 +356,7 @@ assert_eq('example.org', $cfg['imap']['server'], 'unknown preset -> falls back t
 $cfg = resolve_mail_config(['preset' => 'custom', 'imap_server' => 'imap.x.com'], 'me@example.org');
 assert_true($cfg['smtp']['server'] !== '', 'custom imap-only still resolves smtp fallback');
 
+<<<<<<< Updated upstream
 // ------------------------------------------------------- server_lock() ---+
 group('server_lock(): the environment pins the mail server');
 
@@ -471,6 +472,47 @@ assert_true($gateAt < (int)strpos($loginSrc, 'new MailImap'), 'the gate runs bef
 assert_contains("server_lock()['config'] ?? resolve_mail_config(", $loginSrc,
     'a locked server ignores the posted preset and custom fields');
 $lockEnv([]);
+=======
+// ------------------------------------------------------- login lock env ---+
+group('login lock environment');
+
+putenv('EMMMAIL_ALLOWED_DOMAINS=abtz.co, @Example.ORG');
+assert_eq(['abtz.co', 'example.org'], login_allowed_domains(), 'allowlist is trimmed, lowercased and accepts @');
+assert_true(email_domain_allowed('me@abtz.co'), 'allowed domain passes');
+assert_true(email_domain_allowed('me@EXAMPLE.ORG'), 'domain match is case-insensitive');
+assert_false(email_domain_allowed('me@sub.abtz.co'), 'a subdomain is not the whitelisted domain');
+assert_false(email_domain_allowed('me@evil.test'), 'another domain is rejected');
+assert_false(email_domain_allowed('not-an-email'), 'an address without a domain is rejected');
+assert_eq('', login_domain_error('me@abtz.co'), 'an allowed address has no error');
+assert_contains('@abtz.co', login_domain_error('me@evil.test'), 'a rejected address names the allowed domain');
+
+putenv('EMMMAIL_ALLOWED_DOMAINS');
+assert_eq([], login_allowed_domains(), 'unset allowlist means no restriction');
+assert_true(email_domain_allowed('me@anything.test'), 'without an allowlist every domain passes');
+
+putenv('EMMMAIL_FORCE_PRESET=Migadu');
+assert_eq('migadu', forced_mail_preset(), 'forced preset is lowercased');
+$cfg = resolve_mail_config(['preset' => 'gmail'], 'me@abtz.co');
+assert_eq('imap.migadu.com', $cfg['imap']['server'], 'forced preset overrides a posted preset');
+$cfg = resolve_mail_config(['preset' => 'custom', 'imap_server' => 'imap.evil.test'], 'me@abtz.co');
+assert_eq('imap.migadu.com', $cfg['imap']['server'], 'forced preset overrides custom fields');
+
+putenv('EMMMAIL_FORCE_PRESET=not-a-preset');
+assert_eq('', forced_mail_preset(), 'an unknown forced preset is ignored');
+
+putenv('EMMMAIL_FORCE_PRESET=migadu');
+$locked = view_login(str_repeat('0', 64));
+assert_contains('name="preset" value="migadu"', $locked, 'forced preset rides in a hidden input');
+assert_not_contains('id="login-preset"', $locked, 'forced preset hides the selector');
+assert_not_contains('custom-servers', $locked, 'forced preset hides the custom fields');
+
+putenv('EMMMAIL_ALLOWED_DOMAINS=abtz.co');
+$restricted = view_login(str_repeat('0', 64));
+assert_contains('placeholder="you@abtz.co"', $restricted, 'the email field hints the allowed domain');
+
+putenv('EMMMAIL_ALLOWED_DOMAINS');
+putenv('EMMMAIL_FORCE_PRESET');
+>>>>>>> Stashed changes
 
 // ------------------------------------------------------- tls_ssl_options() -+
 group('tls_ssl_options()');

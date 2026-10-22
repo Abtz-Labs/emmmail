@@ -3496,6 +3496,39 @@ async function main() {
     }
   }
 
+  // S92 — a page with a forced preset has no #login-preset select. The login
+  // script must still remember the email, and must leave the previous preset
+  // and custom fields alone.
+  {
+    const doc = makeDoc(); buildMeta(doc);
+    const win = makeWin();
+    win.localStorage = storageWith({
+      'emmmail-last-preset': 'icloud',
+      'emmmail-last-custom': JSON.stringify({ imap_server: 'imap.example.org' })
+    });
+    const form = doc.createElement('form');
+    const email = doc.createElement('input');
+    email.type = 'email'; email.id = 'login-email'; email.setAttribute('name', 'email');
+    email.value = 'me@abtz.co';
+    email.focus = function() { this._focused = true; };
+    const pass = doc.createElement('input');
+    pass.type = 'password'; pass.id = 'login-password'; pass.setAttribute('name', 'password');
+    pass.focus = function() { this._focused = true; };
+    const btn = doc.createElement('button');
+    btn.type = 'submit'; btn.className = 'btn btn-primary';
+    btn.appendChild(doc.createElement('svg'));
+    form.appendChild(email); form.appendChild(pass); form.appendChild(btn);
+    doc.add(form);
+    boot(doc, win, () => ({ ok: true, json: () => Promise.resolve({}) }), []);
+    form.dispatch('submit');
+    eq('S92 submit still saves the email', win.localStorage.getItem('emmmail-last-email'), 'me@abtz.co');
+    eq('S92 a forced preset keeps the remembered preset',
+        win.localStorage.getItem('emmmail-last-preset'), 'icloud');
+    eq('S92 and keeps the remembered custom fields',
+        win.localStorage.getItem('emmmail-last-custom'),
+        JSON.stringify({ imap_server: 'imap.example.org' }));
+  }
+
   // S70 — picking rows: the checkbox, the tri-state head, the bar and the count.
   {
     const doc = makeDoc(); buildMeta(doc);
