@@ -117,6 +117,15 @@ server refusal that rolls the rows back like any other. **Spam hides its own Spa
 action** in all three places — bulk bar, row button and reader — because there is
 nowhere to file a message that is already there.
 
+**The selection goes with the repaint, not the reply** for `bulkRemove()` too. It
+calls `pickReset()` right after the rows are painted, so the count and the bar drop
+in the same frame. Its `undo()` does not reset again: by the time a refusal lands,
+a tick on screen is a new selection.
+
+**Reader Spam passes a `next` URL to `rowAction()`.** A filed message leaves for
+`?page=inbox`, not for the folder it came from. Other reader actions still return
+to their own folder.
+
 **A flag change removes nothing.** Move and delete take the row out of the folder,
 so they remove it. Marking read or unread does not, and its success path must not:
 the row list was copied from `bulkRemove()` and every ticked row vanished until the
@@ -294,6 +303,12 @@ One document-level `kbDispatch`, gated by `kbEnabled` (a localStorage off-flag),
 cannot drift. `kb_folder_map()` renders `<body data-kb-map>`, because the reader and settings
 have no sidebar for `g X`. `read_prev_next()` ranks over the whole cached folder, since
 `db_list_messages` is page-limited.
+
+**A row shortcut follows the selection.** When `pickCount() > 0`, `s`, `v`, `#`, `!`
+and `e` call the bulk paths (`bulkAction`, `bulkMoveTo`, `bulkDelete`, `bulkSpam`,
+`bulkArchive`) instead of the cursor's single row. Without a selection they keep the
+cursor behaviour. The old version always acted on one message while the user was
+looking at several.
 
 **Escape hatch:** `?` opens the sheet *before* the `kbEnabled` flag is read, so a user who
 clicked "Disable shortcuts" is never trapped. The sheet's link is a toggle

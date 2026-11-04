@@ -3993,6 +3993,9 @@ async function main() {
     pick(doc, 1); pick(doc, 2);
     doc.querySelector('[data-bulk-action="spam"]').dispatch('click', doc.querySelector('[data-bulk-action="spam"]'), {});
     eq('S93 bulk spam posts once', calls.length, 1);
+    eq('S93 the count clears in the same frame', doc.querySelector('[data-bulk-count]').textContent, 'Select all');
+    ok('S93 the bar hides at once', doc.querySelector('.bulk-bar').classList.contains('hidden'));
+    ok('S93 and the row boxes are unchecked', !doc.querySelector('.mail-pick[data-pick-uid="1"]').checked);
     eq('S93 to the spam route', calls[0] && calls[0].url, '?page=spam');
     ok('S93 carrying both selected uids, ascending', calls[0].body.indexOf('uids=1%2C2') !== -1);
     ok('S93 the rows leave at once', parts.rows[0].classList.contains('row-gone')
@@ -4010,6 +4013,85 @@ async function main() {
     ok('S93 a refusal puts the row back', !parts2.rows[0].classList.contains('row-gone'));
     const err = doc2.querySelector('.toast-error');
     ok('S93 and says why', err && err.textContent.indexOf('No Spam folder') !== -1);
+  }
+
+  // S94 — list shortcuts act on the whole selection, not only the cursor row.
+  {
+    const selectTwo = (doc) => {
+      doc.dispatch('keydown', { key: 'j' });
+      doc.dispatch('keydown', { key: 'x' });
+      doc.dispatch('keydown', { key: 'j' });
+      doc.dispatch('keydown', { key: 'x' });
+    };
+    const openListing = () => {
+      const doc = makeDoc(); buildMeta(doc);
+      const win = makeWin();
+      const calls = [];
+      const parts = buildKbListing(doc, 3);
+      boot(doc, win, () => ({ json: () => Promise.resolve({ ok: true, success: true, count: 2, message: '' }) }), calls);
+      selectTwo(doc);
+      eq('S94 two rows are selected before the key', doc.querySelector('[data-bulk-count]').textContent, '2 selected');
+      return { doc, win, calls, parts };
+    };
+
+    {
+      const x = openListing();
+      x.doc.dispatch('keydown', { key: '#' });
+      ok('S94 # opens one confirm for the selection', x.parts.dlg.dialog.open);
+      ok('S94 and the copy carries the count', x.parts.dlg.titleEl.textContent.indexOf('2') !== -1);
+      x.parts.dlg.confirmBtn.dispatch('click');
+      await settle();
+      eq('S94 delete posts the selected uids', x.calls[0] && x.calls[0].url, '?page=delete');
+      ok('S94 in one request', x.calls[0].body.indexOf('uids=1%2C2') !== -1);
+    }
+    {
+      const x = openListing();
+      x.doc.dispatch('keydown', { key: '!' });
+      eq('S94 ! spams the selection', x.calls[0] && x.calls[0].url, '?page=spam');
+      ok('S94 with both uids', x.calls[0].body.indexOf('uids=1%2C2') !== -1);
+      ok('S94 and both rows leave at once', x.parts.list.rows[0].classList.contains('row-gone')
+        && x.parts.list.rows[1].classList.contains('row-gone'));
+    }
+    {
+      const x = openListing();
+      x.doc.dispatch('keydown', { key: 'e' });
+      eq('S94 e archives the selection', x.calls[0] && x.calls[0].url, '?page=move');
+      ok('S94 to the mapped folder', x.calls[0].body.indexOf('dest=Archive') !== -1);
+      ok('S94 with both uids', x.calls[0].body.indexOf('uids=1%2C2') !== -1);
+    }
+    {
+      const x = openListing();
+      x.doc.dispatch('keydown', { key: 'v' });
+      ok('S94 v opens the move dialog', x.parts.mdlg.dialog.open);
+      eq('S94 carrying the whole selection', (x.parts.mdlg.dialog._uids || []).length, 2);
+    }
+    {
+      const x = openListing();
+      x.doc.dispatch('keydown', { key: 's' });
+      eq('S94 s marks the selection read', x.calls[0] && x.calls[0].url, '?page=markRead');
+      ok('S94 with both uids', x.calls[0].body.indexOf('uids=1%2C2') !== -1);
+    }
+  }
+
+  // S95 — Spam from the reader returns to the Inbox, not to the folder the
+  // message came from. Other reader actions keep the source folder.
+  {
+    const doc = makeDoc(); buildMeta(doc);
+    const win = makeWin();
+    buildKbReader(doc, {});
+    boot(doc, win, () => ({ json: () => Promise.resolve({ ok: true, success: true, count: 1 }) }), []);
+    win.rowAction(7, 'INBOX', '?page=spam', 'remove', null, '?page=inbox');
+    await settle();
+    eq('S95 spam leaves the reader for the Inbox', win.location.href, '?page=inbox');
+
+    const doc2 = makeDoc(); buildMeta(doc2);
+    const win2 = makeWin();
+    buildKbReader(doc2, {});
+    boot(doc2, win2, () => ({ json: () => Promise.resolve({ ok: true, success: true, count: 1 }) }), []);
+    win2.rowAction(7, 'Sent', '?page=delete', 'remove');
+    await settle();
+    eq('S95 another reader action still returns to its folder',
+      win2.location.href, '?page=folder&folder=Sent');
   }
 
   } catch (e) {

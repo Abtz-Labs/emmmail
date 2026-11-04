@@ -2733,8 +2733,11 @@ function folder_view_data(callable $imapFactory, string $email, string $folder, 
   }
 
   $offset = max(0, ($page - 1) * $perPage);
-  // Anything reaching past the cached window has to be fetched live.
-  $beyondWindow = ($offset + $perPage) > $cached && $total > $cached;
+  // Page 1 can be answered from any cached rows. A folder left one message short
+  // by a move used to fetch a whole live page on every visit, so returning from a
+  // message could wait on the server with rows already on hand. Deeper pages keep
+  // the full-window rule: a short page there would be a hole in the list.
+  $beyondWindow = $offset > 0 && ($offset + $perPage) > $cached && $total > $cached;
 
   // Still no rows after the sync attempt: serve live, unless the folder is known
   // to be empty. A missing state row means the sync failed and the total is
@@ -5904,7 +5907,9 @@ function handle_spam(): void
     cache_invalidate_folder($me, $junk);
   }
   $msg = $count > 0 ? ($count === 1 ? 'Message marked as spam.' : 'Messages marked as spam.') : 'Could not mark as spam.';
-  respond_mutation($count > 0, $msg, $folder, $count);
+  // A successful spam leaves for the Inbox even on the no-JS form post: the
+  // message is no longer in the folder the reader came from.
+  respond_mutation($count > 0, $msg, $count > 0 ? 'INBOX' : $folder, $count);
 }
 
 function handle_restore(): void
@@ -7760,7 +7765,7 @@ function js_inline(): string
     btn.setAttribute('aria-label', label);
   }
 
-  win.rowAction = function(uid, folder, url, mode, extra){
+  win.rowAction = function(uid, folder, url, mode, extra, next){
     var row = rowFor(uid);
     var fields = { uid: uid, folder: folder, ajax: '1' };
     if (extra) {
@@ -7793,7 +7798,7 @@ function js_inline(): string
         return;
       }
       if (row && mode !== 'flag' && row.parentNode) { row.parentNode.removeChild(row); }
-      if (!row) { win.location.href = '?page=folder&folder=' + folder; }
+      if (!row) { win.location.href = next || ('?page=folder&folder=' + folder); }
     }).catch(function(){
       undo();
       rowError('Offline. Nothing was changed.');
@@ -7935,11 +7940,13 @@ function js_inline(): string
       badgeTotal += bumpBadge(folder, -1, row.classList.contains('unread') ? null : 'total');
       patched.push({ row: row });
     }
+    // The selection goes with the repaint, not the reply. undo() does not reset
+    // again, because by then it may be a NEW selection.
+    pickReset();
     function undo(){
       for (var i = 0; i < patched.length; i++) patched[i].row.classList.remove('row-gone');
       bumpCount(countTotal);
       bumpBadge(folder, -badgeTotal);
-      pickReset();
     }
     return $.post(url, fields)
       .then(function(r){ return r.json(); }).then(function(d){
@@ -7952,11 +7959,28 @@ function js_inline(): string
         for (var i = 0; i < patched.length; i++) {
           if (patched[i].row.parentNode) patched[i].row.parentNode.removeChild(patched[i].row);
         }
-        pickReset();
       }).catch(function(){
         undo();
         rowError('Offline. Nothing was changed.');
       });
+  }
+
+  // Spam as a batch, shared by the bulk button and the keyboard. No dialog: it
+  // files the selection, and the server's refusal is the undo.
+  function bulkSpam(){
+    var uids = pickUids();
+    if (!uids.length) return;
+    bulkRemove(uids, bulkFolder(), '?page=spam');
+  }
+
+  // Archive as a batch. The destination comes from the same role map the single
+  // cursor action reads, so both paths land in the folder the user mapped.
+  function bulkArchive(){
+    var dest = kbFolderMap()['a'];
+    if (!dest) { win.toast('No archive folder.', 'error'); return; }
+    var uids = pickUids();
+    if (!uids.length) return;
+    bulkRemove(uids, bulkFolder(), '?page=move', { dest: dest });
   }
 
   // One button, both directions: the row's own class says which way to go, so
@@ -9141,7 +9165,7 @@ JS
       if (act === 'delete') { win.bulkDelete(); return; }
       // Spam is the removal half without a dialog: the server refuses loudly
       // when the account has no Junk mailbox, and the shared undo restores rows.
-      if (act === 'spam') { bulkRemove(pickUids(), bulkFolder(), '?page=spam'); return; }
+      if (act === 'spam') { bulkSpam(); return; }
       // An explicit direction, not a per-row toggle: rowAction's flag mode reads
       // .unread off each row, which is unambiguous for one row and meaningless
       // for N. Per-row, "Mark read" on a mixed set would mark the ALREADY-READ
@@ -9768,8 +9792,30 @@ JS
   }
 
   // A row action, dispatched from the cursor. Reuses the exact globals the
-  // clickable buttons call, so the two paths can never disagree.
+  // clickable buttons call, so the two paths can never disagree. With rows
+  // selected, the action is the bulk one: a shortcut on a selection that touched
+  // only the cursor row was a one-message action wearing a batch's clothes.
+  function kbBulkUnread(){
+    var uids = pickUids();
+    for (var i = 0; i < uids.length; i++) {
+      var row = rowFor(uids[i]);
+      if (row && row.classList.contains('unread')) return true;
+    }
+    return false;
+  }
   function kbCursorAction(action){
+    var bulk = pickCount() > 0;
+    if (bulk && action === 'toggleRead') {
+      // Any unread row makes this "mark all read"; otherwise mark all unread.
+      // A per-row toggle on a mixed set is the bug bulkAction() exists to avoid.
+      var anyUnread = kbBulkUnread();
+      win.bulkAction(anyUnread ? 'read' : 'unread', !anyUnread);
+      return;
+    }
+    if (bulk && action === 'move') { win.bulkMoveTo(); return; }
+    if (bulk && action === 'delete') { win.bulkDelete(); return; }
+    if (bulk && action === 'spam') { bulkSpam(); return; }
+    if (bulk && action === 'archive') { bulkArchive(); return; }
     var f = kbRowFields();
     if (!f) return;
     if (action === 'toggleRead') { win.toggleRead(f.uid, f.folder); return; }
@@ -11331,7 +11377,7 @@ function view_message_actions(array $email, int $uid, string $folder, string $me
   // Spam has nowhere to go from Spam, so the button is not rendered there.
   $spamButton = MailImap::isJunkFolder($folder) ? ''
     : '<form method="POST" action="?page=spam" style="display:inline" '
-    . 'onsubmit="rowAction(' . $uid . ', \'' . $enc . '\', \'?page=spam\', \'remove\'); return false;">'
+    . 'onsubmit="rowAction(' . $uid . ', \'' . $enc . '\', \'?page=spam\', \'remove\', null, \'?page=inbox\'); return false;">'
     . '<input type="hidden" name="csrf_token" value="' . $csrf . '">'
     . '<input type="hidden" name="uid" value="' . $uid . '">'
     . '<input type="hidden" name="folder" value="' . h($enc) . '">'
@@ -11661,6 +11707,8 @@ function view_kb_help_dialog(): string
     . '<tbody>' . $rows . '</tbody></table>'
     . '<p class="modal-desc">These three keys differ from Gmail: <kbd>s</kbd> toggles read, '
     . '<kbd>g s</kbd> opens Spam, <kbd>g a</kbd> opens Archive. '
+    . 'With rows selected, <kbd>s</kbd>, <kbd>v</kbd>, <kbd>#</kbd>, <kbd>!</kbd> and '
+    . '<kbd>e</kbd> act on the whole selection. '
     . '<a href="#" data-kb-disable>Disable shortcuts</a></p>'
     . '<div class="modal-actions"><button class="btn-cancel" autofocus type="button">Close</button></div>'
     . '</dialog>';

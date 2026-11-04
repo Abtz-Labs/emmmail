@@ -94,6 +94,10 @@ because special-folder detection needs to see the tree.
   `cache_apply_move()` run on every mutation.
 - `folder_view_data()` takes an IMAP **factory**, not a connection, so nothing connects
   unless the cache cannot answer the page.
+- **Page 1 is answered from any cached rows.** A partial cache (one message short after a
+  move) used to fetch a live page on every visit, so going back from a message could wait on
+  the server with rows already on hand. Deeper pages keep the full-window rule, where a short
+  page would be a hole in the list.
 
 ## Folder counts
 **Sidebar counters live in `folder_counts`, never in `folder_state`.** `sync_decide()` compares

@@ -717,6 +717,31 @@ $deep = folder_view_data($countingG2, $G2, 'INBOX', 3, 20, ['now' => 1700000010]
 assert_eq('live', $deep['source'], 'and its deep pages still fall back to live');
 assert_eq(45, $deep['total'], 'with the real message total');
 
+// Page 1 can answer from ANY cached rows. A folder left one message short by a
+// move used to ask IMAP for a full page on every visit, so going back from a
+// message could wait on the server even though six rows were on hand.
+group('folder_view_data() page 1 uses a partial cache instead of a live fetch');
+
+$P = 'partial-page@example.com';
+db_delete_messages($P, 'INBOX');
+scenario(['messages' => 7, 'uidvalidity' => 99, 'uidbase' => 9000]);
+$imap = connect();
+$countingP = function () use (&$imap, &$calls) { $calls++; return $imap; };
+$calls = 0;
+folder_view_data($countingP, $P, 'INBOX', 1, 20, ['window' => 6, 'backfill' => 0, 'now' => 1700000500]);
+assert_eq(6, db_count_messages($P, 'INBOX'), 'the first render caches only the window');
+
+$calls = 0;
+resetLog();
+$partialFirst = folder_view_data($countingP, $P, 'INBOX', 1, 20, ['now' => 1700000510]);
+assert_eq('cache', $partialFirst['source'], 'page 1 is served from the partial cache');
+assert_eq(6, count($partialFirst['emails']), 'with the rows the cache holds');
+assert_eq(0, $calls, 'and never asks for an IMAP connection');
+assert_eq(0, count(cmds()), 'so it costs no round trip');
+
+$deepPartial = folder_view_data($countingP, $P, 'INBOX', 2, 20, ['now' => 1700000520]);
+assert_eq('live', $deepPartial['source'], 'but a page past the partial window still goes live');
+
 group('folder_view_data() keeps Drafts flat');
 
 $G3 = 'drafts-flat@example.com';

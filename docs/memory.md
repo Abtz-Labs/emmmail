@@ -128,8 +128,8 @@ knowledge **out** of this file; add it there and link it from here. Budget: 150 
   macOS Focus / Do Not Disturb hides banners (they land in Notification Center).
 - **Code complete, browser pass NOT run:** `2026-11-04-composer-autocomplete-keyboard.md` — ↑/↓ move the suggestion highlight and wrap; Enter picks only a highlighted row; Esc stays with `kbCloseAutocomplete()`. js S92.
 - **Code complete, browser pass NOT run:** `2026-11-04-list-spam-button.md` — row Spam + bulk Spam (no confirm), hidden inside Spam; `handle_spam()` batches `post_uids()` and refuses without a Junk mailbox. js S93.
-- **Deferred manual passes** — code done, browser check not run, because no harness can stand in
-  for a real Safari/Firefox/mobile keyboard: markdown-compose step 8 (editor verified in Chromium only); keyboard-first-ux step 7 (cursor/ring, real `showModal` focus, native `<select>` Enter in the move dialog, pagination cursor restore, undo-send Cmd+Enter, login/touch inertness); instant-folder-switch click-through (needs IMAP creds).
+- **Code complete, browser pass NOT run:** `2026-11-04-selection-and-navigation-fixes.md` — shortcuts follow the selection; page 1 uses a partial cache; reader Spam lands Inbox; bulk count clears with the repaint. js S94/S95, imap partial page.
+- **Deferred manual passes** — code done, browser check not run, because no harness can stand in for a real Safari/Firefox/mobile keyboard: markdown-compose step 8 (editor verified in Chromium only); keyboard-first-ux step 7 (cursor/ring, real `showModal` focus, native `<select>` Enter in the move dialog, pagination cursor restore, undo-send Cmd+Enter, login/touch inertness); instant-folder-switch click-through (needs IMAP creds).
 - Everything else is done. Keep each plan's `status:` header honest.
 
 ## Open items

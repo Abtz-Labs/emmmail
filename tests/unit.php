@@ -2560,7 +2560,8 @@ assert_contains('markUnreadBack(5', $barHtml, 'Unread posts then leaves the mess
 assert_contains('?page=spam', $barHtml, 'Spam posts to the spam route');
 // The reader has no row to patch, so rowAction() posts and follows the message
 // out of the folder. Either way it never waits on a full page load.
-assert_contains("rowAction(5, 'INBOX', '?page=spam', 'remove')", $barHtml, 'Spam goes through the optimistic path');
+assert_contains("rowAction(5, 'INBOX', '?page=spam', 'remove', null, '?page=inbox')", $barHtml, 'Spam goes through the optimistic path');
+assert_contains("'?page=inbox'", $barHtml, 'and returns to the Inbox after filing');
 assert_not_contains('<form method="POST" action="?page=spam" style="display:inline">', $barHtml,
     'and not through a plain form post');
 
@@ -3122,7 +3123,7 @@ assert_contains("json_out(['success' => true, 'count' => \$count])", $bulkBodies
     'mark read answers with the count');
 assert_contains('$folder, $count)', $bulkBodies['handle_delete'], 'delete answers with the count');
 assert_contains('$folder, $count)', $bulkBodies['handle_move'], 'move answers with the count');
-assert_contains('$folder, $count)', $bulkBodies['handle_spam'], 'spam answers with the count');
+assert_contains('$count > 0 ? \'INBOX\' : $folder, $count)', $bulkBodies['handle_spam'], 'spam answers with the count and leaves for the Inbox on success');
 
 // Cache writes are per UID (the cache is one row per message) but only after the
 // batch reported work. A partial failure must not delete rows we did not move.
@@ -4767,6 +4768,7 @@ assert_contains('id="kb-help-dialog"', $kbDlg, 'sheet: dialog id present');
 assert_contains('aria-labelledby="kb-help-title"', $kbDlg, 'sheet: title linked to the dialog');
 assert_contains('btn-cancel" autofocus', $kbDlg, 'sheet: Close is the first focusable');
 assert_contains('data-kb-disable', $kbDlg, 'sheet: disable-shortcuts link present');
+assert_contains('act on the whole selection', $kbDlg, 'sheet: says row shortcuts follow a selection');
 foreach (kb_shortcuts() as $entry) {
     assert_contains('<kbd>' . h($entry['key']) . '</kbd>', $kbDlg, 'sheet: renders ' . $entry['key'] . ' as a key');
 }

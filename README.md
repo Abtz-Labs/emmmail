@@ -48,7 +48,9 @@ That's the whole stack.
   actions post **one** request for the whole batch (up to 200 messages, and a
   handful of IMAP commands total rather than a few per message) and the rows are
   patched optimistically. A refused batch restores every row, the list count and
-  the sidebar badge. `x` or Space picks the row under the keyboard cursor. The bar
+  the sidebar badge. `x` or Space picks the row under the keyboard cursor. With
+  rows picked, the row shortcuts (read, move, archive, spam, delete) act on the
+  whole selection. The bar
   sits in the mailbox header, so it does not push the list down. On a touch
   screen, tap a sender's avatar to start a selection. A background
    poll does not reload the list while rows are picked, so a selection is never
