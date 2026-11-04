@@ -71,6 +71,9 @@ makes the feature look absent, never broken.
 ## Per-message rules
 - Body fetches need `FT_PEEK`, or reading/downloading marks the message read.
 - Deletes go by **UID**, never sequence number, and must check `selectFolder()`.
+- `imap_msgno()` **throws** a `ValueError` for a uid below 1 on PHP 8; `@` does not stop it.
+  `getEmailByUid()`, `getAttachmentByUid()` and `moveToFolder()` refuse those, because a
+  `?uid=-1` request reaches them (the handlers check only `!$uid`).
 
 ## `\Noselect`
 `\Noselect` mailboxes are hierarchy nodes; STATUS and SELECT both fail on them.

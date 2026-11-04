@@ -2753,8 +2753,9 @@ function folder_view_data(callable $imapFactory, string $email, string $folder, 
   // Thread only a folder whose whole message set is cached. A partial window
   // would let a conversation straddle the page boundary, and paginating
   // conversations over it would double up against the flat live tail. Drafts is
-  // unfinished work, never a conversation.
-  $threaded = !MailImap::isDraftsFolder($folder) && (int)$total <= $cached;
+  // unfinished work, never a conversation. Trash and Junk never join one either:
+  // db_list_threads() filters their rows out, so threading them lists nothing.
+  $threaded = thread_folder_is_member($folder) && (int)$total <= $cached;
   if ($threaded) {
     $threadCount = db_count_threads($email, $folder);
     return [
@@ -3844,6 +3845,10 @@ class MailImap
 
   public function getEmailByUid(int $uid): ?array
   {
+    // imap_msgno() throws a ValueError below 1, and '@' does not stop it.
+    if ($uid < 1) {
+      return null;
+    }
     $msgno = @imap_msgno($this->conn, $uid);
     if (!$msgno) {
       return null;
@@ -4085,6 +4090,9 @@ class MailImap
 
   public function getAttachmentByUid(int $uid, string $partNumber): ?array
   {
+    if ($uid < 1) {
+      return null; // imap_msgno() throws below 1
+    }
     $msgno = @imap_msgno($this->conn, $uid);
     if (!$msgno) {
       return null;
@@ -4250,6 +4258,9 @@ class MailImap
 
   public function moveToFolder(int $uid, string $dest): bool
   {
+    if ($uid < 1) {
+      return false; // imap_msgno() throws below 1
+    }
     $msgno = @imap_msgno($this->conn, $uid);
     if (!$msgno) {
       return false;
@@ -4752,45 +4763,6 @@ function server_presets(): array
   ];
 }
 
-// Deployment-time login lock: exact email domains, comma- or space-separated.
-// An empty list means no restriction.
-function login_allowed_domains(): array
-{
-  $raw = trim((string)getenv('EMMMAIL_ALLOWED_DOMAINS'));
-  if ($raw === '') return [];
-
-  $domains = [];
-  foreach (preg_split('/[\s,]+/', $raw) ?: [] as $domain) {
-    $domain = strtolower(ltrim(trim($domain), '@'));
-    if ($domain !== '') $domains[] = $domain;
-  }
-  return array_values(array_unique($domains));
-}
-
-function email_domain_allowed(string $email): bool
-{
-  $domains = login_allowed_domains();
-  if ($domains === []) return true;
-
-  $at = strrpos($email, '@');
-  return $at !== false && in_array(strtolower(substr($email, $at + 1)), $domains, true);
-}
-
-// Empty when the address may sign in, otherwise the message to show.
-function login_domain_error(string $email): string
-{
-  if (email_domain_allowed($email)) return '';
-  return 'Sign in with an @' . implode(' or @', login_allowed_domains()) . ' address.';
-}
-
-// A deployment can pin the provider, hiding the preset selector and custom
-// server fields. An unknown key is ignored.
-function forced_mail_preset(): string
-{
-  $preset = strtolower(trim((string)getenv('EMMMAIL_FORCE_PRESET')));
-  return isset(server_presets()[$preset]) ? $preset : '';
-}
-
 // Resolve a concrete IMAP/SMTP config from login form input. Accepts either a
 // preset key (imap/smtp values looked up) or explicit custom fields. Blank
 // server falls back to the address domain with default ports/encryption.
@@ -4802,7 +4774,7 @@ function resolve_mail_config(array $post, string $email): array
     'smtp' => ['server' => '', 'port' => MAIL_SMTP_PORT, 'enc' => SMTP_ENCRYPTION],
   ];
 
-  $preset = forced_mail_preset() ?: strtolower(trim($post['preset'] ?? ''));
+  $preset = strtolower(trim($post['preset'] ?? ''));
   if ($preset !== '' && isset($presets[$preset])) {
     $cfg['imap'] = $presets[$preset]['imap'];
     $cfg['smtp'] = $presets[$preset]['smtp'];
@@ -5073,24 +5045,14 @@ function handle_login(): void
       exit;
     }
 
-<<<<<<< Updated upstream
     $gate = login_gate($email);
     if ($gate !== '') {
       flash_set('error', $gate);
-=======
-    $domainError = login_domain_error($email);
-    if ($domainError !== '') {
-      flash_set('error', $domainError);
->>>>>>> Stashed changes
       render_login();
       exit;
     }
 
-<<<<<<< Updated upstream
     $cfg = server_lock()['config'] ?? resolve_mail_config($_POST, $email);
-=======
-    $cfg = resolve_mail_config($_POST, $email);
->>>>>>> Stashed changes
     $imapCfg = $cfg['imap'];
 
     // Brute-force protection.
@@ -8044,39 +8006,35 @@ function js_inline(): string
     var serverFields = ['imap_server', 'imap_port', 'imap_enc',
       'smtp_server', 'smtp_port', 'smtp_enc'];
     var $loginPreset = $('#login-preset');
-    // A deployment can pin the preset: the selector is absent then, and the
-    // remembered values must survive untouched for when the lock is lifted.
-    if ($loginPreset.length) {
-      var storedPreset = '';
-      var storedServers = null;
-      try {
-        storedPreset = win.localStorage.getItem('emmmail-last-preset') || '';
-        storedServers = JSON.parse(win.localStorage.getItem('emmmail-last-custom') || 'null');
-      } catch (e) {}
-      var serverPreset = $loginPreset.val();
-      if (storedPreset) {
-        $loginPreset.val(storedPreset);
-        // A key this release has no option for blanks the select in a real browser
-        // (one with no matching option reports ''), so it falls back to the server's.
-        if (!$loginPreset.val()) $loginPreset.val(serverPreset);
-      }
-      // Setting the value fires no change event, so the block is opened here too.
-      $('.custom-servers').css('display', ($loginPreset.val() === 'custom') ? 'block' : 'none');
-      // Overwrite rather than fill-if-blank: a fresh visit renders the ports and
-      // the encryption selects as defaults, not blanks, so a blank test would lose
-      // the remembered value. The server only renders custom values after a failed
-      // POST, and that submit has already saved exactly those.
-      if (storedServers) {
-        for (var sf = 0; sf < serverFields.length; sf++) {
-          var $sf = $('[name="' + serverFields[sf] + '"]');
-          if (!$sf.length || storedServers[serverFields[sf]] === undefined) continue;
-          var serverValue = $sf.val();
-          $sf.val(storedServers[serverFields[sf]]);
-          // A select with no such option reports '' and then renders blank, so an
-          // unknown value falls back to what the server sent. An honestly empty
-          // input keeps its empty value.
-          if (serverValue !== '' && $sf.val() === '') $sf.val(serverValue);
-        }
+    var storedPreset = '';
+    var storedServers = null;
+    try {
+      storedPreset = win.localStorage.getItem('emmmail-last-preset') || '';
+      storedServers = JSON.parse(win.localStorage.getItem('emmmail-last-custom') || 'null');
+    } catch (e) {}
+    var serverPreset = $loginPreset.val();
+    if (storedPreset) {
+      $loginPreset.val(storedPreset);
+      // A key this release has no option for blanks the select in a real browser
+      // (one with no matching option reports ''), so it falls back to the server's.
+      if (!$loginPreset.val()) $loginPreset.val(serverPreset);
+    }
+    // Setting the value fires no change event, so the block is opened here too.
+    $('.custom-servers').css('display', ($loginPreset.val() === 'custom') ? 'block' : 'none');
+    // Overwrite rather than fill-if-blank: a fresh visit renders the ports and
+    // the encryption selects as defaults, not blanks, so a blank test would lose
+    // the remembered value. The server only renders custom values after a failed
+    // POST, and that submit has already saved exactly those.
+    if (storedServers) {
+      for (var sf = 0; sf < serverFields.length; sf++) {
+        var $sf = $('[name="' + serverFields[sf] + '"]');
+        if (!$sf.length || storedServers[serverFields[sf]] === undefined) continue;
+        var serverValue = $sf.val();
+        $sf.val(storedServers[serverFields[sf]]);
+        // A select with no such option reports '' and then renders blank, so an
+        // unknown value falls back to what the server sent. An honestly empty
+        // input keeps its empty value.
+        if (serverValue !== '' && $sf.val() === '') $sf.val(serverValue);
       }
     }
 
@@ -8084,7 +8042,6 @@ function js_inline(): string
       var btn = this.querySelectorAll('.btn-primary')[0];
       if (btn && btn.classList.contains('busy')) { ev.preventDefault(); return; }
       try { win.localStorage.setItem('emmmail-last-email', $loginEmail.val() || ''); } catch (e) {}
-<<<<<<< Updated upstream
       // A locked page has no preset to remember; saving blanks would wipe the
       // servers a user remembered from an unlocked deployment.
       if ($loginPreset.length) try {
@@ -8095,18 +8052,6 @@ function js_inline(): string
         }
         win.localStorage.setItem('emmmail-last-custom', JSON.stringify(servers));
       } catch (e) {}
-=======
-      if ($loginPreset.length) {
-        try {
-          win.localStorage.setItem('emmmail-last-preset', $loginPreset.val() || '');
-          var servers = {};
-          for (var sf2 = 0; sf2 < serverFields.length; sf2++) {
-            servers[serverFields[sf2]] = $('[name="' + serverFields[sf2] + '"]').val();
-          }
-          win.localStorage.setItem('emmmail-last-custom', JSON.stringify(servers));
-        } catch (e) {}
-      }
->>>>>>> Stashed changes
       markBusy(this.querySelectorAll('.btn-primary')[0]);
     });
   }
@@ -10405,11 +10350,8 @@ function view_login(string $csrf): string
     ];
   }
 
-  $forcedPreset = forced_mail_preset();
   $preset = $post['preset'] ?? '';
-  if ($forcedPreset !== '') {
-    $preset = $forcedPreset;
-  } elseif ($preset === '' && $stored['imap_server'] !== '') {
+  if ($preset === '' && $stored['imap_server'] !== '') {
     $preset = 'custom'; // returning user with saved servers -> show custom fields
   } elseif ($preset === '') {
     $preset = 'migadu'; // default selection
@@ -10427,7 +10369,6 @@ function view_login(string $csrf): string
 
   $customShow = ($preset === 'custom') ? ' style="display:block"' : ' style="display:none"';
 
-<<<<<<< Updated upstream
   // A locked deployment signs in against the operator's servers only, so the
   // picker is not rendered at all. A broken lock says so up front, in the box,
   // where a fading toast would not survive the time it takes to read it.
@@ -10462,68 +10403,22 @@ function view_login(string $csrf): string
     . '</select></div></div>'
     . '</div>';
   $alert = ($lock['error'] !== '') ? '<p class="login-alert" role="alert">' . h($lock['error']) . '</p>' : '';
+  // Hint the first allowed domain, so a locked page says which address it wants.
+  $domains = allowed_domains();
+  $domainHint = $domains ? ' placeholder="you@' . h($domains[0]) . '"' : '';
 
   return '<div class="login-box"><h1>' . icon('mail', 22) . ' ' . APP_NAME . '</h1>'
     . '<p class="sub">Sign in to your mailbox</p>'
     . $alert
-=======
-  $allowedDomains = login_allowed_domains();
-  $domainHint = $allowedDomains === []
-    ? ''
-    : ' placeholder="you@' . h($allowedDomains[0]) . '"';
-
-  $serverHtml = $forcedPreset !== ''
-    ? '<input type="hidden" name="preset" value="' . h($forcedPreset) . '">'
-    : '<div class="form-group"><label>Mail server</label>'
-      . '<select name="preset" id="login-preset">'
-      . $presetHtml
-      . '<option value="custom"' . (($preset === 'custom') ? ' selected' : '') . '>Custom settings…</option>'
-      . '</select></div>'
-      . '<div class="custom-servers"' . $customShow . '>'
-      . '<div class="fieldset-title">IMAP (receiving)</div>'
-      . '<div class="form-group"><label>IMAP server</label>'
-      . '<input type="text" name="imap_server" value="' . $f('imap_server') . '" placeholder="imap.example.com"></div>'
-      . '<div class="row2">'
-      . '<div class="form-group"><label>IMAP port</label>'
-      . '<input type="number" name="imap_port" value="' . $f('imap_port') . '"></div>'
-      . '<div class="form-group"><label>Encryption</label>'
-      . '<select name="imap_enc">'
-      . '<option value="ssl"'    . (($f('imap_enc') === 'ssl')    ? ' selected' : '') . '>SSL / TLS</option>'
-      . '<option value="tls"'    . (($f('imap_enc') === 'tls')    ? ' selected' : '') . '>STARTTLS</option>'
-      . '<option value="notls"'  . (($f('imap_enc') === 'notls')  ? ' selected' : '') . '>None</option>'
-      . '</select></div></div>'
-      . '<div class="fieldset-title">SMTP (sending)</div>'
-      . '<div class="form-group"><label>SMTP server</label>'
-      . '<input type="text" name="smtp_server" value="' . $f('smtp_server') . '" placeholder="smtp.example.com"></div>'
-      . '<div class="row2">'
-      . '<div class="form-group"><label>SMTP port</label>'
-      . '<input type="number" name="smtp_port" value="' . $f('smtp_port') . '"></div>'
-      . '<div class="form-group"><label>Encryption</label>'
-      . '<select name="smtp_enc">'
-      . '<option value="tls"' . ((($f('smtp_enc') === 'tls') || $f('smtp_enc') === '') ? ' selected' : '') . '>STARTTLS</option>'
-      . '</select></div></div>'
-      . '</div>';
-
-  return '<div class="login-box"><h1>' . icon('mail', 22) . ' ' . APP_NAME . '</h1>'
-    . '<p class="sub">Sign in to your mailbox</p>'
->>>>>>> Stashed changes
     . '<form method="POST" action="?page=login">'
     . '<input type="hidden" name="csrf_token" value="' . h($csrf) . '">'
     . '<div class="form-group"><label>Email</label>'
     . '<input type="email" name="email" id="login-email" required'
-<<<<<<< Updated upstream
-    . (($email === '') ? ' autofocus' : '') . ' value="' . h($email) . '" autocomplete="email"></div>'
-    . '<div class="form-group"><label>Password</label>'
-    . '<input type="password" name="password" required'
-    . (($email !== '') ? ' autofocus' : '') . ' id="login-password" autocomplete="current-password"></div>'
-    . $servers
-=======
     . (($email === '') ? ' autofocus' : '') . ' value="' . h($email) . '"' . $domainHint . ' autocomplete="email"></div>'
     . '<div class="form-group"><label>Password</label>'
     . '<input type="password" name="password" required'
     . (($email !== '') ? ' autofocus' : '') . ' id="login-password" autocomplete="current-password"></div>'
-    . $serverHtml
->>>>>>> Stashed changes
+    . $servers
     . '<button class="btn btn-primary btn-block" type="submit">' . icon('arrow-right') . ' Sign in</button>'
     . '</form>'
     . '</div>'

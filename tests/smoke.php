@@ -50,8 +50,9 @@ if ($imapAvailable && $hasCreds) {
         $count = $imap->getEmailCount('INBOX');
         assert_true(is_int($count) && $count >= 0, 'getEmailCount(INBOX) returns a count');
 
-        $emails = $imap->getEmails('INBOX', 1, 5);
-        assert_true(is_array($emails), 'getEmails(INBOX) lists messages');
+        $list = $imap->getEmails('INBOX', 1, 5);
+        assert_true(is_array($list['emails'] ?? null), 'getEmails(INBOX) lists messages');
+        $emails = $list['emails'] ?? [];
 
         if (count($emails) > 0) {
             $uid = (int)$emails[0]['uid'];

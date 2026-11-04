@@ -314,8 +314,6 @@ Config is via environment variables read at startup.
 | `EMMMAIL_VERIFY_CERT` | `1` | Set `0` to skip TLS certificate verification |
 | `EMMMAIL_CAFILE` | (system) | Path to a CA bundle for SMTP TLS verification |
 | `EMMMAIL_ENCRYPTION_KEY` | dev default | Secret used to encrypt the session password |
-| `EMMMAIL_ALLOWED_DOMAINS` | (empty) | Comma-separated email domains allowed to sign in; empty = any |
-| `EMMMAIL_FORCE_PRESET` | (empty) | Pin a provider preset (`migadu`), hiding the selector and custom fields |
 | `EMMMAIL_DEBUG` | `0` | Set `1` to surface PHP errors in the response |
 
 Logins are stored per-provider and reused as prefill for the next login.
@@ -339,7 +337,8 @@ An operator can pin the app to one mail server, one sign-in domain, or both.
   count. An address from any other domain gets a friendly error. No connection
   is made to the mail server, and the attempt does not count toward the login
   rate limit. The check runs at sign-in only, so a session that already exists
-  is not ended.
+  is not ended. The email field shows the first domain as a hint
+  (`you@example.com`).
 
 ### Per-account settings
 

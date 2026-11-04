@@ -730,6 +730,25 @@ assert_eq(false, $dr['threads'] ?? null, 'Drafts is never threaded');
 assert_eq(3, count($dr['emails']), 'drafts stay one row each');
 assert_eq(3, $dr['total'], 'and the total stays the message count');
 
+// db_list_threads() drops Trash and Junk rows from every conversation, the
+// listed folder included, so threading them rendered a count over an empty list.
+group('folder_view_data() keeps Junk and Trash flat');
+
+foreach (['Junk', 'Trash', 'INBOX.Junk'] as $i => $flatFolder) {
+  $G4 = 'flat-' . strtolower($flatFolder) . '@example.com';
+  $base = 8000 + $i * 100;
+  db_delete_messages($G4, $flatFolder);
+  // Two messages in one conversation, so a threaded total (1) differs from 2.
+  scenario(['messages' => 2, 'uidvalidity' => 99, 'uidbase' => $base,
+      'references_map' => [(string)($base + 2) => '<m' . ($base + 1) . '@example.com>']]);
+  $imap = connect();
+  $factoryG4 = function () use (&$imap) { return $imap; };
+  $fl = folder_view_data($factoryG4, $G4, $flatFolder, 1, 20, ['backfill' => 0, 'now' => 1700000000]);
+  assert_eq(false, $fl['threads'] ?? null, $flatFolder . ' is never threaded');
+  assert_eq(2, count($fl['emails']), $flatFolder . ' lists its cached rows');
+  assert_eq(2, $fl['total'], $flatFolder . ' total stays the message count');
+}
+
 // ======================================================== sync_request =======
 group('sync_request() staleness gate');
 
@@ -897,6 +916,14 @@ $imap->selectFolder('INBOX');
 $msg2 = $imap->getEmailByUid(1002);
 $form2 = reply_form_data($msg2, 'me@example.com', false);
 assert_contains('s1002@example.com', $form2['to'], 'without Reply-To the reply goes to the sender');
+
+// imap_msgno() throws a ValueError below 1 on PHP 8, and '@' does not stop it.
+// handle_read() only checks !$uid, so ?uid=-1 reached it and crashed the page.
+group('MailImap answers a uid below 1 without a crash');
+assert_eq(null, $imap->getEmailByUid(0), 'uid 0 is not a message');
+assert_eq(null, $imap->getEmailByUid(-1), 'a negative uid is not a message');
+assert_eq(null, $imap->getAttachmentByUid(-1, '1'), 'a negative uid has no attachment');
+assert_eq(false, $imap->moveToFolder(-1, 'INBOX'), 'a negative uid cannot be moved');
 
 // ========================================================= batch mutations ==
 // The point of a batch is that N messages cost a fixed number of round trips, not

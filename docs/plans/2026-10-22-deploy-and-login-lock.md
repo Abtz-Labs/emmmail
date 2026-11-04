@@ -16,6 +16,10 @@ status: in progress
 
 ## Login lock
 
+> **Superseded 2026-10-23** by `2026-10-23-resolve-login-lock-merge.md`. This lock collided
+> with the `2026-10-19` server lock. The `2026-10-19` version is kept, so the preset is pinned
+> with `EMMMAIL_PROVIDER`. The text below records the original design only.
+
 Two environment variables, read at request time so the tests can drive them:
 
 | Variable | Meaning |
@@ -53,7 +57,7 @@ Behavior:
 - PHP 8.1 with `ext-imap` (confirmed on the server).
 - On every release, a post-script appends `ProxyFCGISetEnvIf` lines to the
   release's `.htaccess` so PHP-FPM receives `EMMMAIL_DB_PATH`,
-  `EMMMAIL_ALLOWED_DOMAINS`, `EMMMAIL_FORCE_PRESET`, and
+  `EMMMAIL_ALLOWED_DOMAINS`, `EMMMAIL_PROVIDER` (was `EMMMAIL_FORCE_PRESET`), and
   `EMMMAIL_ENCRYPTION_KEY`. `SetEnv` does not reach PHP-FPM through
   `mod_proxy_fcgi`; `ProxyFCGISetEnvIf` does.
 - The encryption key is generated once and kept only in the git-ignored

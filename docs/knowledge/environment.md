@@ -27,7 +27,8 @@ auto-detect.
   appends `ProxyFCGISetEnvIf "true" NAME "value"` to each release's `.htaccess`
   instead. Hestia runs this domain on PHP 8.1 with `ext-imap`.
 - Production lock: `EMMMAIL_ALLOWED_DOMAINS=abtz.co` and
-  `EMMMAIL_FORCE_PRESET=migadu`. Both are read per request.
+  `EMMMAIL_PROVIDER=migadu`. Both are read per request. `EMMMAIL_FORCE_PRESET` is **gone**:
+  the code ignores it, so a stale one shows the server picker again.
 
 ## TCP timeouts
 `imap_open()` blocks forever on an unreachable host and segfaults PHP at shutdown, and c-client

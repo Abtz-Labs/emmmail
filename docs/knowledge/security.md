@@ -73,7 +73,8 @@ The operator can lock the server from the environment: `EMMMAIL_PROVIDER`, or th
 renders no dropdown, and `handle_login()` ignores the posted preset and custom fields. A
 lock that cannot be resolved **fails closed**: `server_lock()` stays locked with no config,
 and every sign-in is refused. `EMMMAIL_ALLOWED_DOMAINS` is matched exactly on the part after
-the last `@`. `login_gate()` runs both refusals **before the rate limiter and before any
+the last `@`, and `view_login()` shows the first one as the email placeholder.
+`login_gate()` runs both refusals **before the rate limiter and before any
 `MailImap`**, and a source-order test guards that.
 
 `detect_post_overflow()` and `parse_php_size()` run **before** `csrf_verify()` in

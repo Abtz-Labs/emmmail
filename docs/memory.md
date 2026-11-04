@@ -33,13 +33,8 @@ knowledge **out** of this file; add it there and link it from here. Budget: 150 
 ## Decisions in force
 - Password only in the session, libsodium secretbox, key server-global
   (`EMMMAIL_ENCRYPTION_KEY`). One CSRF token per request, shared by all forms
-<<<<<<< Updated upstream
   (`csrf_page_token()`). Login is a preset dropdown only, default `migadu`, unless the env
   locks it (see [knowledge/security.md](knowledge/security.md)). No jQuery, no CDN.
-=======
-  (`csrf_page_token()`). Login is a preset dropdown only, default `migadu`; deployment can pin
-  it and whitelist domains with `EMMMAIL_FORCE_PRESET` / `EMMMAIL_ALLOWED_DOMAINS`. No jQuery, no CDN.
->>>>>>> Stashed changes
 - **The CSP is `script-src 'self' 'unsafe-inline'`** (render_page emits an inline `<script>`),
   so it is **not** a script barrier. Never treat it as one — see
   [knowledge/security.md](knowledge/security.md).
@@ -52,15 +47,12 @@ knowledge **out** of this file; add it there and link it from here. Budget: 150 
   (~30ms warm).
 
 ## Plan status
-<<<<<<< Updated upstream
 - **Code complete, browser pass NOT run:** `2026-10-19-server-lock-and-allowed-domains.md`.
-  Env server lock + domain allow-list, fail closed.
-=======
-- **Code complete, deploy not run:** `2026-10-22-deploy-and-login-lock.md` — env-driven login
-  lock (`EMMMAIL_ALLOWED_DOMAINS`, `EMMMAIL_FORCE_PRESET`), `bare.config.json` for
-  `webmail.abtz.co` (git-ignored, DB in `private/`), dry-run passes; suite has one pre-existing
-  footer failure (`&copy;` vs the test's `(c)`).
->>>>>>> Stashed changes
+  Env server lock + domain allow-list, fail closed. Login email hints the first allowed domain.
+- **Deploy not run:** `2026-10-22-deploy-and-login-lock.md`, `bare.config.json` for
+  `webmail.abtz.co` (git-ignored, DB in `private/`). Its own lock was dropped in the merge
+  (`2026-10-23-resolve-login-lock-merge.md`): the deploy env must set
+  `EMMMAIL_PROVIDER=migadu`, **not** `EMMMAIL_FORCE_PRESET`, or the picker comes back.
 - **Done, manually verified:** `2026-10-06-footer.md` — one `view_footer()` credit line
   (author + Use Bare links, `utm_content=APP_VERSION`, `#<version> &copy; Abtz Labs`, both
   links `target="_blank" rel="noopener noreferrer"`), mounted in `.login-footer` (centered,
@@ -154,3 +146,5 @@ knowledge **out** of this file; add it there and link it from here. Budget: 150 
   that sends a non-UTF-8 folder name makes every folder-list write fail, so the listings
   re-LIST each visit. Both are documented in
   [plans/2026-10-02-empty-folder-sidebar.md](plans/2026-10-02-empty-folder-sidebar.md).
+- **Fixed (browser pass NOT run):** empty Spam/Trash list under a count. Gate is now
+  `thread_folder_is_member()`; `db_list_threads()` drops Trash/Junk rows.
