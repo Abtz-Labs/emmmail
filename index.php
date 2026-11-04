@@ -6474,6 +6474,15 @@ function render_page(string $title, string $content, bool $authenticated): void
   echo '<meta name="csrf" content="' . h(csrf_page_token()) . '">';
   echo '<meta name="color-scheme" content="light dark">';
   echo '<title>' . h($title) . ' — ' . APP_NAME . '</title>';
+  // "E." in Nord dark: nord0 tile, nord6 E, nord8 dot. Paths on the integer grid,
+  // not <text>, so it is sharp at 16px and needs no font. rawurlencode() keeps
+  // '"' and '#' out of the attribute.
+  echo '<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,' . rawurlencode(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
+    . '<rect width="32" height="32" rx="7" fill="#2e3440"/>'
+    . '<path d="M7 7h12v4h-8v3h7v4h-7v3h8v4h-12z" fill="#eceff4"/>'
+    . '<circle cx="24" cy="22" r="3" fill="#88c0d0"/></svg>'
+  ) . '">';
   // Apply the stored theme before first paint, so the page never flashes the
   // wrong palette. Falls through to the OS preference when nothing is stored.
   echo '<script>(function(){try{var t=localStorage.getItem("emmmail-theme");'

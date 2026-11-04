@@ -2194,6 +2194,20 @@ render_page('T', '<div id="probe">x</div>', false);
 $page = ob_get_clean();
 assert_contains('Em.prototype.each', $page, 'render_page: shared toolkit present when logged out');
 
+group('render_page() ships an inline SVG favicon');
+// On the logged-out page, so the login screen has it too. The payload is
+// rawurlencode()d: a raw '"' or '#' would cut the attribute or the data: URL.
+assert_eq(1, preg_match_all('/<link rel="icon" type="image\/svg\+xml" href="data:image\/svg\+xml,([^"]+)">/', $page, $favicon),
+    'render_page: one SVG icon link in the head');
+$faviconSvg = rawurldecode($favicon[1][0] ?? '');
+assert_not_contains('#', $favicon[1][0] ?? '#', 'the payload is percent-encoded: a raw # ends the data: URL');
+$faviconXml = simplexml_load_string($faviconSvg);
+assert_true($faviconXml !== false, 'the favicon is well-formed XML');
+assert_contains('xmlns="http://www.w3.org/2000/svg"', $faviconSvg, 'the favicon declares the SVG namespace, or an image load shows nothing');
+assert_contains('#2e3440', $faviconSvg, 'the tile is Nord dark nord0');
+assert_contains('#eceff4', $faviconSvg, 'the E is nord6');
+assert_contains('#88c0d0', $faviconSvg, 'the dot is the dark accent nord8');
+
 group('render_page() renders flash as toasts, not static alerts');
 $_SESSION['flash'] = ['success' => 'Saved.', 'error' => 'Nope.'];
 ob_start();

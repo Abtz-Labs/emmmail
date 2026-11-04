@@ -53,6 +53,8 @@ knowledge **out** of this file; add it there and link it from here. Budget: 150 
   `webmail.abtz.co` (git-ignored, DB in `private/`). Its own lock was dropped in the merge
   (`2026-10-23-resolve-login-lock-merge.md`): the deploy env must set
   `EMMMAIL_PROVIDER=migadu`, **not** `EMMMAIL_FORCE_PRESET`, or the picker comes back.
+- **Code complete, browser pass NOT run:** `2026-10-24-favicon.md` — inline data: SVG "E."
+  (nord0/6/8) in `render_page()`.
 - **Code complete, browser pass NOT run:** `2026-10-24-message-links-new-tab.md` — body
   `http(s)` links get `target=_blank`; sandbox adds `allow-popups(-to-escape-sandbox)`.
 - **Done, manually verified:** `2026-10-06-footer.md` — one `view_footer()` credit line in
