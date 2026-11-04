@@ -3936,6 +3936,47 @@ async function main() {
       calls[0].body.indexOf('uids=2%2C4%2C5') !== -1, true);
   }
 
+  // S92 — the contact suggestions are reachable from the keyboard: arrows move
+  // the highlight, Enter picks it, and Enter with no list open stays a submit.
+  {
+    const doc = makeDoc(); buildMeta(doc); buildAutocomplete(doc);
+    const win = makeWin();
+    boot(doc, win, () => ({ json: () => Promise.resolve({ results: [{ name: 'Al', email: 'a@x.io' }, { name: 'Bo', email: 'b@x.io' }] }) }), []);
+    const input = doc.querySelector('[data-autocomplete]');
+    const open = async () => {
+      input.value = 'al';
+      input.dispatch('input');
+      await settle(280);
+      return doc.querySelector('.ac-dropdown');
+    };
+    const dd = await open();
+    input.dispatch('keydown', input, { key: 'ArrowDown' });
+    eq('S92 ArrowDown opens on the first suggestion', dd.style.display, 'block');
+    ok('S92 and highlights it', dd.children[0].classList.contains('ac-active'));
+    input.dispatch('keydown', input, { key: 'ArrowDown' });
+    ok('S92 a second ArrowDown moves to the next', dd.children[1].classList.contains('ac-active'));
+    ok('S92 and drops the previous highlight', !dd.children[0].classList.contains('ac-active'));
+    input.dispatch('keydown', input, { key: 'ArrowDown' });
+    ok('S92 ArrowDown wraps to the first', dd.children[0].classList.contains('ac-active'));
+    input.dispatch('keydown', input, { key: 'ArrowUp' });
+    ok('S92 ArrowUp wraps back to the last', dd.children[1].classList.contains('ac-active'));
+    input.dispatch('keydown', input, { key: 'Enter' });
+    eq('S92 Enter fills the highlighted suggestion', input.value, 'b@x.io');
+    eq('S92 and closes the list', dd.style.display, 'none');
+
+    const dd2 = await open();
+    input.dispatch('keydown', input, { key: 'ArrowUp' });
+    ok('S92 ArrowUp with nothing highlighted starts at the last', dd2.children[1].classList.contains('ac-active'));
+
+    dd2.style.display = 'none';
+    const closed = input.dispatch('keydown', input, { key: 'Enter' });
+    eq('S92 with no list open Enter is left to the form', closed.defaultPrevented, false);
+
+    input.dispatch('keydown', input, { key: 'Escape' });
+    input.dispatch('keydown', input, { key: 'ArrowUp' });
+    ok('S92 Escape drops the highlight, so the next ArrowUp starts at the last', dd2.children[1].classList.contains('ac-active'));
+  }
+
   } catch (e) {
     R.push({ name: '<harness crashed mid-run>', pass: false, detail: (e && e.stack) || String(e) });
   }

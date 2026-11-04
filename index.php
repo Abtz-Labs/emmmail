@@ -7367,7 +7367,7 @@ html:has(.compose-actions) { scroll-padding-bottom:80px; }
   border:1px solid var(--border); border-radius:var(--radius); box-shadow:var(--shadow-md);
   max-height:220px; overflow-y:auto; display:none; z-index:50; padding:4px; }
 .ac-item { padding:9px 11px; border-radius:8px; cursor:pointer; font-size:.88rem; }
-.ac-item:hover { background:var(--accent-soft); }
+.ac-item:hover, .ac-item.ac-active { background:var(--accent-soft); }
 .ac-item .em { color:var(--text-faint); font-size:.78rem; }
 
 /* --- Misc -------------------------------------------------------------- */
@@ -10005,23 +10005,46 @@ JS
     $dd.addClass('ac-dropdown');
     input.parentNode.appendChild($dd[0]);
     var timer = null;
+    var active = -1;
+
+    function acItems(){ return $dd[0].querySelectorAll('.ac-item'); }
+    // active is the highlighted row, or -1 when nothing is. It survives only as
+    // long as the rows it points at, so every repaint resets it.
+    function acHighlight(idx){
+      var items = acItems();
+      if (!items.length) { active = -1; return; }
+      active = (idx % items.length + items.length) % items.length;
+      for (var i = 0; i < items.length; i++) {
+        if (i === active) items[i].classList.add('ac-active');
+        else items[i].classList.remove('ac-active');
+      }
+    }
+    function acPick(idx){
+      var items = acItems();
+      if (idx < 0 || idx >= items.length) return false;
+      input.value = items[idx].getAttribute('data-email');
+      $dd.hide();
+      active = -1;
+      return true;
+    }
 
     $(input).on('input', function(){
       win.clearTimeout(timer);
+      active = -1;
       var q = this.value;
       if (q.length < 2) { $dd.hide(); return; }
       timer = win.setTimeout(function(){
         $.get('?page=contacts&q=' + encodeURIComponent(q)).then(function(j){
           $dd.html('');
           var rows = j.results || [];
-          rows.forEach(function(c){
+          rows.forEach(function(c, i){
             var item = doc.createElement('div');
             item.className = 'ac-item';
+            item.setAttribute('data-email', c.email);
             item.innerHTML = '<span class="nm">' + $.escapeHtml(c.name || '') + '</span> <span class="em">' + $.escapeHtml(c.email) + '</span>';
             $(item).on('mousedown', function(ev){
               ev.preventDefault();
-              input.value = c.email;
-              $dd.hide();
+              acPick(i);
             });
             $dd.append(item);
           });
@@ -10029,7 +10052,28 @@ JS
         });
       }, 250);
     });
-    $(doc).on('click', function(){ $dd.hide(); });
+    // Arrows move the highlight and Enter takes it, so an address is reachable
+    // without leaving the field. Enter is only swallowed while a row is
+    // highlighted; otherwise it stays the form's submit.
+    $(input).on('keydown', function(ev){
+      var key = ev.key;
+      // Esc belongs to kbCloseAutocomplete(); only drop the highlight here so a
+      // reopen starts clean. Hiding the list here would let the same key fall
+      // through and discard the draft.
+      if (key === 'Escape') { active = -1; return; }
+      if (key !== 'ArrowDown' && key !== 'ArrowUp' && key !== 'Enter') return;
+      if (!acItems().length) return;
+      if (key === 'Enter') {
+        if (active < 0 || $dd[0].style.display !== 'block') return;
+        ev.preventDefault();
+        acPick(active);
+        return;
+      }
+      ev.preventDefault();
+      $dd.css('display', 'block');
+      acHighlight(active < 0 ? (key === 'ArrowDown' ? 0 : -1) : active + (key === 'ArrowDown' ? 1 : -1));
+    });
+    $(doc).on('click', function(){ active = -1; $dd.hide(); });
   });
 
   // One confirm dialog, reused: it carries the endpoint and the fields to post,

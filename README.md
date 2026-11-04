@@ -77,7 +77,8 @@ That's the whole stack.
   a search, the server-side search offer, or Send/Save draft in the composer spins
   its own control while a progress bar runs in the top bar
 - Search across a folder (local cache first, then IMAP)
-- Contacts auto-populated from recipients, with autocomplete
+- Contacts auto-populated from recipients, with autocomplete (arrow keys move the
+  highlight, Enter picks it)
 - Per-account settings (messages per page, display name, signature, automatic check,
   undo send, remote images, protected-folder map)
 - Session-based authentication with IP binding and rate-limit on logins;

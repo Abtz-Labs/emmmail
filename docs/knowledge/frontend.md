@@ -312,6 +312,12 @@ a source guard on `case 'x': kbSelectCursor();` for that reason.
 is the only no-folder exit in the path, and it is why the Inbox fallback exists rather than
 a guard.
 
+**Composer autocomplete is keyboard-first.** `↑`/`↓` move `.ac-active` through the
+suggestion rows and wrap at both ends; `Enter` picks the highlighted row and only
+then swallows the key, so a bare `Enter` still submits the form. On `Esc` the field
+only clears its highlight: `kbCloseAutocomplete()` owns the hiding, and hiding the
+list in the field would let the same key fall through to the composer's discard.
+
 Form actions carry a modifier so they work while typing and never collide with the mail keys:
 `Cmd/Ctrl+S` = Save draft (composer) or Save settings, `Cmd/Ctrl+Shift+A` = attach,
 `Cmd/Ctrl+Shift+X` = clear local cache. Each clicks the control a user would.
