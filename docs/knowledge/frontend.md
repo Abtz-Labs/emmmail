@@ -111,7 +111,11 @@ real sort.
 `bulkAction(action, unread)` takes an **explicit direction**, not a per-row toggle:
 on a mixed set a toggle marks the already-read rows the other way, painted before
 the request goes out. `bulkRemove(uids, folder, url, extra)` is the removal half,
-shared by move and delete.
+shared by move, delete and spam. Spam is the one removal without a confirm dialog:
+it files the message rather than destroying it, and a missing Junk mailbox is a
+server refusal that rolls the rows back like any other. **Spam hides its own Spam
+action** in all three places — bulk bar, row button and reader — because there is
+nowhere to file a message that is already there.
 
 **A flag change removes nothing.** Move and delete take the row out of the folder,
 so they remove it. Marking read or unread does not, and its success path must not:

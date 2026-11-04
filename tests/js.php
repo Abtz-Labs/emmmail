@@ -541,7 +541,7 @@ function buildList(doc, folder, n, into, uids) {
   bulk.setAttribute('role', 'status');
   bulk.setAttribute('data-bulk-folder', folder);
   bulk.setAttribute('data-bulk-delete-copy', 'Delete %d messages? They will move to Trash.');
-  for (const act of ['read', 'unread', 'move', 'delete']) {
+  for (const act of ['read', 'unread', 'move', 'spam', 'delete']) {
     const b = doc.createElement('button');
     b.setAttribute('type', 'button');
     b.className = 'btn btn-sm';
@@ -3975,6 +3975,41 @@ async function main() {
     input.dispatch('keydown', input, { key: 'Escape' });
     input.dispatch('keydown', input, { key: 'ArrowUp' });
     ok('S92 Escape drops the highlight, so the next ArrowUp starts at the last', dd2.children[1].classList.contains('ac-active'));
+  }
+
+  // S93 — bulk spam is one POST that carries the selection, removes the rows,
+  // and restores them when the server has no Junk mailbox.
+  {
+    const pick = (doc, uid) => {
+      const box = doc.querySelector('.mail-pick[data-pick-uid="' + uid + '"]');
+      box.checked = true;
+      box.dispatch('change', box, {});
+    };
+    const doc = makeDoc(); buildMeta(doc);
+    const win = makeWin();
+    const parts = buildList(doc, 'INBOX', 3);
+    const calls = [];
+    boot(doc, win, () => ({ json: () => Promise.resolve({ ok: true, success: true, count: 2 }) }), calls);
+    pick(doc, 1); pick(doc, 2);
+    doc.querySelector('[data-bulk-action="spam"]').dispatch('click', doc.querySelector('[data-bulk-action="spam"]'), {});
+    eq('S93 bulk spam posts once', calls.length, 1);
+    eq('S93 to the spam route', calls[0] && calls[0].url, '?page=spam');
+    ok('S93 carrying both selected uids, ascending', calls[0].body.indexOf('uids=1%2C2') !== -1);
+    ok('S93 the rows leave at once', parts.rows[0].classList.contains('row-gone')
+      && parts.rows[1].classList.contains('row-gone'));
+    await settle();
+    eq('S93 the confirmed rows are detached', parts.rows[0].parentNode, null);
+
+    const doc2 = makeDoc(); buildMeta(doc2);
+    const win2 = makeWin();
+    const parts2 = buildList(doc2, 'INBOX', 3);
+    boot(doc2, win2, () => ({ json: () => Promise.resolve({ ok: false, message: 'No Spam folder on this account.', count: 0 }) }), []);
+    pick(doc2, 1);
+    doc2.querySelector('[data-bulk-action="spam"]').dispatch('click', doc2.querySelector('[data-bulk-action="spam"]'), {});
+    await settle();
+    ok('S93 a refusal puts the row back', !parts2.rows[0].classList.contains('row-gone'));
+    const err = doc2.querySelector('.toast-error');
+    ok('S93 and says why', err && err.textContent.indexOf('No Spam folder') !== -1);
   }
 
   } catch (e) {

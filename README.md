@@ -39,10 +39,12 @@ That's the whole stack.
 - Attach inline/uploaded files with size limits
 - Move to Trash, restore, and empty Trash or Spam (permanent delete)
 - Move a message into any folder
-- Mark as spam (moves to the Junk mailbox; never deletes)
+- Mark as spam from a list row or the reader (moves to the Junk mailbox; never
+  deletes; not offered inside Spam)
 - Mark as read / unread
 - Bulk selection and actions on the list view: tick rows, or select-all, then
-  mark them read or unread, move them to any folder, or delete them. The
+  mark them read or unread, move them to any folder, mark them as spam, or delete
+  them. The
   actions post **one** request for the whole batch (up to 200 messages, and a
   handful of IMAP commands total rather than a few per message) and the rows are
   patched optimistically. A refused batch restores every row, the list count and

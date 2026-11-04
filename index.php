@@ -4189,17 +4189,6 @@ class MailImap
     return $this->moveToFolder($uid, $trash);
   }
 
-  // Unlike moveToTrash, a missing Junk mailbox must NOT fall back to a delete:
-  // "this is spam" is a filing decision, never a destructive one.
-  public function moveToJunk(int $uid): bool
-  {
-    $junk = $this->findJunkFolder();
-    if (!$junk) {
-      return false;
-    }
-    return $this->moveToFolder($uid, $junk);
-  }
-
   public function restoreFromTrash(int $uid): bool
   {
     $trash = $this->findTrashFolder();
@@ -5886,10 +5875,13 @@ function handle_spam(): void
     http_response_code(403);
     exit('Forbidden');
   }
-  $uid = (int)($_POST['uid'] ?? 0);
+  $uids = post_uids();
   $folder = urldecode($_POST['folder'] ?? 'INBOX');
-  if (!$uid) {
-    respond_mutation(false, 'No message given.', $folder);
+  if (!imap_folder_name_is_safe($folder)) {
+    respond_mutation(false, 'Invalid folder name.', $folder);
+  }
+  if (empty($uids)) {
+    respond_mutation(true, 'No messages given.', $folder, 0);
   }
   $imap = imap_for_session();
   // A UID move against the wrong mailbox would file someone else's mail.
@@ -5900,11 +5892,19 @@ function handle_spam(): void
   if (!$junk) {
     respond_mutation(false, 'No Spam folder on this account.', $folder);
   }
-  $ok = $imap->moveToJunk($uid);
-  if ($ok) {
-    cache_apply_move(current_user(), $folder, $uid, $junk);
+  // Deliberately not a delete: with no Junk mailbox the move fails loudly rather
+  // than destroying mail, and the message stays put (the guard above).
+  $count = $imap->moveManyToFolder($uids, $junk);
+  if ($count > 0) {
+    $me = current_user();
+    foreach ($uids as $uid) {
+      cache_apply_move($me, $folder, $uid, $junk);
+    }
+    cache_invalidate_folder($me, $folder);
+    cache_invalidate_folder($me, $junk);
   }
-  respond_mutation($ok, $ok ? 'Message marked as spam.' : 'Could not mark as spam.', $folder);
+  $msg = $count > 0 ? ($count === 1 ? 'Message marked as spam.' : 'Messages marked as spam.') : 'Could not mark as spam.';
+  respond_mutation($count > 0, $msg, $folder, $count);
 }
 
 function handle_restore(): void
@@ -9139,6 +9139,9 @@ JS
       if (!act || !pickCount()) return;
       if (act === 'move') { win.bulkMoveTo(); return; }
       if (act === 'delete') { win.bulkDelete(); return; }
+      // Spam is the removal half without a dialog: the server refuses loudly
+      // when the account has no Junk mailbox, and the shared undo restores rows.
+      if (act === 'spam') { bulkRemove(pickUids(), bulkFolder(), '?page=spam'); return; }
       // An explicit direction, not a per-row toggle: rowAction's flag mode reads
       // .unread off each row, which is unambiguous for one row and meaningless
       // for N. Per-row, "Mark read" on a mixed set would mark the ALREADY-READ
@@ -10662,6 +10665,13 @@ function view_mailbox(array $d): string
       . icon('mail') . ' <span class="btn-label">Unread</span></button>'
       . '<button type="button" class="btn btn-sm" data-bulk-action="move" aria-label="Move selected">'
       . icon('folder') . ' <span class="btn-label">Move</span></button>'
+      // Spam files the selection without a confirm, like the reader's button:
+      // it is a filing decision, not a delete, and a missing Junk mailbox is a
+      // refusal the rows roll back from. There is nowhere to file from Spam.
+      . (empty($d['is_junk'])
+        ? '<button type="button" class="btn btn-sm btn-warn-soft" data-bulk-action="spam" aria-label="Mark selected as spam">'
+          . icon('alert-triangle') . ' <span class="btn-label">Spam</span></button>'
+        : '')
       // Delete is the only irreversible one, so it takes the confirm dialog like
       // every other destructive action. The copy is built in PHP because whether
       // it is reversible depends on the folder, which only the server knows.
@@ -10769,7 +10779,15 @@ function view_mailbox(array $d): string
         . '<button type="button" class="icon-btn tip" data-read-toggle data-tip="' . ($unread ? 'Mark read' : 'Mark unread') . '" aria-label="' . ($unread ? 'Mark read' : 'Mark unread') . '" '
         . 'onclick="toggleRead(' . (int)$e['uid'] . ', \'' . urlencode($d['current_folder']) . '\')">'
         . ($unread ? icon('mail') : icon('mail-opened')) . '</button>'
-        . $rowMove;
+        . $rowMove
+        // Same immediate path as the reader's Spam: file the message and let the
+        // row leave at once. No dialog, because nothing is destroyed. Spam has
+        // nowhere to file itself, so the row does not offer it there.
+        . (empty($d['is_junk'])
+          ? '<button type="button" class="icon-btn btn-warn-soft tip" data-tip="Spam" aria-label="Spam" '
+            . 'onclick="rowAction(' . (int)$e['uid'] . ', \'' . urlencode($d['current_folder']) . '\', \'?page=spam\', \'remove\')">'
+            . icon('alert-triangle') . '</button>'
+          : '');
       if (!empty($d['is_trash'])) {
         $h .= '<form method="POST" action="?page=restore" style="display:inline" '
           . 'onsubmit="rowAction(' . (int)$e['uid'] . ', \'' . urlencode($d['current_folder']) . '\', \'?page=restore\', \'remove\'); return false;">'
@@ -11310,6 +11328,15 @@ function view_message_actions(array $email, int $uid, string $folder, string $me
     ? '<a class="btn btn-sm tip" data-tip="Back" aria-label="Back" href="?page=folder&folder=' . $enc . '">'
     . icon('arrow-back') . ' <span class="btn-label">Back</span></a>'
     : '';
+  // Spam has nowhere to go from Spam, so the button is not rendered there.
+  $spamButton = MailImap::isJunkFolder($folder) ? ''
+    : '<form method="POST" action="?page=spam" style="display:inline" '
+    . 'onsubmit="rowAction(' . $uid . ', \'' . $enc . '\', \'?page=spam\', \'remove\'); return false;">'
+    . '<input type="hidden" name="csrf_token" value="' . $csrf . '">'
+    . '<input type="hidden" name="uid" value="' . $uid . '">'
+    . '<input type="hidden" name="folder" value="' . h($enc) . '">'
+    . '<button class="btn btn-sm btn-icon btn-warn-soft tip" data-tip="Spam" aria-label="Spam">'
+    . icon('alert-triangle') . '</button></form>';
   return '<div class="actions-bar">'
     . $back
     . '<div class="actions-bar-right">'
@@ -11329,13 +11356,7 @@ function view_message_actions(array $email, int $uid, string $folder, string $me
     . 'onclick="markUnreadBack(' . $uid . ', \'' . $enc . '\')">' . icon('mail') . '</button>'
     . $moveButton
     . '<span class="actions-sep"></span>'
-    . '<form method="POST" action="?page=spam" style="display:inline" '
-    . 'onsubmit="rowAction(' . $uid . ', \'' . $enc . '\', \'?page=spam\', \'remove\'); return false;">'
-    . '<input type="hidden" name="csrf_token" value="' . $csrf . '">'
-    . '<input type="hidden" name="uid" value="' . $uid . '">'
-    . '<input type="hidden" name="folder" value="' . h($enc) . '">'
-    . '<button class="btn btn-sm btn-icon btn-warn-soft tip" data-tip="Spam" aria-label="Spam">'
-    . icon('alert-triangle') . '</button></form>'
+    . $spamButton
     . '<form method="POST" action="?page=delete" style="display:inline" data-uid="' . (int)$uid . '" data-folder="' . h($enc) . '" '
     . 'onsubmit="confirmDelete(' . (int)$uid . ', \'' . $enc . '\', \'Delete this message?\'); return false;">'
     . '<input type="hidden" name="csrf_token" value="' . $csrf . '">'

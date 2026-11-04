@@ -1309,7 +1309,6 @@ assert_true($mv !== null && $mv->getName() === 'bool', 'moveToFolder() reports s
 $imapSrc = file_get_contents(__DIR__ . '/../index.php');
 assert_eq(1, substr_count($imapSrc, 'imap_mail_move($this->conn'),
     'exactly one call site does the actual move');
-assert_contains('return $this->moveToFolder($uid, $junk);', $imapSrc, 'moveToJunk delegates');
 assert_contains('return $this->moveToFolder($uid, $trash);', $imapSrc, 'moveToTrash delegates');
 assert_contains('return $this->moveToFolder($uid, \'INBOX\');', $imapSrc, 'restoreFromTrash delegates');
 
@@ -2565,6 +2564,14 @@ assert_contains("rowAction(5, 'INBOX', '?page=spam', 'remove')", $barHtml, 'Spam
 assert_not_contains('<form method="POST" action="?page=spam" style="display:inline">', $barHtml,
     'and not through a plain form post');
 
+group('Spam hides its own Spam action in the reader');
+
+$spamBar = view_message_actions($raEmail, 5, 'Spam', $me, '');
+assert_not_contains('data-tip="Spam"', $spamBar, 'a message already in Spam offers no Spam button');
+assert_not_contains('?page=spam', $spamBar, 'and no such form');
+assert_contains('data-tip="Unread"', $spamBar, 'the other actions stay');
+assert_contains('data-tip="Delete"', $spamBar, 'including Delete');
+
 group('view_read() avatar is tinted like the list rows');
 
 assert_contains('class="avatar av-', $barHtml, 'the read-view avatar carries a tone');
@@ -2748,6 +2755,12 @@ assert_contains('data-read-toggle', $listHtml, 'the read toggle is findable so i
 assert_contains('toggleRead(3', $listHtml, 'one function serves both directions');
 assert_not_contains('markRead(3', $listHtml, 'the two one-way helpers are gone');
 assert_not_contains('markUnread(3', $listHtml, 'both of them');
+// Spam is a filing decision, not a destructive one: a row files the message
+// without opening it and without a confirm dialog.
+assert_contains("rowAction(3, 'INBOX', '?page=spam', 'remove')", $listHtml,
+    'the list row files a message as spam optimistically');
+assert_contains('class="icon-btn btn-warn-soft tip" data-tip="Spam" aria-label="Spam"', $listHtml,
+    'the row spam button is icon-only, named, and warns on hover like the reader');
 // Delete and Restore go through the same optimistic path.
 $trashRows = view_inbox(['is_trash' => true] + $listD);
 assert_contains("rowAction(3, 'INBOX', '?page=restore', 'remove')", $trashRows, 'Restore is optimistic too');
@@ -2794,9 +2807,11 @@ assert_true($barAt < strpos($listHtml, 'class="mail-list"'), 'and above the list
 
 assert_contains('class="bulk-bar hidden"', $listHtml, 'the bulk bar ships hidden');
 assert_contains('data-bulk-count', $listHtml, 'the count is addressable, not parsed out of text');
-foreach (['read', 'unread', 'move', 'delete'] as $act) {
+foreach (['read', 'unread', 'move', 'spam', 'delete'] as $act) {
     assert_contains('data-bulk-action="' . $act . '"', $listHtml, 'the bar offers ' . $act);
 }
+assert_contains('class="btn btn-sm btn-warn-soft" data-bulk-action="spam"', $listHtml,
+    'bulk spam is a warning action, not a destructive one');
 // An inline handler would be invisible to the js suite: the stub has no
 // attribute-handler wiring, so the scenarios would pass without running a thing.
 assert_not_contains('onclick="bulkAction', $listHtml, 'no inline bulk handler; the buttons are data-driven');
@@ -3073,11 +3088,11 @@ foreach (['handle_delete', 'handle_restore', 'handle_spam', 'handle_move'] as $f
     assert_not_contains('flash_set(', $body, $fn . '() no longer flashes directly');
 }
 
-group('the three bulk handlers: CSRF, folder safety, one batch, a count back');
+group('the four bulk handlers: CSRF, folder safety, one batch, a count back');
 
 $bulkSrc = file_get_contents(__DIR__ . '/../index.php');
 $bulkBodies = [];
-foreach (['handle_mark_read', 'handle_delete', 'handle_move'] as $fn) {
+foreach (['handle_mark_read', 'handle_delete', 'handle_move', 'handle_spam'] as $fn) {
     $body = substr($bulkSrc, (int)strpos($bulkSrc, 'function ' . $fn . '('));
     $body = substr($body, 0, (int)strpos($body, "\n}\n"));
     $bulkBodies[$fn] = $body;
@@ -3092,16 +3107,22 @@ foreach ([
     'handle_mark_read' => 'markManyAsRead($uids, $read)',
     'handle_delete'    => 'moveManyToTrash($uids)',
     'handle_move'      => 'moveManyToFolder($uids, $dest)',
+    'handle_spam'      => 'moveManyToFolder($uids, $junk)',
 ] as $fn => $call) {
     assert_contains($call, $bulkBodies[$fn], $fn . '() makes one batch IMAP call');
     assert_not_contains('markAsReadByUid($uid)', $bulkBodies[$fn], $fn . '() does not loop over the single-UID method');
 }
+// A missing Junk mailbox must never become a delete: that is the one difference
+// from the Trash path, and it is the whole reason this handler is separate.
+assert_contains('if (!$junk)', $bulkBodies['handle_spam'], 'spam refuses to file when there is no Junk mailbox');
+assert_not_contains('moveManyToTrash(', $bulkBodies['handle_spam'], 'and never falls back to a delete');
 
 // The count is the answer: the client removes exactly the rows the server moved.
 assert_contains("json_out(['success' => true, 'count' => \$count])", $bulkBodies['handle_mark_read'],
     'mark read answers with the count');
 assert_contains('$folder, $count)', $bulkBodies['handle_delete'], 'delete answers with the count');
 assert_contains('$folder, $count)', $bulkBodies['handle_move'], 'move answers with the count');
+assert_contains('$folder, $count)', $bulkBodies['handle_spam'], 'spam answers with the count');
 
 // Cache writes are per UID (the cache is one row per message) but only after the
 // batch reported work. A partial failure must not delete rows we did not move.
@@ -3363,6 +3384,12 @@ $spamD['is_junk'] = true;
 $spamD['current_folder'] = 'Spam';
 $spamD['title'] = 'Spam';
 $spamHtml = view_inbox($spamD);
+
+group('the Spam mailbox does not offer to file itself as spam');
+
+assert_not_contains('data-bulk-action="spam"', $spamHtml, 'Spam has no bulk spam button');
+assert_not_contains('?page=spam', $spamHtml, 'and no row spam button');
+assert_contains('data-bulk-action="spam"', $listHtml, 'while the Inbox still has both');
 
 assert_contains('Empty Trash', $trashHtml, 'Trash offers to empty itself');
 assert_contains('Empty Spam', $spamHtml, 'Spam does too');
