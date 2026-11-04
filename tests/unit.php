@@ -93,10 +93,51 @@ assert_contains('<p>body</p>', $s, 'body survives next to a style block');
 $s = sanitize_html('<script>alert(1)</script><p>ok</p>');
 assert_not_contains('alert(1)', $s, 'script source dropped, not rendered as text');
 
+group('sanitize_html() makes web links open in a new tab');
+
+// The read iframe allows popups that escape the sandbox, so the app, never the
+// sender, decides which links get target="_blank": real http(s) URLs only.
+$s = sanitize_html('<a href="https://x.io/a">go</a>');
+assert_contains('target="_blank"', $s, 'an https link opens in a new tab');
+assert_contains('rel="noopener noreferrer"', $s, 'and leaks neither opener nor the reader URL');
+$s = sanitize_html('<a href="http://x.io/a">go</a>');
+assert_contains('target="_blank"', $s, 'an http link opens in a new tab');
+$s = sanitize_html('<a href="HTTPS://x.io">go</a>');
+assert_contains('target="_blank"', $s, 'the scheme is matched case-insensitively');
+// libxml strips leading whitespace on output, so the browser reads https here.
+$s = sanitize_html('<a href="&#9; https://x.io">go</a>');
+assert_contains('target="_blank"', $s, 'an https link after leading whitespace opens in a new tab');
+$s = sanitize_html('<a href="https://x.io" target="_top" rel="opener">go</a>');
+assert_not_contains('_top', $s, 'a sender target is never kept');
+assert_not_contains('"opener"', $s, 'a sender rel is never kept');
+assert_contains('target="_blank"', $s, 'the app target replaces it');
+// libxml writes an inner tab as %09, and '%' cannot be in a scheme: to the
+// browser this is a RELATIVE app URL, which must not open an unsandboxed tab.
+$s = sanitize_html('<a href="ht&#9;tps://x.io">go</a>');
+assert_contains('ht%09tps:', $s, 'libxml escapes the inner tab, as this check assumes');
+assert_not_contains('target=', $s, 'an https link split by a tab is relative and gets no target');
+$noTarget = [
+    '<a href="#sec">x</a>'                     => 'an in-page anchor',
+    '<a href=" #sec">x</a>'                    => 'an in-page anchor after a space',
+    '<a href="">x</a>'                         => 'an empty href',
+    '<a href="?page=logout">x</a>'             => 'a relative href (it resolves into the app)',
+    '<a href="mailto:a@x.io">x</a>'            => 'a mailto link',
+    '<a name="top">x</a>'                      => 'an anchor with no href',
+    '<a href="jav&#9;ascript:alert(1)">x</a>'  => 'javascript: split by a tab',
+    '<a href="java&#10;script:alert(1)">x</a>' => 'javascript: split by a newline',
+    '<a href="//x.io">x</a>'                   => 'a scheme-relative href',
+];
+foreach ($noTarget as $in => $what) {
+    $s = sanitize_html($in);
+    assert_not_contains('target=', $s, $what . ' gets no target');
+    assert_not_contains('rel=', $s, $what . ' gets no rel');
+}
+
 group('sanitize_html() keeps presentational CSS: HTML email is nothing else');
 
 // Why this is safe to allow at all: the body renders in an iframe with
-// sandbox="allow-same-origin" and NO allow-scripts, so CSS cannot reach the app
+// sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox" and NO
+// allow-scripts, so CSS cannot reach the app
 // DOM. Stripping it was why every message rendered as Times New Roman on white
 // while other clients showed the sender's design.
 $s = sanitize_html('<table bgcolor="#f7e9ff" cellpadding="0" cellspacing="0" border="0" width="600">'
@@ -2539,7 +2580,7 @@ $posBody = strpos($preserve, 'class="body"');
 assert_true($posActions !== false && $posBody !== false && $posActions < $posBody,
     'the action bar still renders before the body');
 assert_eq(1, substr_count($preserve, 'id="move-dialog"'), 'exactly one move dialog');
-assert_contains('sandbox="allow-same-origin"', $preserve, 'the body stays sandboxed');
+assert_contains('sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"', $preserve, 'the body stays sandboxed');
 assert_not_contains('allow-scripts', $preserve, 'and never gains allow-scripts');
 // The action-bar forms and the body's trust form all read the ONE page token.
 assert_eq(3, substr_count($preserve, 'value="preserve-token"'), 'every form shares the page token');
@@ -3382,10 +3423,12 @@ $iframeEmail = ['subject' => 'x', 'from' => 'a@x.io', 'to' => 'b@y.io', 'cc' => 
     'bcc' => '', 'date' => 'today', 'body_text' => str_repeat("line\n", 80),
     'body_html' => '', 'attachments' => []];
 $iframeHtml = view_read($iframeEmail, 1, 'INBOX');
-assert_contains('sandbox="allow-same-origin"', $iframeHtml, 'the body iframe allows same-origin so it can be measured');
+assert_contains('sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"', $iframeHtml,
+    'the body iframe allows same-origin so it can be measured, and popups so links open a new tab');
 // allow-scripts TOGETHER WITH allow-same-origin would let the email remove its
 // own sandbox. Scripts must stay off.
 assert_not_contains('allow-scripts', $iframeHtml, 'scripts are never allowed in the body iframe');
+assert_not_contains('allow-forms', $iframeHtml, 'forms are never allowed in the body iframe');
 assert_contains('class="body-iframe srcdoc"', $iframeHtml, 'the iframe keeps the hook the resize code selects');
 
 // Source-level invariant, deliberately: allow-same-origin is only safe while

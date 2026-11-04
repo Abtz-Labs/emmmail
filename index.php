@@ -283,8 +283,9 @@ function css_strip_remote_urls(string $css, int &$blocked): string
  * Scrub a CSS fragment, whether from a style attribute or a <style> block. Pure.
  *
  * CSS is allowed at all because the body renders in an iframe with
- * sandbox="allow-same-origin" and NO allow-scripts, so it cannot reach the app
- * DOM. That is not a reason to keep the parts of CSS that were script:
+ * sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox" and NO
+ * allow-scripts, so it cannot reach the app DOM. That is not a reason to keep
+ * the parts of CSS that were script:
  *
  *  - '<' is removed first. CSS never needs it, and it is the only way to close
  *    the <style> element and inject markup after it.
@@ -490,6 +491,16 @@ function sanitize_html($html, bool $blockRemote = false, ?int &$blocked = null)
         }
         foreach ($attrs as $name => $val) {
           $child->setAttribute($name, $val);
+        }
+        // A web link opens in a new tab: the frame allows popups that escape the
+        // sandbox. Only a real http(s) URL, checked as saveHTML() writes it:
+        // libxml strips the leading space/tab/CR/LF and %-escapes an inner tab,
+        // so `ht&#9;tps:` goes out as a RELATIVE app URL and must get no target.
+        // Anchors, relative and mailto: links keep their in-frame behaviour.
+        if ($tag === 'a' && isset($attrs['href'])
+          && preg_match('#^https?://#i', ltrim((string)$attrs['href'], " \t\r\n"))) {
+          $child->setAttribute('target', '_blank');
+          $child->setAttribute('rel', 'noopener noreferrer');
         }
         // Recurse.
         $walk($child);
@@ -11342,7 +11353,9 @@ function view_message_body(array $email, int $uid, string $folder, array $opts =
   // clipped at the browser's default 150px. Scripts stay off -- it is
   // allow-scripts TOGETHER WITH allow-same-origin that would let the content
   // reach out and remove its own sandbox, so that pair must never appear.
-  $sandboxed = '<iframe class="body-iframe srcdoc" sandbox="allow-same-origin" srcdoc="' . h($html) . '"></iframe>';
+  // allow-popups lets a link open a new tab; -to-escape-sandbox lets the site
+  // there run normally. Only sanitize_html()'s http(s) links carry target.
+  $sandboxed = '<iframe class="body-iframe srcdoc" sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox" srcdoc="' . h($html) . '"></iframe>';
   return $h . '<div class="body">' . $sandboxed . '</div>';
 }
 

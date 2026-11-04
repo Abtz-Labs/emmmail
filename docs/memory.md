@@ -53,12 +53,10 @@ knowledge **out** of this file; add it there and link it from here. Budget: 150 
   `webmail.abtz.co` (git-ignored, DB in `private/`). Its own lock was dropped in the merge
   (`2026-10-23-resolve-login-lock-merge.md`): the deploy env must set
   `EMMMAIL_PROVIDER=migadu`, **not** `EMMMAIL_FORCE_PRESET`, or the picker comes back.
-- **Done, manually verified:** `2026-10-06-footer.md` — one `view_footer()` credit line
-  (author + Use Bare links, `utm_content=APP_VERSION`, `#<version> &copy; Abtz Labs`, both
-  links `target="_blank" rel="noopener noreferrer"`), mounted in `.login-footer` (centered,
-  outside `.login-box`) and `.sidebar-footer` (pinned with `margin-top:auto`, left aligned).
-  `just test` 3024 passed, 2 smoke skips. Browser pass: login at 414px; sidebar measured at
-  264px with the footer 16px off the floor. Light theme not seen.
+- **Code complete, browser pass NOT run:** `2026-10-24-message-links-new-tab.md` — body
+  `http(s)` links get `target=_blank`; sandbox adds `allow-popups(-to-escape-sandbox)`.
+- **Done, manually verified:** `2026-10-06-footer.md` — one `view_footer()` credit line in
+  `.login-footer` and `.sidebar-footer`. Light theme not seen.
 - **Code complete, browser pass NOT run:** `2026-10-05-threaded-conversations.md` — all 11
   steps done, `just test` 2997 passed, 2 smoke skips. Schema v4 clears the `messages` cache
   once (pre-threading rows carried no `References`) and adds `thread_key` (root = first

@@ -7,8 +7,17 @@ It reads `script-src 'self' 'unsafe-inline'`, because `render_page` emits an inl
 CSP as the reason something is OK.
 
 ## The read iframe
-The message body renders in an iframe with `sandbox="allow-same-origin"` and **NO
+The message body renders in an iframe with
+`sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"` and **NO
 `allow-scripts`**.
+
+- Links open in a new tab. `sanitize_html()` drops the sender's `target`/`rel` and sets
+  `target="_blank" rel="noopener noreferrer"` **only on a real `http(s)://` href**, checked
+  as `saveHTML()` writes it. libxml strips leading space/tab/CR/LF and %-escapes an inner
+  tab, so `ht&#9;tps:` (and `jav&#9;ascript:`) go out as a *relative* app URL. That check is
+  **load-bearing**: the popup escapes the sandbox, so a target on a relative or script URL
+  opens an unsandboxed window on the app origin. Anchors, relative and `mailto:`
+  links keep the in-frame behaviour.
 
 - `sandbox=""` gives an opaque origin, so `contentWindow.document` *throws* in the parent.
   That is why `allow-same-origin` is required for the height measurement.
