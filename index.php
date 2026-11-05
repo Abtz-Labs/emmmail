@@ -1081,6 +1081,28 @@ function sanitize_header_value($value)
   return trim($clean);
 }
 
+/**
+ * Build one address header (`Display Name <addr>`). Pure.
+ *
+ * A display name with a comma, a quote or another RFC 5322 special must be a
+ * quoted string, or the header parser reads the comma as a second address.
+ * Non-ASCII keeps the existing B-encoded form; a plain name stays unquoted so
+ * existing From headers do not change.
+ */
+function format_address_header(string $name, string $address): string
+{
+  if ($name === '') {
+    return '<' . $address . '>';
+  }
+  if (preg_match('/[^\x20-\x7E]/', $name)) {
+    return '=?UTF-8?B?' . base64_encode($name) . '?= <' . $address . '>';
+  }
+  if (preg_match('/[()<>\[\]:;@,."\\\\]/', $name)) {
+    return '"' . str_replace(['\\', '"'], ['\\\\', '\\"'], $name) . '" <' . $address . '>';
+  }
+  return $name . ' <' . $address . '>';
+}
+
 // The first RFC 5322 `<...>` token in a header, or '' when there is none.
 // References carries a space-separated chain; the FIRST token is the thread
 // root. Rejects a token with control characters or one past the length cap, so
@@ -1342,16 +1364,7 @@ function smtp_build_raw_message($from, $to, $subject, $body, $fromName = '', $at
   // inserted by the final delivery MTA (RFC 5321 4.4). The SMTP envelope
   // carries the sender and From: names it.
   $headers = [];
-  if ($fromName !== '') {
-    if (preg_match('/[^\x20-\x7E]/', $fromName)) {
-      $encName = '=?UTF-8?B?' . base64_encode($fromName) . '?=';
-      $headers[] = 'From: ' . $encName . ' <' . $from . '>';
-    } else {
-      $headers[] = 'From: ' . $fromName . ' <' . $from . '>';
-    }
-  } else {
-    $headers[] = 'From: <' . $from . '>';
-  }
+  $headers[] = 'From: ' . format_address_header($fromName, $from);
   $headers[] = 'To: ' . $to;
   if ($cc !== '') {
     $headers[] = 'Cc: ' . $cc;
@@ -4691,6 +4704,10 @@ function smtp_ok(string $response): bool
 // Send a message. Returns true on success. $smtpErr populated on failure.
 function smtp_send($conn, string $from, array $recipients, string $rawMessage, ?string &$smtpErr = null): bool
 {
+  if (!filter_var($from, FILTER_VALIDATE_EMAIL)) {
+    $smtpErr = 'Invalid sender address.';
+    return false;
+  }
   $resp = smtp_send_command($conn, 'MAIL FROM:<' . $from . '>');
   if (!smtp_ok($resp)) {
     $smtpErr = trim($resp);
@@ -5017,6 +5034,158 @@ function signature_prefix(): string
   return trim((string)user_setting('signature', ''));
 }
 
+// --- Sending identity (send-as) --------------------------------------------
+
+/**
+ * Parse the stored "Send as" text into a clean alias list. Pure.
+ *
+ * One address per line, optionally `Name <address>`. Invalid lines are dropped,
+ * addresses are deduplicated case-insensitively, and the account address is
+ * never repeated: it is always the primary identity. The order is the user's.
+ */
+function send_as_parse(string $raw, string $me): array
+{
+  $seen = [];
+  $primary = strtolower(trim($me));
+  if ($primary !== '') {
+    $seen[$primary] = true;
+  }
+  $out = [];
+  foreach (preg_split('/[\r\n]+/', $raw) ?: [] as $line) {
+    if (count($out) >= 20) {
+      break;
+    }
+    $line = trim($line);
+    if ($line === '') {
+      continue;
+    }
+    $name = '';
+    $address = $line;
+    if (preg_match('/^(.*?)\s*<([^<>]+)>\s*$/', $line, $m)) {
+      $name = trim($m[1], " \t\"'");
+      $address = trim($m[2]);
+    }
+    if (strlen($address) > 254 || !filter_var($address, FILTER_VALIDATE_EMAIL)) {
+      continue;
+    }
+    $key = strtolower($address);
+    if (isset($seen[$key])) {
+      continue;
+    }
+    $seen[$key] = true;
+    $name = trim(str_replace(['<', '>'], '', $name));
+    $out[] = ['address' => $address, 'name' => $name];
+  }
+  return $out;
+}
+
+// The inverse of send_as_parse(): the normalized textarea text.
+function send_as_format(array $aliases): string
+{
+  $lines = [];
+  foreach ($aliases as $alias) {
+    $address = trim((string)($alias['address'] ?? ''));
+    if ($address === '') {
+      continue;
+    }
+    $name = trim((string)($alias['name'] ?? ''));
+    $lines[] = $name !== '' ? $name . ' <' . $address . '>' : $address;
+  }
+  return implode("\n", $lines);
+}
+
+/**
+ * Every identity this account can send as, primary first. Reads the DB directly:
+ * the $me argument must be honoured, not replaced by the session user.
+ */
+function send_as_identities(string $me): array
+{
+  $display = (string)db_get_setting($me, 'display_name', strstr($me, '@', true) ?: $me);
+  $out = [['address' => $me, 'name' => $display]];
+  foreach (send_as_parse((string)db_get_setting($me, 'send_as', ''), $me) as $alias) {
+    $out[] = $alias;
+  }
+  return $out;
+}
+
+/**
+ * Clamp a posted from to a configured identity. An empty or unknown value falls
+ * back to the primary, so the POST can never name an arbitrary sender.
+ */
+function identity_resolve(string $requested, array $identities, string $me): array
+{
+  $want = strtolower(trim($requested));
+  if ($want !== '') {
+    foreach ($identities as $identity) {
+      if (strtolower((string)($identity['address'] ?? '')) === $want) {
+        return $identity;
+      }
+    }
+  }
+  foreach ($identities as $identity) {
+    if (strcasecmp((string)($identity['address'] ?? ''), $me) === 0) {
+      return $identity;
+    }
+  }
+  return ['address' => $me, 'name' => ''];
+}
+
+/**
+ * The alias that actually received this message, or the primary. Pure.
+ *
+ * Iterate the header addresses, not the identity list: a To of
+ * `me@x, sales@x` must choose the alias, not the first configured identity.
+ * To wins over Cc; the first matching alias in header order wins.
+ */
+function identity_for_message(array $email, array $identities, string $me): string
+{
+  $aliases = [];
+  foreach ($identities as $identity) {
+    $address = (string)($identity['address'] ?? '');
+    if ($address === '' || strcasecmp($address, $me) === 0) {
+      continue;
+    }
+    $aliases[strtolower($address)] = $address;
+  }
+  if ($aliases === []) {
+    return $me;
+  }
+  foreach (['to', 'cc'] as $key) {
+    foreach (explode(', ', header_address_list((string)($email[$key] ?? ''))) as $address) {
+      $address = trim($address);
+      if ($address === '') {
+        continue;
+      }
+      $match = $aliases[strtolower($address)] ?? '';
+      if ($match !== '') {
+        return $match;
+      }
+    }
+  }
+  return $me;
+}
+
+// `Name <address>` or the bare address, for the composer's From option.
+function identity_option_label(array $identity): string
+{
+  $name = trim((string)($identity['name'] ?? ''));
+  $address = (string)($identity['address'] ?? '');
+  return $name !== '' ? $name . ' <' . $address . '>' : $address;
+}
+
+// Every own address, case-folded, for the reply-all self-exclusion.
+function own_identity_addresses(array $identities): array
+{
+  $out = [];
+  foreach ($identities as $identity) {
+    $address = strtolower(trim((string)($identity['address'] ?? '')));
+    if ($address !== '') {
+      $out[] = $address;
+    }
+  }
+  return $out;
+}
+
 // Get client IP for rate limiting.
 function client_ip(): string
 {
@@ -5336,7 +5505,11 @@ function handle_compose(): void
     handle_edit_draft($draftUid);
     return;
   }
+  $me = (string)current_user();
+  $identities = send_as_identities($me);
   render_compose([
+    'from'        => $me,
+    'identities'  => $identities,
     'to'          => '',
     'subject'     => '',
     'body'        => (string)user_setting('signature', ''),
@@ -5374,7 +5547,11 @@ function handle_edit_draft(int $uid): void
   } else {
     unset($_SESSION['forward_src']);
   }
+  $me = (string)current_user();
+  $identities = send_as_identities($me);
   render_compose([
+    'from'        => identity_resolve((string)($email['from_address'] ?? ''), $identities, $me)['address'],
+    'identities'  => $identities,
     // Headers come back as "Name <a@b.c>", which the send path would reject.
     'to'          => header_address_list($email['to']),
     'subject'     => $email['subject'] === '(No subject)' ? '' : $email['subject'],
@@ -5416,7 +5593,10 @@ function render_reply_form(bool $all): void
   if (!$email) {
     redirect('?page=inbox');
   }
-  render_compose(reply_form_data($email, (string)current_user(), $all) + [
+  $me = (string)current_user();
+  $identities = send_as_identities($me);
+  render_compose(reply_form_data($email, $me, $all, $identities) + [
+    'identities' => $identities,
     'undo_period_seconds' => (int)user_setting('undo_period_seconds', 0),
     'csrf' => csrf_page_token(),
   ]);
@@ -5440,7 +5620,11 @@ function handle_forward(): void
   $subject = (stripos($email['subject'], 'Fwd:') === 0) ? $email['subject'] : 'Fwd: ' . $email['subject'];
   // Store forward source metadata server-side for the send step.
   $_SESSION['forward_src'] = ['uid' => $uid, 'folder' => $folder, 'parts' => array_column($email['attachments'], 'part_number')];
+  $me = (string)current_user();
+  $identities = send_as_identities($me);
   render_compose([
+    'from'        => $me,
+    'identities'  => $identities,
     'to'          => '',
     'subject'     => $subject,
     'body'        => $sigPrefix . $quote,
@@ -5532,7 +5716,12 @@ function handle_save_draft(): void
     flash_set('error', 'Security token invalid.');
     redirect('?page=compose');
   }
-  $me       = current_user();
+  $me       = (string)current_user();
+  $identities = send_as_identities($me);
+  $requested = is_string($_POST['from'] ?? null) ? $_POST['from'] : '';
+  $identity = identity_resolve($requested, $identities, $me);
+  $from = $identity['address'];
+  $fromName = (string)$identity['name'];
   $to       = trim($_POST['to'] ?? '');
   $subject  = trim($_POST['subject'] ?? '');
   $body     = (string)($_POST['body'] ?? '');
@@ -5563,8 +5752,7 @@ function handle_save_draft(): void
 
   $attachments = compose_gather_attachments($imap);
 
-  $fromName = user_setting('display_name', strstr($me, '@', true) ?: $me);
-  $raw = smtp_build_raw_message($me, $to, $subject, md_email_html($body), $fromName, $attachments, $cc, $bcc, $inReplyTo, $references, textBody: $body);
+  $raw = smtp_build_raw_message($from, $to, $subject, md_email_html($body), $fromName, $attachments, $cc, $bcc, $inReplyTo, $references, textBody: $body);
   // A draft keeps its Bcc: it is not in transit, and the addresses must still be
   // there when the draft is finally sent.
   if (!$imap->appendToFolder($drafts, smtp_raw_with_bcc($raw, $bcc), '\\Draft \\Seen')) {
@@ -5593,7 +5781,13 @@ function handle_send(): void
     flash_set('error', 'Security token invalid.');
     redirect('?page=compose');
   }
-  $me = current_user();
+  $me = (string)current_user();
+
+  $identities = send_as_identities($me);
+  $requested = is_string($_POST['from'] ?? null) ? $_POST['from'] : '';
+  $identity = identity_resolve($requested, $identities, $me);
+  $from = $identity['address'];
+  $fromName = (string)$identity['name'];
 
   $to = trim($_POST['to'] ?? '');
   $subject = trim($_POST['subject'] ?? '');
@@ -5607,16 +5801,12 @@ function handle_send(): void
     flash_set('error', 'Recipient and subject are required.');
     redirect('?page=compose');
   }
-  $extra = array_merge(
-    $cc !== '' ? explode(',', $cc) : [],
-    $bcc !== '' ? explode(',', $bcc) : []
-  );
-  foreach (array_merge([$to], $extra) as $addr) {
-    if (trim($addr) !== '' && !filter_var(trim($addr), FILTER_VALIDATE_EMAIL)) {
-      flash_set('error', 'Invalid email address: ' . h(trim($addr)));
-      redirect('?page=compose');
-    }
+  $parsed = compose_recipients($to, $cc, $bcc);
+  if (!$parsed['ok']) {
+    flash_set('error', $parsed['error']);
+    redirect('?page=compose');
   }
+  $recipients = $parsed['recipients'];
 
   // Connect only once the request is known to be valid: a rejected compose
   // should not pay a full IMAP login. Kept above smtp_send() on purpose --
@@ -5634,11 +5824,9 @@ function handle_send(): void
     redirect('?page=compose');
   }
 
-  $fromName = user_setting('display_name', strstr($me, '@', true) ?: $me);
   // $bcc is passed for completeness but never becomes a header: the blind
   // recipients are in the envelope below, and in the Sent copy further down.
-  $raw = smtp_build_raw_message($me, $to, $subject, md_email_html($body), $fromName, $attachments, $cc, $bcc, $inReplyTo, $references, textBody: $body);
-  $recipients = array_merge([$to], $extra);
+  $raw = smtp_build_raw_message($from, $to, $subject, md_email_html($body), $fromName, $attachments, $cc, $bcc, $inReplyTo, $references, textBody: $body);
 
   // Undo send: when enabled, hold the message in the session for a configurable
   // period so the user can cancel and edit before it actually goes out.
@@ -5650,6 +5838,7 @@ function handle_send(): void
       'recipients'  => $recipients,
       'bcc'         => $bcc,
       'me'          => $me,
+      'from'        => $from,
       'sent_folder' => null, // resolved on flush
       'expires'     => time() + $undoPeriod,
       'draft_uid'   => (int)($_POST['draft_uid'] ?? 0),
@@ -5661,7 +5850,7 @@ function handle_send(): void
     redirect('?page=inbox');
   }
 
-  $ok = smtp_send($smtp, $me, $recipients, $raw, $smtpErr);
+  $ok = smtp_send($smtp, $from, $recipients, $raw, $smtpErr);
   smtp_disconnect($smtp);
 
   if (!$ok) {
@@ -5731,24 +5920,28 @@ function handle_flush_undo(): void
     json_out(['ok' => false, 'error' => 'Message not found or already sent.']);
   }
   $entry = $_SESSION['undo_queue'][$token];
-  unset($_SESSION['undo_queue'][$token]);
 
   // Expired? Ignore silently — the window already passed.
   if (time() > (int)$entry['expires']) {
+    unset($_SESSION['undo_queue'][$token]);
     json_out(['ok' => true, 'expired' => true]);
   }
 
   $me = $entry['me'];
+  $from = (string)($entry['from'] ?? $me);
   $sc = smtp_config();
   $smtp = smtp_connect($sc['server'], $sc['port'], $me, session_decrypt($_SESSION['pass']), $smtpErr, $sc['enc']);
   if (!$smtp) {
     json_out(['ok' => false, 'error' => 'SMTP connection failed: ' . $smtpErr]);
   }
-  $ok = smtp_send($smtp, $me, $entry['recipients'], $entry['raw'], $smtpErr);
+  $ok = smtp_send($smtp, $from, $entry['recipients'], $entry['raw'], $smtpErr);
   smtp_disconnect($smtp);
   if (!$ok) {
     json_out(['ok' => false, 'error' => 'Failed to send: ' . $smtpErr]);
   }
+  // The message is away. A failed send keeps the entry so the error is not
+  // followed by a silent loss.
+  unset($_SESSION['undo_queue'][$token]);
 
   // Record recipients + append to Sent.
   $imap = imap_for_session();
@@ -6326,6 +6519,8 @@ function handle_settings(): void
     $displayName = trim($_POST['display_name'] ?? '');
     db_set_setting($me, 'emails_per_page', (string)$perPage);
     db_set_setting($me, 'display_name', $displayName);
+    $sendAs = send_as_parse(is_string($_POST['send_as'] ?? null) ? $_POST['send_as'] : '', $me);
+    db_set_setting($me, 'send_as', send_as_format($sendAs));
     db_set_setting($me, 'show_remote_images', empty($_POST['show_remote_images']) ? '0' : '1');
     db_set_setting($me, 'signature', trim($_POST['signature'] ?? ''));
     db_set_setting($me, 'auto_poll', empty($_POST['auto_poll']) ? '0' : '1');
@@ -6351,6 +6546,8 @@ function handle_settings(): void
   render_settings([
     'emails_per_page' => (int)user_setting('emails_per_page', DEFAULT_EMAILS_PER_PAGE),
     'display_name'    => (string)user_setting('display_name', strstr($me, '@', true) ?: $me),
+    'send_as'         => (string)user_setting('send_as', ''),
+    'account_email'   => $me,
     'show_remote_images' => user_setting('show_remote_images', DEFAULT_SHOW_REMOTE_IMAGES) === '1',
     'image_whitelist' => (string)user_setting('image_whitelist', ''),
     'signature'       => (string)user_setting('signature', ''),
@@ -6623,6 +6820,7 @@ function render_read(array $email, int $uid, string $folder, string $me = '', ar
     $pn = read_prev_next($me, $folder, $uid);
     $opts['prev_uid'] = $pn['prev'];
     $opts['next_uid'] = $pn['next'];
+    $opts += ['own_addresses' => own_identity_addresses(send_as_identities($me))];
   }
   // Straight from the folder-list cache, so the Move picker costs no round trip.
   render_page($email['subject'], view_read(
@@ -7242,6 +7440,10 @@ body.nav-open .nav-backdrop { opacity:1; pointer-events:auto; }
 .compose-row input[type="text"] { flex:1; border:none; background:transparent;
   padding:10px 0; font-size:.92rem; font-family:inherit; color:var(--text);
   outline:none; min-width:0; }
+.compose-row select { flex:1; border:none; background:transparent;
+  padding:10px 0; font-size:.92rem; font-family:inherit; color:var(--text);
+  outline:none; min-width:0; max-width:100%; text-overflow:ellipsis; }
+.compose-row select:focus-visible { outline:2px solid var(--accent); outline-offset:2px; border-radius:4px; }
 .compose-cc-tog button, .compose-bcc-tog button {
   border:none; background:transparent; color:var(--accent); font-size:.82rem;
   font-weight:600; cursor:pointer; padding:4px 8px; border-radius:6px; }
@@ -8332,7 +8534,13 @@ function js_inline(): string
               fd2.append('csrf_token', form.querySelector('input[name="csrf_token"]').value);
               fd2.append('token', d.token);
               fd2.append('ajax', '1');
-              win.fetch('?page=flushUndo', { method: 'POST', body: fd2 });
+              win.fetch('?page=flushUndo', { method: 'POST', body: fd2 })
+                .then(function(r){ return r.json(); })
+                .then(function(res){
+                  if (res && res.ok) return;
+                  win.toast((res && res.error) || 'Send failed.', 'error');
+                })
+                .catch(function(){ win.toast('Send failed.', 'error'); });
             }
           }, 1000);
           bar.querySelector('.undo-bar-btn').addEventListener('click', function(){
@@ -11002,12 +11210,20 @@ function reply_sender_address(array $email): string
  * way, and matching case-sensitively here would put the user back in their own
  * recipient list.
  */
-function reply_all_recipients(array $email, string $me): array
+function reply_all_recipients(array $email, string $me, array $own = []): array
 {
   $seen = [];
   $meKey = strtolower(trim($me));
   if ($meKey !== '') {
     $seen[$meKey] = true;
+  }
+  // An alias is still the user. Replying all must not mail the user's own
+  // alias, exactly as it must not mail the account address.
+  foreach ($own as $address) {
+    $key = strtolower(trim((string)$address));
+    if ($key !== '') {
+      $seen[$key] = true;
+    }
   }
 
   $collect = function (string $header) use (&$seen) {
@@ -11043,9 +11259,9 @@ function reply_all_recipients(array $email, string $me): array
  * recipients would be wrong: your own address is a recipient of every message
  * you receive, and reply_all_recipients() already drops it.
  */
-function reply_default_is_all(array $email, string $me): bool
+function reply_default_is_all(array $email, string $me, array $own = []): bool
 {
-  $all = reply_all_recipients($email, $me);
+  $all = reply_all_recipients($email, $me, $own);
   if ($all['cc'] !== '') {
     return true;
   }
@@ -11100,7 +11316,7 @@ function forward_quote(array $email): string
     . "\nDate: " . ($email['date'] ?? '') . "\n\n" . quote_source_text($email));
 }
 
-function reply_form_data(array $email, string $me, bool $all): array
+function reply_form_data(array $email, string $me, bool $all, array $identities = []): array
 {
   // The sender's text is escaped line by line, and its own `>` markers are kept
   // as real markers, so an earlier quote nests one level deeper.
@@ -11121,8 +11337,9 @@ function reply_form_data(array $email, string $me, bool $all): array
   $subject = (string)($email['subject'] ?? '');
   $subject = (stripos($subject, 'Re:') === 0) ? $subject : 'Re: ' . $subject;
 
+  $own = own_identity_addresses($identities);
   $groups = $all
-    ? reply_all_recipients($email, $me)
+    ? reply_all_recipients($email, $me, $own)
     : ['to' => reply_sender_address($email), 'cc' => ''];
 
   // RFC 5322: References is the parent's own References plus its Message-ID. With
@@ -11132,6 +11349,7 @@ function reply_form_data(array $email, string $me, bool $all): array
   $references = $parent === '' ? '' : trim($chain . ' ' . $parent);
 
   return [
+    'from'        => identity_for_message($email, $identities, $me),
     'to'          => $groups['to'],
     'cc'          => $groups['cc'],
     'bcc'         => '',
@@ -11336,15 +11554,17 @@ function folder_create_check(string $name): string
 }
 
 /**
- * Reduce an address header to a comma-separated list of bare addresses. Pure.
+ * Split an address header into its raw entries and bare addresses. Pure.
  *
  * A draft reopened in the composer arrives as header text ("Name <a@b.c>"), and
  * the send path validates with FILTER_VALIDATE_EMAIL, which rejects that form.
  * Splitting has to respect quoted display names, which may contain commas.
+ * An entry that is not a usable address is kept with address => '' so the send
+ * path can refuse it instead of silently dropping it.
  */
-function header_address_list(string $header): string
+function header_address_entries(string $header): array
 {
-  $out = [];
+  $parts = [];
   $buf = '';
   $inQuotes = false;
   $len = strlen($header);
@@ -11356,43 +11576,87 @@ function header_address_list(string $header): string
       continue;
     }
     if ($ch === ',' && !$inQuotes) {
-      $out[] = $buf;
+      $parts[] = $buf;
       $buf = '';
       continue;
     }
     $buf .= $ch;
   }
-  $out[] = $buf;
+  $parts[] = $buf;
 
-  $addresses = [];
-  foreach ($out as $part) {
+  $entries = [];
+  foreach ($parts as $part) {
     $part = trim($part);
     if ($part === '') {
       continue;
     }
+    $address = $part;
     if (preg_match('/<([^>]+)>/', $part, $m)) {
-      $part = trim($m[1]);
+      $address = trim($m[1]);
     }
-    // Anything that is still not an address (a group name, a bare label) is
-    // dropped rather than handed to the send path to choke on.
-    if (filter_var($part, FILTER_VALIDATE_EMAIL)) {
-      $addresses[] = $part;
+    $entries[] = [
+      'text'    => $part,
+      'address' => filter_var($address, FILTER_VALIDATE_EMAIL) ? $address : '',
+    ];
+  }
+  return $entries;
+}
+
+/**
+ * Reduce an address header to a comma-separated list of bare addresses. Pure.
+ *
+ * Anything that is still not an address (a group name, a bare label) is dropped
+ * rather than handed to the send path to choke on. Callers that must refuse a
+ * bad entry use header_address_entries() or compose_recipients() instead.
+ */
+function header_address_list(string $header): string
+{
+  $addresses = [];
+  foreach (header_address_entries($header) as $entry) {
+    if ($entry['address'] !== '') {
+      $addresses[] = $entry['address'];
     }
   }
   return implode(', ', $addresses);
+}
+
+/**
+ * Turn the three composer recipient fields into individual SMTP recipients.
+ * Pure. A To with several addresses is legal; it used to be rejected as one
+ * FILTER_VALIDATE_EMAIL string, which also broke reply-all to a group.
+ */
+function compose_recipients(string $to, string $cc, string $bcc): array
+{
+  $recipients = [];
+  foreach ([$to, $cc, $bcc] as $header) {
+    if (trim($header) === '') {
+      continue;
+    }
+    $entries = header_address_entries($header);
+    if ($entries === []) {
+      return ['ok' => false, 'error' => 'Invalid email address: ' . $header, 'recipients' => []];
+    }
+    foreach ($entries as $entry) {
+      if ($entry['address'] === '') {
+        return ['ok' => false, 'error' => 'Invalid email address: ' . $entry['text'], 'recipients' => []];
+      }
+      $recipients[] = $entry['address'];
+    }
+  }
+  return ['ok' => true, 'error' => '', 'recipients' => $recipients];
 }
 
 // The message's action bar: Back, Reply, Reply all, Forward, Unread, Move,
 // Spam, Delete. Shared by the single-message reader and each message inside a
 // conversation. $moveOptions is the caller's once-built picker (see
 // view_move_dialog); the dialog itself is emitted once by the caller, not here.
-function view_message_actions(array $email, int $uid, string $folder, string $me, string $moveOptions, bool $withBack = true): string
+function view_message_actions(array $email, int $uid, string $folder, string $me, string $moveOptions, bool $withBack = true, array $own = []): string
 {
   $enc  = urlencode($folder);
   $csrf = h(csrf_page_token());
   // The reply that reaches everybody leads only when there is somebody extra to
   // reach; otherwise it is the same message as a plain reply, twice.
-  $allLeads    = reply_default_is_all($email, $me);
+  $allLeads    = reply_default_is_all($email, $me, $own);
   $replyCls    = 'btn btn-sm' . ($allLeads ? '' : ' btn-primary');
   $replyAllCls = 'btn btn-sm' . ($allLeads ? ' btn-primary' : '');
   $moveButton = $moveOptions === '' ? ''
@@ -11526,7 +11790,7 @@ function view_read(array $email, int $uid, string $folder, string $me = '', arra
     . (!empty($opts['prev_uid']) ? ' data-prev="?page=read&amp;uid=' . (int)$opts['prev_uid'] . '&amp;folder=' . $enc . '"' : '')
     . (!empty($opts['next_uid']) ? ' data-next="?page=read&amp;uid=' . (int)$opts['next_uid'] . '&amp;folder=' . $enc . '"' : '')
     . '>';
-  $h .= view_message_actions($email, $uid, $folder, $me, $moveOptions);
+  $h .= view_message_actions($email, $uid, $folder, $me, $moveOptions, true, $opts['own_addresses'] ?? []);
   $h .= view_message_body($email, $uid, $folder, $opts);
   $h .= '</div>';
   // The picker lives with the reader, not in render_page: only this view knows
@@ -11584,7 +11848,7 @@ function view_thread(array $messages, string $folder, string $subject, string $m
       . '<div class="thread-msg-body">'
       // Actions lead, like the single-message reader: the bar sits above the
       // message it acts on.
-      . view_message_actions($email, $uid, $mfolder, $me, $moveOptions, false)
+      . view_message_actions($email, $uid, $mfolder, $me, $moveOptions, false, $opts['own_addresses'] ?? [])
       . view_message_body($email, $uid, $mfolder, ['block_images' => !empty($m['block_images']), 'no_title' => true])
       . '</div></details>';
   }
@@ -11604,7 +11868,7 @@ function render_thread(array $messages, string $folder, string $me, int $omitted
     $subject,
     $me,
     cached_folder_list($me ?: current_user()),
-    ['omitted' => $omitted]
+    ['omitted' => $omitted, 'own_addresses' => own_identity_addresses(send_as_identities($me))]
   ), true);
 }
 
@@ -11618,6 +11882,23 @@ function view_compose(array $d): string
     . (!empty($d['in_reply_to']) ? '<input type="hidden" name="in_reply_to_id" value="' . h($d['in_reply_to']) . '">' : '')
     . (!empty($d['references']) ? '<input type="hidden" name="references" value="' . h($d['references']) . '">' : '')
     . (isset($_SESSION['forward_src']) ? '<input type="hidden" name="__hasfwd" value="1">' : '');
+  // The From row exists only when there is a choice. The server resolves the
+  // posted value again; this select is a convenience, not the gate.
+  $identities = $d['identities'] ?? [];
+  if (count($identities) > 1) {
+    $current = identity_resolve((string)($d['from'] ?? ''), $identities,
+      (string)($identities[0]['address'] ?? ''));
+    $h .= '<div class="compose-row compose-from">'
+      . '<label for="compose-from">From</label>'
+      . '<select id="compose-from" name="from">';
+    foreach ($identities as $identity) {
+      $selected = strcasecmp((string)($identity['address'] ?? ''), (string)($current['address'] ?? '')) === 0
+        ? ' selected' : '';
+      $h .= '<option value="' . h($identity['address'] ?? '') . '"' . $selected . '>'
+        . h(identity_option_label($identity)) . '</option>';
+    }
+    $h .= '</select></div>';
+  }
   // --- To / Cc / Bcc row (Gmail-style: inline labels, Cc/Bcc toggled) ---
   $showCc  = !empty($d['cc']);
   $showBcc = !empty($d['bcc']);
@@ -11792,6 +12073,7 @@ function view_md_help_dialog(): string
 function view_settings(array $d): string
 {
   $h = '<div class="card"><h1>Settings</h1>';
+  $accountEmail = (string)($d['account_email'] ?? '');
   $folderMapJson = (string)($d['protected_folders'] ?? '{}');
   // Pre-fill detection only when the user has no saved map: once set, their own
   // choices are the single source of truth, so offering the detected names again
@@ -11807,6 +12089,13 @@ function view_settings(array $d): string
     . '<div class="settings-note">Between 5 and 200.</div></div>'
     . '<div class="form-group"><label>Display name (shown on sent mail)</label>'
     . '<input type="text" name="display_name" value="' . h($d['display_name']) . '"></div>'
+    . '<div class="form-group"><label for="send-as">Send as</label>'
+    . '<textarea id="send-as" name="send_as" rows="4" placeholder="alias@example.com or Name &lt;alias@example.com&gt;">'
+    . h($d['send_as'] ?? '') . '</textarea>'
+    . '<div class="settings-note">One address per line. Use <code>Name &lt;address&gt;</code> to set a display '
+    . 'name for that address. Your account address is always available'
+    . ($accountEmail !== '' ? ' (<strong>' . h($accountEmail) . '</strong>)' : '') . '. '
+    . 'Your mail provider must allow sending from every address.</div></div>'
     . '<div class="form-group"><label>Signature</label>'
     . '<textarea name="signature" rows="4" placeholder="Your email signature...">' . h($d['signature'] ?? '') . '</textarea>'
     . '<div class="settings-note">Appended to the bottom of every message you send, before quoted content.</div></div>'

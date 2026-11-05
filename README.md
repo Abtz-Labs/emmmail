@@ -30,6 +30,10 @@ That's the whole stack.
   recipient gets HTML, and the Markdown source is the plain-text part
 - Cc and Bcc (Bcc travels in the SMTP envelope only; it is recorded solely on
   the copy filed in Sent)
+- Send from several addresses: register aliases or provider identities in
+  Settings, pick the From in the composer, and reply as the address that
+  received the message. See
+  [Aliases and send-as addresses](#aliases-and-send-as-addresses)
 - Save drafts, and reopen one in the composer to continue it
 - Create and delete folders from the sidebar (Inbox, Drafts, Sent, Spam and
   Trash are protected)
@@ -154,6 +158,43 @@ These are decisions for this version. Each one has a regression test (group
 
 The composer was verified in Chromium. Safari, Firefox and mobile keyboards
 (iOS Smart Punctuation, Android composition) need a manual check.
+
+## Aliases and send-as addresses
+
+One signed-in account can send as more than one address. Add them in Settings →
+Send as, one per line:
+
+```
+support@example.com
+Sales <sales@example.com>
+```
+
+The account address is always available and is the default for a new message.
+The composer shows a From picker when there is a choice. A reply selects the
+alias that received the original message, looking in To first and then Cc; the
+account address is the fallback. You can always change it before sending.
+
+The chosen address is both the `From:` header and the SMTP envelope sender
+(`MAIL FROM`). The SMTP login stays the account. A draft keeps its From, and undo
+send keeps it too.
+
+**The provider must allow it.** On Migadu, a send-as address is an *Identity*
+with `may_send` (often created with `password_use: mailbox`), not a receive-only
+*Alias*. Gmail and Outlook need a verified send-as address. If the server refuses
+the envelope sender, the send fails with its error and nothing is filed in Sent.
+
+Limits:
+
+1. The list is manual. There is no provider-neutral discovery. The Migadu API
+   needs an admin API key, not the mailbox password.
+2. Detection uses the To and Cc headers. A Bcc-only delivery, or mail delivered
+   through a mailing list, cannot be detected; choose the From yourself.
+3. An alias with no name sends as `From: <address>`; it does not inherit the
+   account display name. Add `Name <address>` to give it one.
+4. A failed send does not restore the composer text. This is true for every send
+   failure, not only an address the provider refuses.
+5. If undo send is on and the flush fails, the error is shown, but the message is
+   not returned to the composer.
 
 ## Notifications
 
@@ -351,6 +392,9 @@ Each account configures its own copy of these (Settings page, stored per user):
 
 - Messages per page (5–200)
 - Display name, shown on sent mail
+- Send-as addresses: aliases or provider identities, one per line, optionally
+  `Name <address>`. The account address is always available and is the default
+  for a new message
 - Signature, inserted at the top of the compose editor, above any quoted reply
   or forward
 - Protected folders: a map of the system roles (Sent, Drafts, Spam, Trash,
@@ -390,7 +434,7 @@ Routing is `index.php?page=<page>`:
 `PRAGMA user_version` and migrated forward automatically on first open; there is
 no down path.
 
-- `settings` — per-user key/value settings
+- `settings` — per-user key/value settings, including the send-as address list
 - `contacts` — auto-populated contacts (search/autocomplete)
 - `search_cache` — mail search snippets for fast local search
 - `login_attempts` — rate-limit bookkeeping

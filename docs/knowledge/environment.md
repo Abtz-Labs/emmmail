@@ -18,6 +18,11 @@ non-blank path is set.
 the email domain** — the login page uses a preset dropdown only, default `migadu`, with no
 auto-detect.
 
+A Migadu **Alias** only forwards incoming mail. Sending from an address needs an **Identity**
+with `may_send`, usually created with `password_use: mailbox` so it shares the mailbox
+password. Emmmail's send-as list is manual; `api.migadu.com` needs an admin API key, not the
+mailbox password.
+
 ## Production deployment (webmail.abtz.co)
 - `vps-4` under `abtz2`, Hestia layout: releases in
   `/home/abtz2/web/webmail.abtz.co`, document root `public_html`, data in `private/`.

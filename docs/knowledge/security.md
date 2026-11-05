@@ -66,6 +66,11 @@ RFC 5321 says the local part is case-sensitive. Honouring that puts the user bac
 reply-all, because their own address is on every message they receive. Compare
 case-insensitively and count *other* recipients, not raw ones.
 
+**The send-as list follows the same rule.** `identity_for_message()` and
+`reply_all_recipients()` compare every own identity case-insensitively. The posted `from` is
+resolved against the stored list (`identity_resolve()`); only a configured address can reach
+`From:` or `MAIL FROM`. `smtp_send()` validates the envelope sender again.
+
 ## Bcc is never a header in transit
 `smtp_raw_with_bcc()` folds Bcc onto the already-built bytes for the Sent copy only.
 Rebuilding the message would change the Message-ID and the MIME boundaries. The same rule

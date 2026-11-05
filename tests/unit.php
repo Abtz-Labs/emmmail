@@ -5131,5 +5131,385 @@ assert_contains('class="sidebar-footer"', view_sidebar([], '', null, []),
     'app: an empty panel still carries the footer');
 assert_contains('.sidebar-footer', css_inline(), 'app: the footer is pinned with CSS');
 
+// --------------------------------------------- sending identity (send-as) ---+
+// The feature starts with the parsing layer: a header can carry several
+// recipients, and the composer must turn it into individual SMTP recipients
+// without losing a display name or silently dropping a bad address.
+
+group('header_address_entries() splits a header and keeps the raw entry');
+
+if (!function_exists('header_address_entries')) {
+    failTest('header_address_entries() exists');
+} else {
+    $entries = header_address_entries('Rogerio <rogerio@abtz.co>, "Vin, Inc." <vin@pm.me>, bad');
+    assert_eq(3, count($entries), 'one entry per comma-separated recipient');
+    assert_eq('rogerio@abtz.co', $entries[0]['address'], 'a named address yields its bare address');
+    assert_eq('vin@pm.me', $entries[1]['address'], 'a quoted comma stays inside one display name');
+    assert_eq('', $entries[2]['address'], 'an invalid entry is kept with an empty address');
+    assert_eq('bad', $entries[2]['text'], 'the invalid text is kept for the error message');
+    assert_eq([], header_address_entries('   '), 'a blank header has no entries');
+}
+
+group('header_address_list() keeps its existing projection');
+
+$list = header_address_list('Rogerio <rogerio@abtz.co>, "Vin, Inc." <vin@pm.me>, bad');
+assert_eq('rogerio@abtz.co, vin@pm.me', $list, 'valid addresses only, comma-joined, as before');
+
+group('compose_recipients(): several To addresses become several recipients');
+
+if (!function_exists('compose_recipients')) {
+    failTest('compose_recipients() exists');
+} else {
+    $r = compose_recipients('a@x.io, Bob <b@y.io>', 'c@z.io', 'd@w.io');
+    assert_true($r['ok'], 'a multi-address To is accepted');
+    assert_eq(['a@x.io', 'b@y.io', 'c@z.io', 'd@w.io'], $r['recipients'],
+        'To, then Cc, then Bcc, each address on its own');
+    assert_eq('', $r['error'], 'no error on a valid list');
+
+    $r = compose_recipients('"Vin, Inc." <vin@pm.me>, a@x.io', '', '');
+    assert_true($r['ok'], 'a quoted comma in a display name is not a split');
+    assert_eq(['vin@pm.me', 'a@x.io'], $r['recipients'], 'both recipients survive the quoted comma');
+
+    $r = compose_recipients('a@x.io, bad', '', '');
+    assert_false($r['ok'], 'one bad entry rejects the list');
+    assert_contains('bad', $r['error'], 'and the error names the bad entry');
+
+    $r = compose_recipients('a@x.io', 'not-an-address', '');
+    assert_false($r['ok'], 'a bad Cc entry rejects the list');
+
+    $r = compose_recipients('', 'c@z.io', 'd@w.io');
+    assert_true($r['ok'], 'an empty To is allowed by the helper; the handler requires it');
+    assert_eq(['c@z.io', 'd@w.io'], $r['recipients'], 'Cc and Bcc still yield recipients');
+
+    $r = compose_recipients('', '', '');
+    assert_true($r['ok'], 'three empty headers are not an error');
+    assert_eq([], $r['recipients'], 'and yield no recipients');
+}
+
+group('format_address_header(): a display name cannot break the From header');
+
+if (!function_exists('format_address_header')) {
+    failTest('format_address_header() exists');
+} else {
+    assert_eq('Display Name <from@example.com>',
+        format_address_header('Display Name', 'from@example.com'),
+        'a simple name stays unquoted, so existing headers are unchanged');
+    assert_eq('<from@example.com>', format_address_header('', 'from@example.com'),
+        'no name is a bare angle address');
+    assert_eq('"Sales, EMEA" <sales@example.com>',
+        format_address_header('Sales, EMEA', 'sales@example.com'),
+        'a comma forces a quoted phrase');
+    assert_eq('"John Q. Public" <a@b.c>',
+        format_address_header('John Q. Public', 'a@b.c'),
+        'a dot in the phrase is quoted too');
+    assert_eq('"A\\"B" <a@b.c>', format_address_header('A"B', 'a@b.c'),
+        'an embedded quote is escaped');
+    assert_contains('=?UTF-8?B?', format_address_header('Zażółć', 'a@b.c'),
+        'a non-ASCII name is still B-encoded');
+}
+
+group('smtp_build_raw_message() quotes the From display name');
+
+$quotedFrom = smtp_build_raw_message('sales@example.com', 'to@example.com', 'S', 'body',
+    'Sales, EMEA', [], '', '', '');
+assert_contains('From: "Sales, EMEA" <sales@example.com>', $quotedFrom,
+    'a comma in the From name is a quoted phrase, not a second address');
+
+group('smtp_send() refuses an invalid sender at the SMTP boundary');
+
+$smtpSrc = file_get_contents(__DIR__ . '/../index.php');
+assert_contains("if (!filter_var(\$from, FILTER_VALIDATE_EMAIL))", $smtpSrc,
+    'smtp_send() validates the envelope sender, not only the recipients');
+
+group('handle_send() splits To into individual envelope recipients');
+
+assert_contains('compose_recipients($to, $cc, $bcc)', $smtpSrc,
+    'the send handler parses To/Cc/Bcc instead of passing the raw To string');
+
+// ------------------------------------------------- sending identity helpers -+
+
+group('send_as_parse() reads the settings list');
+
+if (!function_exists('send_as_parse')) {
+    failTest('send_as_parse() exists');
+} else {
+    $me = 'me@example.com';
+    $parsed = send_as_parse("sales@example.com\nSupport <support@example.com>\n", $me);
+    assert_eq([
+        ['address' => 'sales@example.com', 'name' => ''],
+        ['address' => 'support@example.com', 'name' => 'Support'],
+    ], $parsed, 'bare and named lines become identities');
+
+    $parsed = send_as_parse("Ops<ops@example.com>\n  ME@EXAMPLE.COM  \n", $me);
+    assert_eq([['address' => 'ops@example.com', 'name' => 'Ops']], $parsed,
+        'no space before the bracket is accepted and the primary is dropped case-insensitively');
+
+    $parsed = send_as_parse("sales@example.com\nSALES@example.com\nSales <sales@example.com>", $me);
+    assert_eq([['address' => 'sales@example.com', 'name' => '']], $parsed,
+        'duplicate addresses keep the first spelling and name');
+
+    $parsed = send_as_parse("not-an-address\nsales@example.com\n\n", $me);
+    assert_eq([['address' => 'sales@example.com', 'name' => '']], $parsed,
+        'invalid and blank lines are dropped');
+
+    $parsed = send_as_parse('"Sales, EMEA" <sales@example.com>', $me);
+    assert_eq([['address' => 'sales@example.com', 'name' => 'Sales, EMEA']], $parsed,
+        'surrounding quotes are stripped from the name');
+
+    $parsed = send_as_parse('Sa<les> <sales@example.com>', $me);
+    assert_eq([['address' => 'sales@example.com', 'name' => 'Sales']], $parsed,
+        'angle brackets never survive in a name');
+
+    $many = [];
+    for ($i = 1; $i <= 25; $i++) {
+        $many[] = 'alias' . $i . '@example.com';
+    }
+    assert_eq(20, count(send_as_parse(implode("\n", $many), $me)),
+        'the list is capped at 20 aliases');
+}
+
+group('send_as_format() round-trips the list');
+
+if (!function_exists('send_as_format')) {
+    failTest('send_as_format() exists');
+} else {
+    $raw = "sales@example.com\nSupport <support@example.com>";
+    assert_eq($raw, send_as_format(send_as_parse($raw, 'me@example.com')),
+        'the normalized textarea text is the parsed list');
+}
+
+group('send_as_identities() puts the primary first');
+
+if (!function_exists('send_as_identities')) {
+    failTest('send_as_identities() exists');
+} else {
+    $user = 'sendas-unit@example.com';
+    db_set_setting($user, 'display_name', 'Test User');
+    db_set_setting($user, 'send_as', "sales@example.com\nSupport <support@example.com>");
+    $ids = send_as_identities($user);
+    assert_eq('sendas-unit@example.com', $ids[0]['address'], 'the account address is first');
+    assert_eq('Test User', $ids[0]['name'], 'and carries the display name');
+    assert_eq('sales@example.com', $ids[1]['address'], 'then the aliases');
+    assert_eq('', $ids[1]['name'], 'an unnamed alias has no name, not the account display name');
+    assert_eq('Support', $ids[2]['name'], 'a named alias keeps its own name');
+
+    db_set_setting($user, 'send_as', 'not-an-address');
+    $ids = send_as_identities($user);
+    assert_eq(1, count($ids), 'malformed stored text yields the primary only');
+
+    db_set_setting($user, 'send_as', '');
+    assert_eq(1, count(send_as_identities($user)), 'an empty setting yields the primary only');
+}
+
+group('identity_resolve() clamps a posted from');
+
+if (!function_exists('identity_resolve')) {
+    failTest('identity_resolve() exists');
+} else {
+    $ids = [
+        ['address' => 'me@example.com', 'name' => 'Me'],
+        ['address' => 'sales@example.com', 'name' => 'Sales'],
+    ];
+    assert_eq('sales@example.com', identity_resolve('sales@example.com', $ids, 'me@example.com')['address'],
+        'a known address is returned');
+    assert_eq('sales@example.com', identity_resolve('SALES@example.com', $ids, 'me@example.com')['address'],
+        'matching is case-insensitive');
+    assert_eq('me@example.com', identity_resolve('stranger@example.com', $ids, 'me@example.com')['address'],
+        'an unknown address falls back to the primary');
+    assert_eq('me@example.com', identity_resolve('', $ids, 'me@example.com')['address'],
+        'an empty value falls back to the primary');
+}
+
+group('identity_for_message() prefers the alias that received the message');
+
+if (!function_exists('identity_for_message')) {
+    failTest('identity_for_message() exists');
+} else {
+    $ids = [
+        ['address' => 'me@example.com', 'name' => 'Me'],
+        ['address' => 'sales@example.com', 'name' => 'Sales'],
+        ['address' => 'support@example.com', 'name' => 'Support'],
+    ];
+    $me = 'me@example.com';
+    assert_eq('sales@example.com', identity_for_message(
+        ['to' => 'me@example.com, sales@example.com', 'cc' => ''], $ids, $me),
+        'an alias wins even when the primary is listed first');
+    assert_eq('support@example.com', identity_for_message(
+        ['to' => 'me@example.com', 'cc' => 'Support <support@example.com>'], $ids, $me),
+        'Cc is searched after To');
+    assert_eq('support@example.com', identity_for_message(
+        ['to' => 'Support <support@example.com>, Sales <sales@example.com>', 'cc' => ''], $ids, $me),
+        'the first alias in header order wins');
+    assert_eq('SALES@example.com', identity_for_message(
+        ['to' => 'SALES@EXAMPLE.COM', 'cc' => ''], [['address' => 'SALES@example.com', 'name' => '']], $me),
+        'a header address is returned in the stored spelling');
+    assert_eq($me, identity_for_message(
+        ['to' => 'me@example.com', 'cc' => 'bob@example.com'], $ids, $me),
+        'no alias in To or Cc means the primary');
+    assert_eq($me, identity_for_message(['to' => 'me@example.com', 'cc' => ''], [], $me),
+        'no identities means the primary');
+}
+
+group('own_identity_addresses() lowercases every own address');
+
+if (!function_exists('own_identity_addresses')) {
+    failTest('own_identity_addresses() exists');
+} else {
+    assert_eq(['me@example.com', 'sales@example.com'], own_identity_addresses([
+        ['address' => 'ME@example.com', 'name' => ''],
+        ['address' => 'Sales@Example.com', 'name' => ''],
+    ]), 'the reply-all exclusion list is case-folded');
+}
+
+group('reply_all_recipients() drops every own alias');
+
+$own = ['sales@example.com', 'support@example.com'];
+$r = reply_all_recipients([
+    'from_address' => 'exhip@pm.me',
+    'to' => 'me@example.com, Sales@Example.com, vin@pm.me',
+    'cc' => 'Support <support@example.com>, ann@x.io',
+], 'me@example.com', $own);
+assert_eq('exhip@pm.me, vin@pm.me', $r['to'], 'own aliases are dropped from To, case-insensitively');
+assert_eq('ann@x.io', $r['cc'], 'and from Cc too');
+
+group('reply_default_is_all() ignores own aliases');
+
+assert_false(reply_default_is_all([
+    'from_address' => 'exhip@pm.me',
+    'to' => 'me@example.com, sales@example.com',
+    'cc' => '',
+], 'me@example.com', ['sales@example.com']),
+    'an own alias in To does not make Reply-all lead');
+
+group('reply_form_data() chooses the receiving alias');
+
+$parentForAlias = [
+    'subject' => 'Hello',
+    'from' => 'Vin <vin@pm.me>',
+    'from_address' => 'vin@pm.me',
+    'reply_to_address' => '',
+    'to' => 'Sales <sales@example.com>',
+    'cc' => '',
+    'date' => 'Wed, 09 Sep 2026 15:23:38 +0000',
+    'body_text' => 'Hi.',
+    'message_id' => '<p@x.io>',
+    'references' => '',
+];
+$ids = [
+    ['address' => 'me@example.com', 'name' => 'Me'],
+    ['address' => 'sales@example.com', 'name' => 'Sales'],
+];
+$rf = reply_form_data($parentForAlias, 'me@example.com', false, $ids);
+assert_eq('sales@example.com', $rf['from'], 'a reply to an alias is sent from that alias');
+$rf = reply_form_data($parentForAlias, 'me@example.com', true, $ids);
+assert_eq('sales@example.com', $rf['from'], 'and reply-all uses the same from');
+assert_eq('vin@pm.me', $rf['to'], 'reply-all still starts with the sender');
+
+$noAlias = $parentForAlias;
+$noAlias['to'] = 'me@example.com';
+assert_eq('me@example.com', reply_form_data($noAlias, 'me@example.com', false, $ids)['from'],
+    'no alias in the message means the primary');
+
+group('identity_option_label() renders the composer label');
+
+if (!function_exists('identity_option_label')) {
+    failTest('identity_option_label() exists');
+} else {
+    assert_eq('Sales <sales@example.com>',
+        identity_option_label(['address' => 'sales@example.com', 'name' => 'Sales']),
+        'a named identity shows its name and address');
+    assert_eq('sales@example.com',
+        identity_option_label(['address' => 'sales@example.com', 'name' => '']),
+        'an unnamed identity shows the address alone');
+}
+
+group('view_compose() renders the From select only when aliases exist');
+
+$composeNoAlias = view_compose([
+    'to' => '', 'cc' => '', 'bcc' => '', 'subject' => '', 'body' => '',
+    'forward_attachments' => [], 'csrf' => 'tok',
+]);
+assert_not_contains('name="from"', $composeNoAlias, 'no aliases means no posted from field');
+assert_not_contains('compose-from', $composeNoAlias, 'and no empty From row');
+assert_contains('name="to" required autofocus', $composeNoAlias, 'the blank compose still focuses To');
+
+$composeIds = [
+    ['address' => 'me@example.com', 'name' => 'Me'],
+    ['address' => 'sales@example.com', 'name' => 'Sales'],
+];
+$composeWithAlias = view_compose([
+    'to' => '', 'cc' => '', 'bcc' => '', 'subject' => '', 'body' => '',
+    'forward_attachments' => [], 'csrf' => 'tok',
+    'identities' => $composeIds, 'from' => 'SALES@example.com',
+]);
+assert_contains('class="compose-row compose-from"', $composeWithAlias, 'the From row is present');
+assert_contains('<select id="compose-from" name="from">', $composeWithAlias, 'it is a real select');
+assert_contains('<option value="me@example.com">Me &lt;me@example.com&gt;</option>', $composeWithAlias,
+    'the primary option is present and escaped');
+assert_contains('<option value="sales@example.com" selected>Sales &lt;sales@example.com&gt;</option>',
+    $composeWithAlias, 'the requested alias is selected, case-insensitively');
+assert_contains('name="to" required autofocus', $composeWithAlias, 'the From select does not steal autofocus');
+
+$composeRemovedAlias = view_compose([
+    'to' => '', 'cc' => '', 'bcc' => '', 'subject' => '', 'body' => '',
+    'forward_attachments' => [], 'csrf' => 'tok',
+    'identities' => $composeIds, 'from' => 'removed@example.com',
+]);
+assert_contains('<option value="me@example.com" selected>', $composeRemovedAlias,
+    'a removed alias falls back to the primary rather than selecting nothing');
+
+group('view_settings() renders the send-as list');
+
+$settingsSendAs = view_settings([
+    'csrf' => 'tok', 'emails_per_page' => 25, 'display_name' => 'Me',
+    'show_remote_images' => false, 'image_whitelist' => '', 'signature' => '',
+    'auto_poll' => true, 'undo_period_seconds' => 0,
+    'protected_folders' => '{}', 'folder_list' => [], 'cached_messages' => 0,
+    'send_as' => "Sales <sales@example.com>", 'account_email' => 'me@example.com',
+]);
+assert_contains('name="send_as"', $settingsSendAs, 'the alias list is a form field');
+assert_contains('Sales &lt;sales@example.com&gt;', $settingsSendAs, 'the stored list is escaped in the textarea');
+assert_contains('me@example.com', $settingsSendAs, 'the account address is named as always available');
+assert_contains('always available', $settingsSendAs, 'the note says the account address is always available');
+
+group('send-as wiring (source guards)');
+
+$saSrc = file_get_contents(__DIR__ . '/../index.php');
+assert_contains('send_as_parse(is_string($_POST[\'send_as\']', $saSrc, 'handle_settings parses the posted list');
+assert_contains("db_set_setting(\$me, 'send_as'", $saSrc, 'handle_settings stores the normalized list');
+assert_contains('identity_resolve($requested, $identities, $me)', $saSrc, 'the send path resolves the posted from');
+assert_eq(2, substr_count($saSrc, "is_string(\$_POST['from'] ?? null)"),
+    'only the send and draft paths read the posted from, each behind a string check');
+assert_eq(2, substr_count($saSrc, 'identity_resolve($requested, $identities, $me)'),
+    'and both pass it through identity_resolve');
+assert_contains('smtp_build_raw_message($from,', $saSrc, 'the From header is built from the resolved address');
+assert_contains('smtp_send($smtp, $from,', $saSrc, 'the envelope uses the resolved address');
+assert_true((bool)preg_match('/[\'"]from[\'"]\s*=>\s*\$from/', $saSrc),
+    'the undo queue keeps the resolved address');
+assert_contains("identity_resolve((string)(\$email['from_address'] ?? ''), \$identities, \$me)", $saSrc,
+    'a draft restores its own From');
+assert_contains("'own_addresses' => own_identity_addresses", $saSrc,
+    'the reader fills the own-address list for reply-all');
+assert_contains("'identities' => \$identities", $saSrc,
+    'the compose paths pass the identity list to the view');
+
+group('undo-send reports a refused alias instead of dropping it');
+
+$flushAt = strpos($saSrc, 'function handle_flush_undo()');
+$flushEnd = $flushAt === false ? false : strpos($saSrc, "\nfunction ", $flushAt + 10);
+$flushBody = ($flushAt !== false && $flushEnd !== false) ? substr($saSrc, $flushAt, $flushEnd - $flushAt) : '';
+assert_contains("smtp_send(\$smtp, \$from,", $flushBody, 'the flush sends with the queued from');
+$okAt = strpos($flushBody, "if (!\$ok) {");
+$unsetAt = strpos($flushBody, "unset(\$_SESSION['undo_queue'][\$token]);", $okAt === false ? 0 : $okAt);
+assert_true($unsetAt !== false && $okAt !== false && $okAt < $unsetAt,
+    'the queue entry survives a failed send and is dropped only after success');
+assert_contains('res.ok', js_inline(), 'the flush client reads the JSON result');
+assert_contains('res.error', js_inline(), 'and shows the server error');
+
+group('compose From select styling');
+
+assert_contains('.compose-row select', css_inline(), 'the From select has a composer rule');
+assert_contains('.compose-row select:focus-visible', css_inline(), 'and a visible keyboard focus ring');
+
 // ------------------------------------------------------------- summary ------+
 summary();

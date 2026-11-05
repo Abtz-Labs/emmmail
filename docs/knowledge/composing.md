@@ -48,6 +48,31 @@ rejected with `5.4.6 mail forwarding loop for <rcpt>` — netcup did this to a r
 `mail@sysscore.com` on 2026-11-05. `Return-Path:` is inserted by the final delivery MTA
 (RFC 5321 4.4). Identity travels in the SMTP envelope (`MAIL FROM`) and `From:`.
 
+## Sending identity (Send as)
+
+A reply must go out as the address that received the message. `reply_form_data()` asks
+`identity_for_message()`: it scans the original To, then Cc, through `header_address_list()`,
+and returns the first configured alias. No match means the account address.
+
+**The posted `from` is a hint.** `handle_send()` and `handle_save_draft()` run it through
+`identity_resolve()` against `send_as_identities()`, then use the result for both `From:` and
+`MAIL FROM`. Never pass `$_POST['from']` to the builder or `smtp_send()` directly.
+
+**Own aliases are the user.** `reply_all_recipients(..., $own)` seeds its seen-list with every
+identity, so reply-all never mails an alias. The reader passes `own_addresses` to
+`view_message_actions()`; without it the Reply-all button leads on the user's own alias.
+
+**Drafts and undo keep the From.** The raw draft carries it, so `handle_edit_draft()` reads
+`$email['from_address']`; the undo queue stores `from` and `handle_flush_undo()` uses it. The
+queue entry is removed only after a successful send.
+
+**A From name with a comma is quoted.** `format_address_header()` quotes RFC 5322 specials and
+falls back to B-encoding for non-ASCII. `smtp_build_raw_message()` is its only caller.
+
+**Recipient parsing is separate from the header.** `compose_recipients()` turns To/Cc/Bcc into
+individual `RCPT TO` addresses; the headers keep the text as typed. A multi-address To was
+rejected as one address before this, so reply-all to a group did not work.
+
 ## The conversation view
 
 `thread_root()` (`index.php`) is the whole identity: first `References` token, else

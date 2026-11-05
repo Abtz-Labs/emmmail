@@ -28,8 +28,8 @@ stream sockets for SMTP, vanilla JS, SQLite. Single `index.php`, routes via `?pa
 | [docs/knowledge/frontend.md](docs/knowledge/frontend.md) | The `$` toolkit and its three banned APIs, round-trip feedback, JS/DOM contracts, optimistic actions, the conversation reader seam, the js stub |
 | [docs/knowledge/css-ui.md](docs/knowledge/css-ui.md) | Dark tokens in three places, specificity traps, tooltips, toolbars, composer layout |
 | [docs/knowledge/testing.md](docs/knowledge/testing.md) | TDD loop, source-level guards, why a crash is not a failing test, what no harness can prove |
-| [docs/knowledge/composing.md](docs/knowledge/composing.md) | The Markdown composer, outbound threading, the conversation view, drafts and attachments, undo send, the signature, POST overflow |
-| [docs/knowledge/environment.md](docs/knowledge/environment.md) | The `imap` extension install, the CA bundle, Migadu hosts, TCP timeouts |
+| [docs/knowledge/composing.md](docs/knowledge/composing.md) | The Markdown composer, outbound threading, sending identities (send-as), the conversation view, drafts and attachments, undo send, the signature, POST overflow |
+| [docs/knowledge/environment.md](docs/knowledge/environment.md) | The `imap` extension install, the CA bundle, Migadu hosts and send-as identities, TCP timeouts |
 
 ## How to work here
 - **TDD is imperative.** Plan, review, red tests, code, review, green tests.

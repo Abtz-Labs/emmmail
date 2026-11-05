@@ -129,12 +129,12 @@ knowledge **out** of this file; add it there and link it from here. Budget: 150 
 - **Code complete, browser pass NOT run:** `2026-11-04-composer-autocomplete-keyboard.md` — ↑/↓ move the suggestion highlight and wrap; Enter picks only a highlighted row; Esc stays with `kbCloseAutocomplete()`. js S92.
 - **Code complete, browser pass NOT run:** `2026-11-04-list-spam-button.md` — row Spam + bulk Spam (no confirm), hidden inside Spam; `handle_spam()` batches `post_uids()` and refuses without a Junk mailbox. js S93.
 - **Code complete, browser pass NOT run:** `2026-11-04-selection-and-navigation-fixes.md` — shortcuts follow the selection; page 1 uses a partial cache; reader Spam lands Inbox; bulk count clears with the repaint. js S94/S95, imap partial page.
+- **Code complete, browser pass NOT run:** `2026-11-05-send-as-aliases.md` — manual Send-as list, composer From picker, reply auto-alias, reply-all self-exclusion; `just test` 3326 passed, 2 smoke skips.
 - **Deferred manual passes** — code done, browser check not run, because no harness can stand in for a real Safari/Firefox/mobile keyboard: markdown-compose step 8 (editor verified in Chromium only); keyboard-first-ux step 7 (cursor/ring, real `showModal` focus, native `<select>` Enter in the move dialog, pagination cursor restore, undo-send Cmd+Enter, login/touch inertness); instant-folder-switch click-through (needs IMAP creds).
 - Everything else is done. Keep each plan's `status:` header honest.
 
 ## Open items
-- Open decision: drop the unused `search_cache` table (one migration step + 3 dead helpers).
-  Destructive, so it needs an explicit yes.
+- Open decision: drop the unused `search_cache` table (one migration + 3 dead helpers). Destructive; needs an explicit yes.
 - Known, unfixed, low priority: server-side-search pagination drops `server=1`; per-row output
   boilerplate is ~660 of 1485 bytes; `MailImap::__construct` pays a wasted TCP probe (~40ms);
   `handle_read`/`reply`/`forward` ignore `selectFolder()`'s result (read-only, so it degrades to
@@ -145,5 +145,4 @@ knowledge **out** of this file; add it there and link it from here. Budget: 150 
   that sends a non-UTF-8 folder name makes every folder-list write fail, so the listings
   re-LIST each visit. Both are documented in
   [plans/2026-10-02-empty-folder-sidebar.md](plans/2026-10-02-empty-folder-sidebar.md).
-- **Fixed (browser pass NOT run):** empty Spam/Trash list under a count. Gate is now
-  `thread_folder_is_member()`; `db_list_threads()` drops Trash/Junk rows.
+- **Fixed (browser pass NOT run):** empty Spam/Trash under a count; gate is `thread_folder_is_member()`, `db_list_threads()` drops Trash/Junk rows.

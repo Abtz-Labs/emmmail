@@ -99,6 +99,9 @@ trusted-sender dialogs keep their input/select/Close focus by design.
   IntersectionObserver at threshold 1 toggles `.stuck` (separator + shadow).
 - `html:has(.compose-actions) { scroll-padding-bottom }` stops the browser scrolling the caret
   to the window edge, under the stuck row.
+- The From row is `.compose-row select`: transparent, `min-width:0`, and a `:focus-visible`
+  ring. Do not copy the input rule's `outline:none` without the focus rule; that ring is the
+  control's only visible focus.
 
 ## Reader toolbar
 `reply_default_is_all()` decides which reply gets `btn-primary`: Reply all only when it would
