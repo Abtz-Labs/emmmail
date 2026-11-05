@@ -119,7 +119,23 @@ in `"\n\n"` *and* so did the quote builder, so the composer showed three blank l
 
 In a merge, both quote sites lost the signature: the stash owned `$sigPrefix` and the pull owned
 the `forward_quote()` / `reply_form_data()` bodies, so taking either side whole silently drops
-it. That is why the prefix goes through one helper, pinned by counting its two call sites.
+it. That is why the prefix goes through one helper, pinned by its three exact call strings:
+`signature_prefix($from, $me)` (reply) and `signature_prefix($me, $me)` (forward, blank compose).
+
+**One signature per identity.** `signature` is the account's; `send_as_signatures` is a JSON
+map keyed by lowercase alias. An alias with no entry has **no** signature (no fall back). The
+settings form posts parallel `send_as_signature_for[]` / `send_as_signatures[]` lists, not
+`[<address>]` keys (PHP cuts a key at `]`), through the pure `send_as_signatures_clean()`.
+The page must render a box for every saved alias: a save without them wipes the map.
+
+**The From swap.** `view_compose()` ships one hidden `.compose-signature` per identity
+(`data-signature-for`, `data-signature-md`, the rendered blocks; empty = `<div><br></div>`, the
+empty top line of a reply). On `change` the JS finds the old signature by its blocks'
+Markdown and replaces them; an edited one is not found and stays. It works because
+`md_to_html(sig . "\n\n" . rest)` starts with `md_to_html(sig)` (unit guard). The textarea is
+patched byte for byte only when the editor is untouched **and** the swapped blocks are the top
+lines the source starts with; otherwise it is serialized. Without that position check a draft
+could post a body that differs from the editor.
 
 ## Undo send
 A session queue, `$_SESSION['undo_queue']`. `handle_send` stores when the period is > 0, a JS

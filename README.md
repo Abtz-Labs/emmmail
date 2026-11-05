@@ -174,6 +174,12 @@ The composer shows a From picker when there is a choice. A reply selects the
 alias that received the original message, looking in To first and then Cc; the
 account address is the fallback. You can always change it before sending.
 
+Each address has its own signature (Settings → Signature). An alias with no
+signature signs with nothing; it does not borrow the account one. A new alias
+gets its signature box after you save the Send-as list. When you change From in
+the composer, the signature in the body changes with it, as long as you have not
+edited it.
+
 The chosen address is both the `From:` header and the SMTP envelope sender
 (`MAIL FROM`). The SMTP login stays the account. A draft keeps its From, and undo
 send keeps it too.
@@ -193,6 +199,10 @@ Limits:
    account display name. Add `Name <address>` to give it one.
 4. A failed send does not restore the composer text. This is true for every send
    failure, not only an address the provider refuses.
+5. The signature follows a From change only in the rich editor, and only while
+   the old signature is unchanged. With JavaScript off (or the plain textarea
+   fallback), or after you edit the signature, change it by hand. Ctrl+Z after a
+   swap is not reliable. A signature with an unclosed code fence is not swapped.
 5. If undo send is on and the flush fails, the error is shown, but the message is
    not returned to the composer.
 
@@ -396,7 +406,8 @@ Each account configures its own copy of these (Settings page, stored per user):
   `Name <address>`. The account address is always available and is the default
   for a new message
 - Signature, inserted at the top of the compose editor, above any quoted reply
-  or forward
+  or forward. One for the account address and one for each send-as address; an
+  address with an empty box has no signature
 - Protected folders: a map of the system roles (Sent, Drafts, Spam, Trash,
   Archive) to the account's actual folder names. Pre-filled from auto-detection
   until you save your own map; the first login walks you through it
@@ -435,6 +446,7 @@ Routing is `index.php?page=<page>`:
 no down path.
 
 - `settings` — per-user key/value settings, including the send-as address list
+  and its signatures (`send_as_signatures`, JSON keyed by lowercase address)
 - `contacts` — auto-populated contacts (search/autocomplete)
 - `search_cache` — mail search snippets for fast local search
 - `login_attempts` — rate-limit bookkeeping

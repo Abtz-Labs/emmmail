@@ -5025,13 +5025,19 @@ function folder_map_clean(array $decoded): array
   return $clean;
 }
 
-// The signature as a body prefix: it goes ABOVE whatever the composer already
-// filled in (quote, forward), or nothing at all when the user set none. The
+// The signature of one identity, as a body prefix: it goes ABOVE whatever the
+// composer already filled in (quote, forward), or nothing at all when that
+// identity has none. An alias never borrows the account signature. The
 // quote/forward builder supplies the single blank line under it, so this must
 // not add one too — that is what left a gap between the signature and the quote.
-function signature_prefix(): string
+function signature_prefix(string $address, string $me): string
 {
-  return trim((string)user_setting('signature', ''));
+  if (strcasecmp($address, $me) === 0) {
+    return trim((string)db_get_setting($me, 'signature', ''));
+  }
+  $map = json_decode((string)db_get_setting($me, 'send_as_signatures', '{}'), true);
+  $sig = is_array($map) ? ($map[strtolower($address)] ?? '') : '';
+  return is_string($sig) ? trim($sig) : '';
 }
 
 // --- Sending identity (send-as) --------------------------------------------
@@ -5092,6 +5098,36 @@ function send_as_format(array $aliases): string
     $lines[] = $name !== '' ? $name . ' <' . $address . '>' : $address;
   }
   return implode("\n", $lines);
+}
+
+/**
+ * The posted alias signatures, cleaned for storage. Pure.
+ *
+ * $for and $text are parallel lists from the settings form: the address rides
+ * in its own field because PHP cuts an array key at the first `]`. Only aliases
+ * in the freshly parsed list are kept, so a removed alias loses its signature.
+ */
+function send_as_signatures_clean(array $aliases, $for, $text): array
+{
+  $for = is_array($for) ? $for : [];
+  $text = is_array($text) ? $text : [];
+  $known = [];
+  foreach ($aliases as $alias) {
+    $known[strtolower((string)$alias['address'])] = true;
+  }
+  $out = [];
+  foreach ($for as $i => $address) {
+    $sig = $text[$i] ?? null;
+    if (!is_string($address) || !is_string($sig)) {
+      continue;
+    }
+    $key = strtolower(trim($address));
+    $sig = trim($sig);
+    if ($sig !== '' && isset($known[$key])) {
+      $out[$key] = $sig;
+    }
+  }
+  return $out;
 }
 
 /**
@@ -5507,12 +5543,13 @@ function handle_compose(): void
   }
   $me = (string)current_user();
   $identities = send_as_identities($me);
+  $sigPrefix = signature_prefix($me, $me);
   render_compose([
     'from'        => $me,
     'identities'  => $identities,
     'to'          => '',
     'subject'     => '',
-    'body'        => (string)user_setting('signature', ''),
+    'body'        => $sigPrefix,
     'cc'          => '',
     'bcc'         => '',
     'forward_attachments' => [],
@@ -5615,12 +5652,12 @@ function handle_forward(): void
   if (!$email) {
     redirect('?page=inbox');
   }
-  $sigPrefix = signature_prefix();
+  $me = (string)current_user();
+  $sigPrefix = signature_prefix($me, $me);
   $quote = forward_quote($email);
   $subject = (stripos($email['subject'], 'Fwd:') === 0) ? $email['subject'] : 'Fwd: ' . $email['subject'];
   // Store forward source metadata server-side for the send step.
   $_SESSION['forward_src'] = ['uid' => $uid, 'folder' => $folder, 'parts' => array_column($email['attachments'], 'part_number')];
-  $me = (string)current_user();
   $identities = send_as_identities($me);
   render_compose([
     'from'        => $me,
@@ -6521,6 +6558,9 @@ function handle_settings(): void
     db_set_setting($me, 'display_name', $displayName);
     $sendAs = send_as_parse(is_string($_POST['send_as'] ?? null) ? $_POST['send_as'] : '', $me);
     db_set_setting($me, 'send_as', send_as_format($sendAs));
+    db_set_setting($me, 'send_as_signatures', (string)json_encode(
+      send_as_signatures_clean($sendAs, $_POST['send_as_signature_for'] ?? null, $_POST['send_as_signatures'] ?? null),
+      JSON_INVALID_UTF8_SUBSTITUTE));
     db_set_setting($me, 'show_remote_images', empty($_POST['show_remote_images']) ? '0' : '1');
     db_set_setting($me, 'signature', trim($_POST['signature'] ?? ''));
     db_set_setting($me, 'auto_poll', empty($_POST['auto_poll']) ? '0' : '1');
@@ -6547,6 +6587,9 @@ function handle_settings(): void
     'emails_per_page' => (int)user_setting('emails_per_page', DEFAULT_EMAILS_PER_PAGE),
     'display_name'    => (string)user_setting('display_name', strstr($me, '@', true) ?: $me),
     'send_as'         => (string)user_setting('send_as', ''),
+    'send_as_signatures' => array_map(
+      fn(array $alias) => $alias + ['signature' => signature_prefix($alias['address'], $me)],
+      send_as_parse((string)user_setting('send_as', ''), $me)),
     'account_email'   => $me,
     'show_remote_images' => user_setting('show_remote_images', DEFAULT_SHOW_REMOTE_IMAGES) === '1',
     'image_whitelist' => (string)user_setting('image_whitelist', ''),
@@ -6835,6 +6878,11 @@ function render_read(array $email, int $uid, string $folder, string $me = '', ar
 
 function render_compose(array $d): void
 {
+  // The From select swaps signatures in the editor, so the view needs them all.
+  $me = (string)current_user();
+  foreach ($d['identities'] ?? [] as $i => $identity) {
+    $d['identities'][$i]['signature'] = signature_prefix((string)$identity['address'], $me);
+  }
   $folderMap = json_decode((string)user_setting('protected_folders', '{}'), true) ?: null;
   render_page('Compose', view_sidebar(cached_folder_list(current_user()), '', $folderMap, db_get_folder_counts(current_user())) . '<section class="mailbox">' . view_compose($d) . '</section></div>', true);
 }
@@ -8909,9 +8957,10 @@ function js_inline(): string
     // Written back only after a real edit: an untouched draft or reply is
     // posted exactly as the server prefilled it.
     var dirty = false;
-    function empty(){
-      $(ed).toggleClass('is-empty', !String(ed.textContent || '').replace(/\u200b/g, '') && !ed.querySelectorAll('img').length);
+    function blank(){
+      return !String(ed.textContent || '').replace(/\u200b/g, '') && !ed.querySelectorAll('img').length;
     }
+    function empty(){ $(ed).toggleClass('is-empty', blank()); }
     function sync(){ if (dirty) ta.value = mdSerialize(ed); }
     // One Enter is one line, as in Gmail and as md_to_html() renders it.
     try { doc.execCommand('defaultParagraphSeparator', false, 'div'); } catch (e) {}
@@ -9085,6 +9134,60 @@ function js_inline(): string
         sel.addRange(r);
       }
       doc.execCommand('insertText', false, dt.getData('text/plain'));
+    });
+
+    // --- From swaps the signature. view_compose() ships one hidden source per
+    // identity. The old signature is found by its blocks, so one the user
+    // changed (or removed) is their text now and stays. No state is kept but
+    // the previous From, so a draft works the same as a fresh reply.
+    var from = form.querySelectorAll('select[name="from"]')[0];
+    if (!from) return;
+    var prevFrom = from.value;
+    function sigSource(addr){
+      var all = form.querySelectorAll('.compose-signature');
+      for (var i = 0; i < all.length; i++) {
+        if (String(all[i].getAttribute('data-signature-for') || '').toLowerCase() === String(addr).toLowerCase()) return all[i];
+      }
+      return null;
+    }
+    // Top-level nodes without the layout newlines (the same test as mdBlocks).
+    function sigBlocks(n){
+      return mdKids(n).filter(function(k){ return !(k.nodeType === 3 && /^[ \t\r\n]*$/.test(k.nodeValue) && /\n/.test(k.nodeValue)); });
+    }
+    function sigMd(nodes){ var lines = []; mdBlocks(nodes, lines); return lines.join('\n'); }
+    $(from).on('change', function(){
+      var oldSrc = sigSource(prevFrom), newSrc = sigSource(from.value);
+      prevFrom = from.value;
+      if (!oldSrc || !newSrc) return;
+      var oldMd = oldSrc.getAttribute('data-signature-md') || '';
+      var want = sigBlocks(oldSrc), have = sigBlocks(ed), hit = null;
+      if (oldMd === '') {
+        // No signature: the empty editor, or the empty top line of a reply.
+        if (blank()) hit = mdKids(ed);
+        else if (mdTag(have[0] || {}) === 'DIV' && sigMd([have[0]]) === '') hit = [have[0]];
+      } else {
+        // A bare text line or a quote that is not the signature ends the
+        // search, so the quoted reply is never searched.
+        var target = sigMd(want);
+        for (var i = 0; i + want.length <= have.length && !hit; i++) {
+          if (sigMd(have.slice(i, i + want.length)) === target) hit = have.slice(i, i + want.length);
+          else if (have[i].nodeType !== 1 || mdTag(have[i]) === 'BLOCKQUOTE') break;
+        }
+      }
+      if (!hit) return;
+      var kids = mdKids(ed), ref = hit[0] || null;
+      sigBlocks(newSrc).forEach(function(n){ if (n.nodeType === 1) ed.insertBefore(n.cloneNode(true), ref); });
+      // The old blocks and the layout newlines between them go.
+      if (hit.length) kids.slice(kids.indexOf(hit[0]), kids.indexOf(hit[hit.length - 1]) + 1).forEach(function(n){ ed.removeChild(n); });
+      undoable = null;
+      var newMd = newSrc.getAttribute('data-signature-md') || '';
+      // An untouched body stays the server's source, byte for byte, but only
+      // when the blocks swapped are the top lines that source starts with.
+      var rest = ta.value.slice(oldMd.length);
+      if (!dirty && (!hit.length || hit[0] === have[0]) && ta.value.slice(0, oldMd.length) === oldMd && /^(\n|$)/.test(rest)) {
+        ta.value = newMd + rest;
+      } else { dirty = true; sync(); }
+      empty();
     });
   });
 
@@ -11333,7 +11436,8 @@ function reply_form_data(array $email, string $me, bool $all, array $identities 
   // signature must not add a second one.
   $quote = "\n\n" . md_escape('On ' . ($email['date'] ?? '') . ', ' . ($email['from'] ?? '') . ' wrote:')
     . "\n" . implode("\n", $quoted);
-  $sigPrefix = signature_prefix();
+  $from = identity_for_message($email, $identities, $me);
+  $sigPrefix = signature_prefix($from, $me);
   $subject = (string)($email['subject'] ?? '');
   $subject = (stripos($subject, 'Re:') === 0) ? $subject : 'Re: ' . $subject;
 
@@ -11349,7 +11453,7 @@ function reply_form_data(array $email, string $me, bool $all, array $identities 
   $references = $parent === '' ? '' : trim($chain . ' ' . $parent);
 
   return [
-    'from'        => identity_for_message($email, $identities, $me),
+    'from'        => $from,
     'to'          => $groups['to'],
     'cc'          => $groups['cc'],
     'bcc'         => '',
@@ -11890,7 +11994,7 @@ function view_compose(array $d): string
       (string)($identities[0]['address'] ?? ''));
     $h .= '<div class="compose-row compose-from">'
       . '<label for="compose-from">From</label>'
-      . '<select id="compose-from" name="from">';
+      . '<select id="compose-from" name="from" autocomplete="off">';
     foreach ($identities as $identity) {
       $selected = strcasecmp((string)($identity['address'] ?? ''), (string)($current['address'] ?? '')) === 0
         ? ' selected' : '';
@@ -11898,6 +12002,14 @@ function view_compose(array $d): string
         . h(identity_option_label($identity)) . '</option>';
     }
     $h .= '</select></div>';
+    // One hidden source per identity: the signature as the editor shows it, and
+    // its Markdown. The JS swaps the old one for the new one when From changes.
+    // An empty signature is the one empty top line a reply leaves without one.
+    foreach ($identities as $identity) {
+      $sig = (string)($identity['signature'] ?? '');
+      $h .= '<div class="compose-signature hidden" data-signature-for="' . h($identity['address'] ?? '')
+        . '" data-signature-md="' . h($sig) . '">' . ($sig !== '' ? md_to_html($sig) : '<div><br></div>') . '</div>';
+    }
   }
   // --- To / Cc / Bcc row (Gmail-style: inline labels, Cc/Bcc toggled) ---
   $showCc  = !empty($d['cc']);
@@ -12096,11 +12208,23 @@ function view_settings(array $d): string
     . 'name for that address. Your account address is always available'
     . ($accountEmail !== '' ? ' (<strong>' . h($accountEmail) . '</strong>)' : '') . '. '
     . 'Your mail provider must allow sending from every address.</div></div>'
-    . '<div class="form-group"><label>Signature</label>'
-    . '<textarea name="signature" rows="4" placeholder="Your email signature...">' . h($d['signature'] ?? '') . '</textarea>'
-    . '<div class="settings-note">Appended to the bottom of every message you send, before quoted content.</div></div>'
-    // Protected folders: button on the right, matching the toggle layout.
-    . '<div class="form-group settings-toggle">'
+    . '<div class="form-group"><label for="signature">Signature'
+    . ($accountEmail !== '' ? ' for ' . h($accountEmail) : '') . '</label>'
+    . '<textarea id="signature" name="signature" rows="4" placeholder="Your email signature...">' . h($d['signature'] ?? '') . '</textarea>'
+    . '<div class="settings-note">Inserted at the top of a new message, above any quoted reply. '
+    . 'Each Send-as address has its own signature, or none. '
+    . 'Save a new Send-as address first, then add its signature here.</div></div>';
+  // One box for each saved alias. The address rides in a hidden field: PHP cuts
+  // an array key at the first `]`, and a quoted local part can hold one.
+  foreach ($d['send_as_signatures'] ?? [] as $i => $alias) {
+    $h .= '<div class="form-group"><label for="signature-' . (int)$i . '">Signature for '
+      . h(identity_option_label($alias)) . '</label>'
+      . '<input type="hidden" name="send_as_signature_for[]" value="' . h($alias['address']) . '">'
+      . '<textarea id="signature-' . (int)$i . '" name="send_as_signatures[]" rows="3">'
+      . h($alias['signature'] ?? '') . '</textarea></div>';
+  }
+  // Protected folders: button on the right, matching the toggle layout.
+  $h .= '<div class="form-group settings-toggle">'
     . '<div class="settings-toggle-text">'
     . '<div class="settings-label">Protected folders</div>'
     . '<div class="settings-note">Map system roles (Sent, Drafts, Spam, Trash, Archive) to your actual folder names.</div>'

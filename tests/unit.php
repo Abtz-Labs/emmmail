@@ -2428,17 +2428,22 @@ $sigFwd = forward_quote(['from' => 'Vin <vin@pm.me>', 'date' => 'Wed, 09 Sep 202
     'body_text' => 'Fwd body', 'body_html' => '']);
 assert_contains('Fwd body', $sigFwd, 'the forward quote is independent of the signature');
 // The forward path composes the same way, so it gets the same single blank line.
-$sigFwdBody = signature_prefix() . $sigFwd;
+$sigFwdBody = signature_prefix($sigUser, $sigUser) . $sigFwd;
 assert_contains("Best regards,\n\n----- Forwarded Message -----", $sigFwdBody,
     'a forward has one blank line after the signature too');
 assert_not_contains("Best regards,\n\n\n", $sigFwdBody, 'and no double blank line');
-// handle_forward and reply_form_data are the two paths that lost it in a merge.
+// The reply, the forward and the blank compose are the paths that lost it in a
+// merge. Each one names the identity it signs for.
 $mergeSrc = file_get_contents(__DIR__ . '/../index.php');
-assert_contains('$sigPrefix = signature_prefix();', $mergeSrc, 'the signature prefix is computed');
-assert_eq(2, substr_count($mergeSrc, '$sigPrefix = signature_prefix();'),
-    'both the reply and the forward path set it, so neither can lose it again');
-assert_contains("'body'        => \$sigPrefix . \$quote,", $mergeSrc,
-    'and both put it above the quote');
+assert_eq(1, substr_count($mergeSrc, '$sigPrefix = signature_prefix($from, $me);'),
+    'the reply signs for the identity it is sent from');
+assert_eq(2, substr_count($mergeSrc, '$sigPrefix = signature_prefix($me, $me);'),
+    'the forward and the blank compose sign for the account');
+assert_eq(2, substr_count($mergeSrc, "'body'        => \$sigPrefix . \$quote,"),
+    'the reply and the forward put it above the quote');
+assert_contains("'body'        => \$sigPrefix,", $mergeSrc, 'the blank compose opens with it');
+assert_eq(1, substr_count($mergeSrc, "user_setting('signature'"),
+    'only the settings page reads the raw setting; no compose path skips the helper');
 
 db_set_setting($sigUser, 'signature', '');
 $noSig = reply_form_data($parent, $sigUser, false)['body'];
@@ -5443,7 +5448,7 @@ $composeWithAlias = view_compose([
     'identities' => $composeIds, 'from' => 'SALES@example.com',
 ]);
 assert_contains('class="compose-row compose-from"', $composeWithAlias, 'the From row is present');
-assert_contains('<select id="compose-from" name="from">', $composeWithAlias, 'it is a real select');
+assert_contains('<select id="compose-from" name="from" autocomplete="off">', $composeWithAlias, 'it is a real select, never restored by the browser');
 assert_contains('<option value="me@example.com">Me &lt;me@example.com&gt;</option>', $composeWithAlias,
     'the primary option is present and escaped');
 assert_contains('<option value="sales@example.com" selected>Sales &lt;sales@example.com&gt;</option>',
@@ -5471,6 +5476,168 @@ assert_contains('name="send_as"', $settingsSendAs, 'the alias list is a form fie
 assert_contains('Sales &lt;sales@example.com&gt;', $settingsSendAs, 'the stored list is escaped in the textarea');
 assert_contains('me@example.com', $settingsSendAs, 'the account address is named as always available');
 assert_contains('always available', $settingsSendAs, 'the note says the account address is always available');
+
+// ------------------------------------------------ per-identity signatures -+
+
+group('signature_prefix() reads the signature of one identity');
+
+$psMe = 'ps-me@example.com';
+db_set_setting($psMe, 'signature', "  This is me \n");
+db_set_setting($psMe, 'send_as', "Help <help@example.com>\nquiet@example.com");
+db_set_setting($psMe, 'send_as_signatures', json_encode(['help@example.com' => " Help Team \n"]));
+assert_eq('This is me', signature_prefix($psMe, $psMe), 'the account reads its own signature, trimmed');
+assert_eq('This is me', signature_prefix('PS-ME@example.com', $psMe), 'the account address matches without case');
+assert_eq('Help Team', signature_prefix('help@example.com', $psMe), 'an alias reads its own signature, trimmed');
+assert_eq('Help Team', signature_prefix('HELP@Example.com', $psMe), 'an alias matches without case');
+assert_eq('', signature_prefix('quiet@example.com', $psMe), 'an alias with no signature has none, not the account one');
+assert_eq('', signature_prefix('help@example.com', 'nobody-ps@example.com'), 'a user with no map has no alias signature');
+foreach (['not json', '["a","b"]', '42', '{"help@example.com":["x"]}'] as $badMap) {
+    db_set_setting($psMe, 'send_as_signatures', $badMap);
+    error_clear_last();
+    assert_eq('', signature_prefix('help@example.com', $psMe), 'a bad stored map gives no signature: ' . $badMap);
+    assert_eq(null, error_get_last(), 'and no warning: ' . $badMap);
+}
+db_set_setting($psMe, 'send_as_signatures', json_encode(['help@example.com' => 'Help Team']));
+
+group('send_as_signatures_clean() keeps one signature per saved alias');
+
+if (!function_exists('send_as_signatures_clean')) {
+    failTest('send_as_signatures_clean() exists');
+} else {
+    $cleanAliases = [
+        ['address' => 'Help@Example.com', 'name' => 'Help'],
+        ['address' => 'sales@example.com', 'name' => ''],
+        ['address' => 'quiet@example.com', 'name' => ''],
+    ];
+    assert_eq(
+        ['help@example.com' => 'Help Team', 'sales@example.com' => 'Sales'],
+        send_as_signatures_clean($cleanAliases,
+            ['help@example.com', 'SALES@example.com', 'quiet@example.com', 'gone@example.com'],
+            ["  Help Team \n", 'Sales', '   ', 'Gone']),
+        'trimmed, keyed by lowercase, empty and removed aliases dropped');
+    assert_eq([], send_as_signatures_clean($cleanAliases, 'help@example.com', 'x'),
+        'a forged string instead of a list is ignored');
+    assert_eq([], send_as_signatures_clean($cleanAliases, null, null), 'a missing field is ignored');
+    assert_eq(['sales@example.com' => 'Sales'],
+        send_as_signatures_clean($cleanAliases, [['help@example.com'], 'sales@example.com'], [['x'], 'Sales']),
+        'a value that is not a string is skipped');
+    assert_eq([], send_as_signatures_clean($cleanAliases, ['help@example.com'], []),
+        'an address with no text is skipped');
+}
+
+group('reply_form_data() signs for the identity it replies from');
+
+$psIds = send_as_identities($psMe);
+$psParent = $parentForAlias;
+$psParent['to'] = 'Help <help@example.com>';
+$psReply = reply_form_data($psParent, $psMe, false, $psIds);
+assert_eq('help@example.com', $psReply['from'], 'the reply goes out from the alias');
+assert_eq(0, strpos($psReply['body'], "Help Team\n\nOn "), 'and opens with the alias signature');
+assert_not_contains('This is me', $psReply['body'], 'not the account signature');
+$psParent['to'] = 'quiet@example.com';
+$psQuiet = reply_form_data($psParent, $psMe, false, $psIds)['body'];
+assert_eq(0, strpos($psQuiet, "\n\nOn "), 'an alias with no signature leaves room on top only');
+assert_not_contains('This is me', $psQuiet, 'and does not fall back to the account signature');
+$psParent['to'] = $psMe;
+assert_eq(0, strpos(reply_form_data($psParent, $psMe, false, $psIds)['body'], "This is me\n\nOn "),
+    'a reply to the account still signs as the account');
+
+group('md_to_html() renders a signature as the leading blocks of the body');
+
+// The composer swap finds the old signature by its blocks. That works only if
+// the body's HTML starts with the signature's own HTML.
+$psQuote = "\n\n" . md_escape('On Wed, a@b.c wrote:') . "\n> hi";
+foreach (['Help Team', "Help Team\nSupport desk", "-- \nRogerio", "- one\n- two", '**Help** Team',
+    '# Help', '> quoted', '---', "Best,\n\nRogerio"] as $psSig) {
+    assert_eq(0, strpos(md_to_html($psSig . $psQuote), md_to_html($psSig) . "\n"),
+        'the body starts with the signature blocks: ' . json_encode($psSig));
+}
+assert_eq(0, strpos(md_to_html($psQuote), '<div><br></div>' . "\n"),
+    'with no signature the body starts with the one empty line the empty source stands for');
+
+group('view_compose() ships one signature source per identity');
+
+$psComposeIds = [
+    ['address' => 'me@example.com', 'name' => 'Me', 'signature' => ''],
+    ['address' => 'Help@Example.com', 'name' => 'Help', 'signature' => "**Help** Team\n<b>&</b>"],
+];
+$psCompose = view_compose([
+    'to' => '', 'cc' => '', 'bcc' => '', 'subject' => '', 'body' => '',
+    'forward_attachments' => [], 'csrf' => 'tok',
+    'identities' => $psComposeIds, 'from' => 'me@example.com',
+]);
+assert_eq(2, substr_count($psCompose, 'class="compose-signature hidden"'), 'one source for each identity');
+assert_contains('<div class="compose-signature hidden" data-signature-for="me@example.com" data-signature-md=""><div><br></div></div>',
+    $psCompose, 'an empty signature is the one empty line');
+assert_contains('data-signature-for="Help@Example.com"', $psCompose, 'the address keeps its case');
+assert_contains("data-signature-md=\"**Help** Team\n&lt;b&gt;&amp;&lt;/b&gt;\"", $psCompose,
+    'the Markdown source is escaped into the attribute');
+assert_contains('>' . md_to_html("**Help** Team\n<b>&</b>") . '</div>', $psCompose,
+    'the source holds the rendered signature');
+$psEdAt = strpos($psCompose, 'class="md-editor');
+$psEdEnd = strpos($psCompose, '<textarea name="body"');
+$psSrcAt = strpos($psCompose, 'compose-signature');
+assert_true($psSrcAt !== false && $psEdAt !== false && ($psSrcAt < $psEdAt || $psSrcAt > $psEdEnd),
+    'the sources are outside the editor');
+assert_true($psSrcAt < strpos($psCompose, '</form>'), 'and inside the form, where the editor finds them');
+assert_false((bool)preg_match('/class="compose-signature[^>]*name=/', $psCompose), 'a source is never posted');
+assert_not_contains('compose-signature', $composeNoAlias, 'no From row means no sources');
+
+group('render_compose() adds each identity signature for the view');
+
+$psRcSrc = file_get_contents(__DIR__ . '/../index.php');
+$psRcAt = strpos($psRcSrc, 'function render_compose(');
+$psRcBody = $psRcAt === false ? '' : substr($psRcSrc, $psRcAt, strpos($psRcSrc, "\nfunction ", $psRcAt + 10) - $psRcAt);
+assert_contains("\$d['identities'][\$i]['signature'] = signature_prefix((string)\$identity['address'], \$me);", $psRcBody,
+    'render_compose gives every identity its own signature');
+
+group('view_settings() renders a signature box for each alias');
+
+$psSettings = view_settings([
+    'csrf' => 'tok', 'emails_per_page' => 25, 'display_name' => 'Me',
+    'show_remote_images' => false, 'image_whitelist' => '', 'signature' => 'This is me',
+    'auto_poll' => true, 'undo_period_seconds' => 0,
+    'protected_folders' => '{}', 'folder_list' => [], 'cached_messages' => 0,
+    'send_as' => "Help & Co <help@example.com>\nquiet@example.com", 'account_email' => 'me@example.com',
+    'send_as_signatures' => [
+        ['address' => 'help@example.com', 'name' => 'Help & Co', 'signature' => 'Help <Team>'],
+        ['address' => 'quiet@example.com', 'name' => '', 'signature' => ''],
+    ],
+]);
+assert_eq(2, substr_count($psSettings, 'name="send_as_signatures[]"'), 'one signature box for each alias');
+assert_eq(2, substr_count($psSettings, 'name="send_as_signature_for[]"'), 'each with its address');
+assert_contains('<input type="hidden" name="send_as_signature_for[]" value="help@example.com">', $psSettings,
+    'the address travels in a hidden field, not in the field name');
+assert_contains('Help &amp; Co &lt;help@example.com&gt;', $psSettings, 'the label names the alias, escaped');
+assert_contains('Help &lt;Team&gt;</textarea>', $psSettings, 'the stored signature is escaped in its box');
+assert_contains('Save a new Send-as address first', $psSettings, 'the note says how to add a box');
+assert_contains('This is me', $psSettings, 'the account signature is still there');
+assert_contains('Signature for me@example.com', $psSettings, 'the account box names the account address');
+assert_not_contains('Appended to the bottom', $psSettings, 'the old, wrong placement note is gone');
+error_clear_last();
+$psOldStyle = view_settings([
+    'csrf' => 'tok', 'emails_per_page' => 25, 'display_name' => 'Me',
+    'show_remote_images' => false, 'image_whitelist' => '', 'signature' => '',
+    'auto_poll' => true, 'undo_period_seconds' => 0,
+    'protected_folders' => '{}', 'folder_list' => [], 'cached_messages' => 0,
+]);
+assert_eq(null, error_get_last(), 'an old-style view call gives no warning');
+assert_not_contains('send_as_signatures[]', $psOldStyle, 'and shows no alias boxes');
+
+group('handle_settings() stores the alias signatures (source guard)');
+
+$psHsAt = strpos($psRcSrc, 'function handle_settings(');
+$psHsBody = $psHsAt === false ? '' : substr($psRcSrc, $psHsAt, strpos($psRcSrc, "\nfunction ", $psHsAt + 10) - $psHsAt);
+$psParseAt = strpos($psHsBody, 'send_as_parse(');
+$psCleanAt = strpos($psHsBody, 'send_as_signatures_clean($sendAs,');
+assert_true($psParseAt !== false && $psCleanAt !== false && $psParseAt < $psCleanAt,
+    'the posted signatures are cleaned against the freshly parsed alias list');
+assert_contains("db_set_setting(\$me, 'send_as_signatures'", $psHsBody, 'and stored');
+assert_contains('JSON_INVALID_UTF8_SUBSTITUTE', $psHsBody, 'one bad byte cannot wipe the whole map');
+// Without the boxes on the page, the next save would post no signatures and
+// wipe the map.
+assert_contains("fn(array \$alias) => \$alias + ['signature' => signature_prefix(\$alias['address'], \$me)],", $psHsBody,
+    'the settings page renders a box for each saved alias');
 
 group('send-as wiring (source guards)');
 

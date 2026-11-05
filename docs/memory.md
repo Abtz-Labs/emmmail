@@ -130,6 +130,7 @@ knowledge **out** of this file; add it there and link it from here. Budget: 150 
 - **Code complete, browser pass NOT run:** `2026-11-04-list-spam-button.md` — row Spam + bulk Spam (no confirm), hidden inside Spam; `handle_spam()` batches `post_uids()` and refuses without a Junk mailbox. js S93.
 - **Code complete, browser pass NOT run:** `2026-11-04-selection-and-navigation-fixes.md` — shortcuts follow the selection; page 1 uses a partial cache; reader Spam lands Inbox; bulk count clears with the repaint. js S94/S95, imap partial page.
 - **Code complete, browser pass NOT run:** `2026-11-05-send-as-aliases.md` — manual Send-as list, composer From picker, reply auto-alias, reply-all self-exclusion; `just test` 3326 passed, 2 smoke skips.
+- **Code complete, browser pass NOT run:** `2026-11-05-per-identity-signatures.md` — one signature per identity (`send_as_signatures` JSON, no fall back); a From change swaps an unedited signature in the editor. js S28b.
 - **Deferred manual passes** — code done, browser check not run, because no harness can stand in for a real Safari/Firefox/mobile keyboard: markdown-compose step 8 (editor verified in Chromium only); keyboard-first-ux step 7 (cursor/ring, real `showModal` focus, native `<select>` Enter in the move dialog, pagination cursor restore, undo-send Cmd+Enter, login/touch inertness); instant-folder-switch click-through (needs IMAP creds).
 - Everything else is done. Keep each plan's `status:` header honest.
 

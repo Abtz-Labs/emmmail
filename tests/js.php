@@ -95,6 +95,53 @@ foreach ($mdLiterals as $x) {
     $mdFixtures['literal'][] = ['src' => $x, 'expect' => md_escape($x),
         'tree' => md_html_tree('<div>' . h($x) . '</div>')];
 }
+// The signature swap: the editor and the signature sources exactly as
+// view_compose() renders them, and the body the server prefills for each
+// identity. The test then proves the JS lands on the same body.
+function sig_compose_set(array $ids, callable $bodyFor): array
+{
+    $html = view_compose(['to' => '', 'cc' => '', 'bcc' => '', 'subject' => '', 'body' => $bodyFor($ids[0]['signature']),
+        'forward_attachments' => [], 'csrf' => 't', 'identities' => $ids, 'from' => $ids[0]['address']]);
+    $doc = new DOMDocument();
+    $prev = libxml_use_internal_errors(true);
+    $doc->loadHTML('<?xml encoding="UTF-8">' . $html, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
+    libxml_clear_errors();
+    libxml_use_internal_errors($prev);
+    $xp = new DOMXPath($doc);
+    $sources = [];
+    foreach ($xp->query('//div[contains(@class,"compose-signature")]') as $n) {
+        $sources[] = ['for' => $n->getAttribute('data-signature-for'), 'md' => $n->getAttribute('data-signature-md'),
+            'tree' => md_dom_tree($n)];
+    }
+    $expect = [];
+    foreach ($ids as $id) {
+        $expect[strtolower($id['address'])] = $bodyFor($id['signature']);
+    }
+    return ['editor' => md_dom_tree($xp->query('//div[contains(@class,"md-editor")]')->item(0)),
+        'sources' => $sources, 'body' => $bodyFor($ids[0]['signature']), 'expect' => $expect];
+}
+$sigIds = [
+    ['address' => 'me@x.io', 'name' => 'Me', 'signature' => ''],
+    // Not canonical: the serializer writes `**`, so only the byte-for-byte path
+    // keeps `__` in the textarea.
+    ['address' => 'Help@X.io', 'name' => 'Help', 'signature' => "__Help__ Team\nSupport_desk"],
+    ['address' => 'sales@x.io', 'name' => '', 'signature' => 'Sales'],
+    ['address' => 'team@x.io', 'name' => '', 'signature' => 'Sales'],
+    ['address' => 'quote@x.io', 'name' => '', 'signature' => '> Quoted desk'],
+];
+$sigQuote = reply_form_data([
+    'from' => 'Vin <vin@pm.me>', 'date' => 'Wed, 09 Sep 2026', 'subject' => 'S', 'body_html' => '',
+    'body_text' => "Hi,\n> earlier", 'from_address' => 'vin@pm.me', 'reply_to_address' => '', 'to' => 'nobody-sig@x.io',
+    'cc' => '', 'message_id' => '', 'references' => '',
+], 'nobody-sig@x.io', false)['body'];
+$mdFixtures['sig'] = [
+    'reply' => sig_compose_set($sigIds, fn(string $s) => $s . $sigQuote),
+    'forward' => sig_compose_set($sigIds, fn(string $s) => $s . forward_quote(['from' => 'Vin <vin@pm.me>',
+        'date' => 'Wed, 09 Sep 2026', 'body_text' => "Hi,\nSales\nbye", 'body_html' => ''])),
+    'blank' => sig_compose_set($sigIds, fn(string $s) => $s),
+    // A draft opened from sales, whose first line only starts like the signature.
+    'draft' => sig_compose_set([$sigIds[2], $sigIds[0]], fn(string $s) => "Sales pitch\n" . $s . $sigQuote),
+];
 file_put_contents($mdFile, json_encode($mdFixtures, JSON_UNESCAPED_UNICODE));
 file_put_contents($runFile, <<<'JS'
 'use strict';
@@ -223,6 +270,7 @@ function makeEl(tag, doc) {
     },
   };
   Object.defineProperty(el, 'textContent', {
+    configurable: true,
     get() { return el._text; },
     set(v) { el._text = String(v); el._innerHTML = escHtml(el._text); },
   });
@@ -1641,6 +1689,146 @@ async function main() {
     ok('L7: a rich drop is stopped too', drop.defaultPrevented);
     eq('L7: and inserted as plain text', JSON.stringify(on.cmds), JSON.stringify([['insertText', 'd']]));
     ok('typing is left to the browser', !on.ed.dispatch('beforeinput', null, { inputType: 'insertText', data: 'a' }).defaultPrevented);
+  }
+
+  // S28b — changing From swaps the signature in the editor, when it is still
+  // the one that was there. The editor and the sources are the real
+  // view_compose() markup; the expected bodies are the server prefills.
+  const sigFx = JSON.parse(fs.readFileSync(process.env.MD_FIXTURES_PATH, 'utf8')).sig;
+  ok('S28b view_compose() ships a signature source for each identity', sigFx.reply.sources.length === 5);
+  if (sigFx.reply.sources.length === 5) {
+    const fx = sigFx;
+    const mkNode = j => ('t' in j)
+      ? { nodeType: 3, nodeName: '#text', nodeValue: j.t, childNodes: [], cloneNode() { return mkNode(j); } }
+      : { nodeType: 1, nodeName: j.n, childNodes: j.c.map(mkNode), getAttribute: k => (k in j.a ? j.a[k] : null),
+          cloneNode() { return mkNode(j); } };
+    const textOf = n => n.nodeType === 3 ? n.nodeValue : n.childNodes.map(textOf).join('');
+    const mkSwap = (set, withExec) => {
+      const doc = makeDoc(); buildMeta(doc);
+      const win = makeWin();
+      const c = buildCompose(doc);
+      const sel = doc.createElement('select'); sel.setAttribute('name', 'from');
+      set.sources.forEach(s => { const o = doc.createElement('option'); o.value = s.for; sel.appendChild(o); });
+      sel.value = set.sources[0].for;
+      c.form.appendChild(sel);
+      set.sources.forEach(s => {
+        const d = doc.createElement('div'); d.className = 'compose-signature hidden';
+        d.setAttribute('data-signature-for', s.for); d.setAttribute('data-signature-md', s.md);
+        d.childNodes = s.tree.c.map(mkNode);
+        c.form.appendChild(d);
+      });
+      const body = doc.createElement('div'); body.className = 'compose-body';
+      const ed = doc.createElement('div'); ed.className = 'md-editor hidden';
+      const ta = doc.createElement('textarea'); ta.setAttribute('name', 'body');
+      ta.value = set.body;
+      body.appendChild(ed); body.appendChild(ta); c.form.appendChild(body);
+      ed.focus = function() {};
+      // The serializer reads childNodes, so the swap must edit that list, and
+      // the placeholder test reads the text of the same nodes.
+      ed.childNodes = set.editor.c.map(mkNode);
+      Object.defineProperty(ed, 'textContent', { get() { return ed.childNodes.map(textOf).join(''); } });
+      ed.insertBefore = function(n, ref) {
+        const i = ref ? this.childNodes.indexOf(ref) : -1;
+        if (i < 0) this.childNodes.push(n); else this.childNodes.splice(i, 0, n);
+        return n;
+      };
+      ed.removeChild = function(n) { this.childNodes.splice(this.childNodes.indexOf(n), 1); return n; };
+      if (withExec) doc.execCommand = () => true;
+      boot(doc, win, () => ({ ok: true, json: () => Promise.resolve({}) }), []);
+      const pick = addr => { sel.value = addr; sel.dispatch('change'); };
+      const typed = () => { ed.dispatch('input'); };
+      return { win, ed, ta, sel, pick, typed, md: () => win.mdSerialize(ed) };
+    };
+    const E = (tag, text) => mkNode({ n: tag, a: {}, c: [{ t: text }] });
+    // What the serializer writes for the help signature, which is not canonical.
+    const canon = s => s.replace('__Help__', '**Help**');
+    const same = (a, b) => a.length === b.length && a.every((n, i) => n === b[i]);
+
+    const r = mkSwap(fx.reply, true);
+    r.pick('help@x.io');
+    eq('S28b untouched reply: the textarea is the alias body, byte for byte', r.ta.value, fx.reply.expect['help@x.io']);
+    eq('S28b and the editor shows the same body', r.md(), canon(fx.reply.expect['help@x.io']));
+    r.pick('sales@x.io');
+    eq('S28b one signature swaps for another, still byte for byte', r.ta.value, fx.reply.expect['sales@x.io']);
+    const salesNodes = r.ed.childNodes.slice();
+    r.pick('team@x.io');
+    eq('S28b two identities with the same signature: the body is the same', r.ta.value, fx.reply.expect['team@x.io']);
+    eq('S28b and so is the editor', r.md(), fx.reply.expect['team@x.io']);
+    ok('S28b (the blocks were swapped for equal ones)', !same(salesNodes, r.ed.childNodes));
+    r.pick('quote@x.io');
+    eq('S28b a signature that is a quote goes in', r.ta.value, fx.reply.expect['quote@x.io']);
+    r.pick('sales@x.io');
+    eq('S28b and comes out again', r.ta.value, fx.reply.expect['sales@x.io']);
+    r.pick('me@x.io');
+    eq('S28b back to no signature leaves the empty top line', r.ta.value, fx.reply.expect['me@x.io']);
+    eq('S28b in the editor too', r.md(), fx.reply.expect['me@x.io']);
+    r.pick('HELP@x.io');
+    eq('S28b and in again: the address matches without case', r.ta.value, fx.reply.expect['help@x.io']);
+
+    // Text typed above the signature stays, and the signature still swaps.
+    r.ed.childNodes.unshift(E('DIV', 'Hi there'));
+    r.typed();
+    r.pick('sales@x.io');
+    eq('S28b text above the signature is kept', r.ta.value, 'Hi there\n' + fx.reply.expect['sales@x.io']);
+
+    // An edited signature is the user's text now.
+    const sigAt = r.ed.childNodes.findIndex(n => n.nodeType === 1 && r.win.mdSerialize({ childNodes: [n] }) === 'Sales');
+    r.ed.childNodes[sigAt] = E('DIV', 'Sales, Bob');
+    r.typed();
+    const before = r.ed.childNodes.slice(), beforeTa = r.ta.value;
+    r.pick('help@x.io');
+    ok('S28b an edited signature is left alone', same(before, r.ed.childNodes));
+    eq('S28b and the textarea too', r.ta.value, beforeTa);
+    r.pick('sales@x.io');
+    eq('S28b the previous From moved on, so nothing matches later either', r.ta.value, beforeTa);
+
+    // No signature, but the user typed into the empty top line: no insert.
+    const t = mkSwap(fx.reply, true);
+    t.ed.childNodes[t.ed.childNodes.findIndex(n => n.nodeType === 1)] = E('DIV', 'Hello');
+    t.typed();
+    const tTa = t.ta.value;
+    t.pick('help@x.io');
+    eq('S28b a typed top line is not replaced by a signature', t.ta.value, tTa);
+
+    // A forward: its text is plain lines, not a quote, so the whole body is
+    // searched. The top signature is found first.
+    const f = mkSwap(fx.forward, true);
+    f.pick('sales@x.io');
+    eq('S28b forward: the signature goes on top', f.ta.value, fx.forward.expect['sales@x.io']);
+    f.pick('help@x.io');
+    eq('S28b forward: the top one swaps, not the line in the forwarded text', f.ta.value, fx.forward.expect['help@x.io']);
+    f.pick('me@x.io');
+    eq('S28b forward: and out again', f.ta.value, fx.forward.expect['me@x.io']);
+
+    // A draft whose first line only starts like the old signature: the swapped
+    // block is not the top line, so the textarea is written from the editor.
+    const d = mkSwap(fx.draft, true);
+    d.pick('me@x.io');
+    eq('S28b draft: the signature below the first line is swapped', d.ta.value, fx.draft.expect['me@x.io']);
+    eq('S28b draft: and the textarea is what the editor shows', d.ta.value, d.md());
+
+    // A blank compose with no signature has an empty editor.
+    const b = mkSwap(fx.blank, true);
+    ok('S28b blank compose starts empty', b.ed.classList.contains('is-empty'));
+    b.pick('help@x.io');
+    eq('S28b blank compose: the alias signature goes in', b.ta.value, fx.blank.expect['help@x.io']);
+    eq('S28b and the editor shows it', b.md(), canon(fx.blank.expect['help@x.io']));
+    ok('S28b and the placeholder goes', !b.ed.classList.contains('is-empty'));
+    b.pick('me@x.io');
+    eq('S28b and back out', b.ta.value, '');
+    eq('S28b the editor is empty again', b.md(), '');
+    ok('S28b and the placeholder is back', b.ed.classList.contains('is-empty'));
+
+    // Typed into a blank compose (Chrome keeps the first line as bare text).
+    const bt = mkSwap(fx.blank, true);
+    bt.ed.childNodes.push(mkNode({ t: 'Hello' }));
+    bt.typed();
+    bt.pick('help@x.io');
+    eq('S28b text typed into a blank compose is not replaced', bt.md(), 'Hello');
+
+    const off = mkSwap(fx.reply, false);
+    off.pick('help@x.io');
+    eq('S28b without the rich editor the body is left alone', off.ta.value, fx.reply.body);
   }
 
   // S30 — the Markdown help opens in a modal, and only where one can open.
