@@ -11,7 +11,7 @@
 // [1] Config + session -------------------------------------------------------
 
 define('APP_NAME', 'Emmmail');
-define('APP_VERSION', '0.1.0');
+define('APP_VERSION', '0.2.0');
 define('APP_DEBUG', (getenv('EMMMAIL_DEBUG') ?: '0') === '1');
 
 // Tabler icons (current-color outline set), embedded inline so the UI needs
@@ -498,8 +498,10 @@ function sanitize_html($html, bool $blockRemote = false, ?int &$blocked = null)
         // libxml strips the leading space/tab/CR/LF and %-escapes an inner tab,
         // so `ht&#9;tps:` goes out as a RELATIVE app URL and must get no target.
         // Anchors, relative and mailto: links keep their in-frame behaviour.
-        if ($tag === 'a' && isset($attrs['href'])
-          && preg_match('#^https?://#i', ltrim((string)$attrs['href'], " \t\r\n"))) {
+        if (
+          $tag === 'a' && isset($attrs['href'])
+          && preg_match('#^https?://#i', ltrim((string)$attrs['href'], " \t\r\n"))
+        ) {
           $child->setAttribute('target', '_blank');
           $child->setAttribute('rel', 'noopener noreferrer');
         }
@@ -1101,8 +1103,10 @@ function quota_storage_from_response($raw): ?array
       }
       continue;
     }
-    if ($variant === null && stripos((string)$key, 'STORAGE') === 0
-        && is_numeric($value['usage'] ?? null)) {
+    if (
+      $variant === null && stripos((string)$key, 'STORAGE') === 0
+      && is_numeric($value['usage'] ?? null)
+    ) {
       $variant = $value;
     }
   }
@@ -4967,16 +4971,22 @@ function server_lock(): array
   if ($provider === '' && $imapHost === '' && $smtpHost === '') {
     return ['locked' => false, 'error' => '', 'config' => null];
   }
-  $broken = ['locked' => true, 'config' => null,
-    'error' => 'Sign-in is unavailable: the mail server is not configured correctly. Please contact your administrator.'];
+  $broken = [
+    'locked' => true,
+    'config' => null,
+    'error' => 'Sign-in is unavailable: the mail server is not configured correctly. Please contact your administrator.'
+  ];
 
   if ($provider !== '') {
     $presets = server_presets();
     if (!isset($presets[$provider]) || $imapHost !== '' || $smtpHost !== '') {
       return $broken;
     }
-    return ['locked' => true, 'error' => '',
-      'config' => ['imap' => $presets[$provider]['imap'], 'smtp' => $presets[$provider]['smtp']]];
+    return [
+      'locked' => true,
+      'error' => '',
+      'config' => ['imap' => $presets[$provider]['imap'], 'smtp' => $presets[$provider]['smtp']]
+    ];
   }
   if ($imapHost === '' || $smtpHost === '') {
     return $broken;
@@ -6141,8 +6151,11 @@ function handle_undo_send(): void
   unset($_SESSION['undo_queue'][$token]);
   $location = undo_save_draft(imap_for_session(false), $entry);
   if ($location === null) {
-    json_out(['ok' => true, 'location' => null,
-      'error' => 'Send cancelled, but the message could not be saved to Drafts.']);
+    json_out([
+      'ok' => true,
+      'location' => null,
+      'error' => 'Send cancelled, but the message could not be saved to Drafts.'
+    ]);
   }
   json_out(['ok' => true, 'location' => $location]);
 }
@@ -6789,7 +6802,8 @@ function handle_settings(): void
     db_set_setting($me, 'send_as', send_as_format($sendAs));
     db_set_setting($me, 'send_as_signatures', (string)json_encode(
       send_as_signatures_clean($sendAs, $_POST['send_as_signature_for'] ?? null, $_POST['send_as_signatures'] ?? null),
-      JSON_INVALID_UTF8_SUBSTITUTE));
+      JSON_INVALID_UTF8_SUBSTITUTE
+    ));
     db_set_setting($me, 'show_remote_images', empty($_POST['show_remote_images']) ? '0' : '1');
     db_set_setting($me, 'signature', trim($_POST['signature'] ?? ''));
     db_set_setting($me, 'auto_poll', empty($_POST['auto_poll']) ? '0' : '1');
@@ -6830,14 +6844,15 @@ function handle_settings(): void
   $storage = $quota !== null
     ? ['mode' => 'quota'] + $quota
     : ['mode' => 'cache', 'reason' => $hadConnection ? 'unsupported' : 'unreachable']
-      + db_cached_storage($me);
+    + db_cached_storage($me);
   render_settings([
     'emails_per_page' => (int)user_setting('emails_per_page', DEFAULT_EMAILS_PER_PAGE),
     'display_name'    => (string)user_setting('display_name', strstr($me, '@', true) ?: $me),
     'send_as'         => (string)user_setting('send_as', ''),
     'send_as_signatures' => array_map(
       fn(array $alias) => $alias + ['signature' => signature_prefix($alias['address'], $me)],
-      send_as_parse((string)user_setting('send_as', ''), $me)),
+      send_as_parse((string)user_setting('send_as', ''), $me)
+    ),
     'account_email'   => $me,
     'show_remote_images' => user_setting('show_remote_images', DEFAULT_SHOW_REMOTE_IMAGES) === '1',
     'image_whitelist' => (string)user_setting('image_whitelist', ''),
@@ -6997,9 +7012,9 @@ function render_page(string $title, string $content, bool $authenticated): void
   // '"' and '#' out of the attribute.
   echo '<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,' . rawurlencode(
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
-    . '<rect width="32" height="32" rx="7" fill="#2e3440"/>'
-    . '<path d="M7 7h12v4h-8v3h7v4h-7v3h8v4h-12z" fill="#eceff4"/>'
-    . '<circle cx="24" cy="22" r="3" fill="#88c0d0"/></svg>'
+      . '<rect width="32" height="32" rx="7" fill="#2e3440"/>'
+      . '<path d="M7 7h12v4h-8v3h7v4h-7v3h8v4h-12z" fill="#eceff4"/>'
+      . '<circle cx="24" cy="22" r="3" fill="#88c0d0"/></svg>'
   ) . '">';
   // Apply the stored theme before first paint, so the page never flashes the
   // wrong palette. Falls through to the OS preference when nothing is stored.
@@ -11328,7 +11343,7 @@ function view_mailbox(array $d): string
       // refusal the rows roll back from. There is nowhere to file from Spam.
       . (empty($d['is_junk'])
         ? '<button type="button" class="btn btn-sm btn-warn-soft" data-bulk-action="spam" aria-label="Mark selected as spam">'
-          . icon('alert-triangle') . ' <span class="btn-label">Spam</span></button>'
+        . icon('alert-triangle') . ' <span class="btn-label">Spam</span></button>'
         : '')
       // Delete is the only irreversible one, so it takes the confirm dialog like
       // every other destructive action. The copy is built in PHP because whether
@@ -11443,8 +11458,8 @@ function view_mailbox(array $d): string
         // nowhere to file itself, so the row does not offer it there.
         . (empty($d['is_junk'])
           ? '<button type="button" class="icon-btn btn-warn-soft tip" data-tip="Spam" aria-label="Spam" '
-            . 'onclick="rowAction(' . (int)$e['uid'] . ', \'' . urlencode($d['current_folder']) . '\', \'?page=spam\', \'remove\')">'
-            . icon('alert-triangle') . '</button>'
+          . 'onclick="rowAction(' . (int)$e['uid'] . ', \'' . urlencode($d['current_folder']) . '\', \'?page=spam\', \'remove\')">'
+          . icon('alert-triangle') . '</button>'
           : '');
       if (!empty($d['is_trash'])) {
         $h .= '<form method="POST" action="?page=restore" style="display:inline" '
@@ -12276,8 +12291,11 @@ function view_compose(array $d): string
   // posted value again; this select is a convenience, not the gate.
   $identities = $d['identities'] ?? [];
   if (count($identities) > 1) {
-    $current = identity_resolve((string)($d['from'] ?? ''), $identities,
-      (string)($identities[0]['address'] ?? ''));
+    $current = identity_resolve(
+      (string)($d['from'] ?? ''),
+      $identities,
+      (string)($identities[0]['address'] ?? '')
+    );
     $h .= '<div class="compose-row compose-from">'
       . '<label for="compose-from">From</label>'
       . '<select id="compose-from" name="from" autocomplete="off">';
