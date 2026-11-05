@@ -47,92 +47,35 @@ knowledge **out** of this file; add it there and link it from here. Budget: 150 
   (~30ms warm).
 
 ## Plan status
-- **Code complete, browser pass NOT run:** `2026-10-19-server-lock-and-allowed-domains.md`.
-  Env server lock + domain allow-list, fail closed. Login email hints the first allowed domain.
-- **Deploy not run:** `2026-10-22-deploy-and-login-lock.md`, `bare.config.json` for
-  `webmail.abtz.co` (git-ignored, DB in `private/`). Its own lock was dropped in the merge
-  (`2026-10-23-resolve-login-lock-merge.md`): the deploy env must set
-  `EMMMAIL_PROVIDER=migadu`, **not** `EMMMAIL_FORCE_PRESET`, or the picker comes back.
-- **Code complete, browser pass NOT run:** `2026-10-24-favicon.md` — inline data: SVG "E."
-  (nord0/6/8) in `render_page()`.
-- **Code complete, browser pass NOT run:** `2026-10-24-message-links-new-tab.md` — body
-  `http(s)` links get `target=_blank`; sandbox adds `allow-popups(-to-escape-sandbox)`.
-- **Done, manually verified:** `2026-10-06-footer.md` — one `view_footer()` credit line in
-  `.login-footer` and `.sidebar-footer`. Light theme not seen.
-- **Code complete, browser pass NOT run:** `2026-10-05-threaded-conversations.md` — all 11
-  steps done, `just test` 2997 passed, 2 smoke skips. Schema v4 clears the `messages` cache
-  once (pre-threading rows carried no `References`) and adds `thread_key` (root = first
-  `References` token, else `In-Reply-To`, else own `Message-ID`; sentinel for id-less mail).
-  `sync_folder()` computes it; `overviewRange()`/`fetchOverviews()` export the ids, and
-  c-client already fetches `References` inside the same overview FETCH (the stub now answers
-  `HEADER.FIELDS`). Listings group via `db_list_threads()` **only when the whole folder is
-  cached** (`total <= cached`, not Drafts) — a partial window would double-show against the
-  flat live tail. New `?page=thread` reader (`THREAD_MAX_MESSAGES`=30, one move dialog,
-  active-`<details>` seam for the keyboard/`readerControl`). Cross-folder works because a
-  Sent reply shares the root; `handle_sync()` keeps Sent warm. Thread rows: read toggle posts
-  `thread=<key>`, the box picks all in-folder members. Fixed a shipped bug: rows cached
-  between the v4 migration and the extractor kept `thread_key=''` and all grouped into one
-  conversation; `db_count_unthreaded()` now makes `sync_decide()` purge such a folder once
-  (reason `unthreaded`), and `folder_view_data()` checks it so the rebuild happens on the
-  render. Browser pass owed: keyboard scoping, open/close iframe re-measure, count chip in
-  both themes at phone width, a live pre-v4 cache upgrade, and a real Sent reply joining an
-  Inbox thread.
-- **Code complete, browser pass NOT run:** `2026-10-02-bulk-actions.md` — steps 0-7 done.
-  Bulk mark read/unread, move, delete on the list view: `post_uids()` (three holes closed,
-  200 cap, order preserving), four `MailImap::*Many*` batch methods returning **int**, one
-  IMAP command per batch, `.mail-pick` + select-all + `.bulk-bar`, optimistic patching with
-  an exact undo, `x` to pick the cursor row, and `pickCount()` in `syncCanSwap()`. The four
-  batch return types are test-guarded because a `bool` there silently skips every cache
-  write (`if ($count > 0)` against `true` is false). The delete confirm copy now shares the
-  handler's resolver (`MailImap::findTrashFolderIn()` via `delete_is_permanent()`), so it
-  warns "permanently" when no Trash is resolvable instead of promising a move. `just test`
-  2790 passed, 2 smoke skips. Manual pass still owed: the picked tint on an unread row under
-  the pointer, `.bulk-bar` in both themes, `j`/`x` right after clicking a checkbox, and the
-  nested-`Deleted Items` account, whose copy should now read "permanently".
-- **Code complete, live pass NOT run:** `2026-10-05-bulk-selection-polish.md` — round
-  checkboxes, a "Select all" label, Space = `x` when a cursor exists, and the bulk bar
-  moved into the mailbox head with `@container` tiers so it never moves the list; the
-  select-all label doubles as the count ("18 selected"); on touch an idle row shows no picker or
-  actions (tap the avatar to start a selection); fixed bulk mark read/unread
-  removing its rows, the head dash surviving `pickReset()`, and the
-  paperclip repainted as an envelope by `setReadIcon()`; bulk read/unread now drops the selection
-  with the repaint, not the reply; `pickReset()` unchecks the row boxes too
-  (measured at 12 widths, see [knowledge/css-ui.md](knowledge/css-ui.md)). `just test`
-  2845 passed, 2 smoke skips.
-- **Code complete, browser pass NOT run:** `2026-10-05-stale-listing-immediate-sync.md` —
-  fixed the report that a fresh login showed "Synced 6 days ago" and did not sync: the header
-  cache survives logout and `folder_view_data()` only syncs a cold cache, while the poll
-  chain's first tick is a full period away. `view_mailbox()` now stamps `data-sync-stale="1"`
-  on the `.sync` chip via the pure `sync_is_stale()`, and the client syncs a stale listing at
-  boot (then the normal 60s chain); a fresh chip still waits its period. `just test` 2856
-  passed, 2 smoke skips. Browser pass owed: log in with a >1min cache and watch it correct on
-  load.
-- **Done, manually verified:** `2026-10-02-solid-toast-and-login-memory.md` — toasts are
-  opaque (`--surface` on `--text`, the type on the border; `--success` on `--surface` is only
-  3.7:1 at `.88rem`, so the text stays uncoloured), and the login page remembers
-  `emmmail-last-preset` + `emmmail-last-custom` beside the email. The memory is client-side
-  because the server has no email to look settings up by before one is typed. `just test` 2558
-  passed, 2 smoke skips. Browser pass: restore after reload, a failed submit saving all six
-  values, and both themes' toast colours.
-- **Done, not manually verified:** `2026-10-02-empty-folder-sidebar.md` — the folder list
-  cache now has two readers: the listings honour the 15 min TTL and re-LIST, every other page
-  (`cached_folder_list()`) serves the last copy whatever its age and never connects. Plus
-  `db_set_folder_list()` refusing an unencodable payload, `kb_folder_map()` always mapping
-  `i` => `INBOX`, and `view_sidebar()` rendering a `Folders are unavailable` note.
-  `just test` 2528 passed, 2 smoke skips. The browser pass is not done: the sidebar on
-  Settings after 15+ minutes of inbox idleness, and the note's look in light and dark.
-- **Done:** `2026-09-29-browser-notifications.md` (poll chain, title counter, opt-in
-  notifications, `auto_poll` switch replacing the *Sync period* select, settings rows with
-  dividers and a right-hand control column). `just test` 2512 passed, 2 smoke skips. Manual pass
-  by the user in Brave/macOS; Firefox, Safari, plain HTTP and idle stop not reported separately.
-  macOS Focus / Do Not Disturb hides banners (they land in Notification Center).
-- **Code complete, browser pass NOT run:** `2026-11-04-composer-autocomplete-keyboard.md` — ↑/↓ move the suggestion highlight and wrap; Enter picks only a highlighted row; Esc stays with `kbCloseAutocomplete()`. js S92.
-- **Code complete, browser pass NOT run:** `2026-11-04-list-spam-button.md` — row Spam + bulk Spam (no confirm), hidden inside Spam; `handle_spam()` batches `post_uids()` and refuses without a Junk mailbox. js S93.
-- **Code complete, browser pass NOT run:** `2026-11-04-selection-and-navigation-fixes.md` — shortcuts follow the selection; page 1 uses a partial cache; reader Spam lands Inbox; bulk count clears with the repaint. js S94/S95, imap partial page.
-- **Code complete, browser pass NOT run:** `2026-11-05-send-as-aliases.md` — manual Send-as list, composer From picker, reply auto-alias, reply-all self-exclusion; `just test` 3326 passed, 2 smoke skips.
-- **Code complete, browser pass NOT run:** `2026-11-05-per-identity-signatures.md` — one signature per identity (`send_as_signatures` JSON, no fall back); a From change swaps an unedited signature in the editor. js S28b.
-- **Deferred manual passes** — code done, browser check not run, because no harness can stand in for a real Safari/Firefox/mobile keyboard: markdown-compose step 8 (editor verified in Chromium only); keyboard-first-ux step 7 (cursor/ring, real `showModal` focus, native `<select>` Enter in the move dialog, pagination cursor restore, undo-send Cmd+Enter, login/touch inertness); instant-folder-switch click-through (needs IMAP creds).
-- Everything else is done. Keep each plan's `status:` header honest.
+Details, decisions and owed checks live in each plan; keep its `status:` header honest.
+
+**Code complete, browser pass NOT run** (what is owed, in brief):
+- `2026-11-05-undo-send-closes-composer.md` — plain-POST Send to Sent, undo bar on every page
+  (says logout cancels), Undo via Drafts, `compose_id` send-once. Owed: page moves, Undo with
+  attachment / no Drafts, closed tab, Back + Send, phone width.
+- `2026-11-05-per-identity-signatures.md` — `send_as_signatures`, From swap. Owed: Chrome +
+  Firefox Enter-at-signature, forward, draft.
+- `2026-11-05-send-as-aliases.md` — Send-as list, From picker, reply auto-alias.
+- `2026-11-04-selection-and-navigation-fixes.md`, `-composer-autocomplete-keyboard.md`,
+  `-list-spam-button.md`.
+- `2026-10-24-favicon.md`, `2026-10-24-message-links-new-tab.md`.
+- `2026-10-19-server-lock-and-allowed-domains.md` — env lock + allow-list, fail closed.
+- `2026-10-05-threaded-conversations.md` — owed: keyboard scoping, iframe re-measure, count chip
+  at phone width, live pre-v4 upgrade, a Sent reply joining an Inbox thread.
+- `2026-10-05-stale-listing-immediate-sync.md` — owed: login with a >1 min cache.
+- `2026-10-05-bulk-selection-polish.md`, `2026-10-02-bulk-actions.md` — owed: picked tint under
+  the pointer, `.bulk-bar` both themes, `j`/`x` after a checkbox click, nested `Deleted Items`.
+- `2026-10-02-empty-folder-sidebar.md` — owed: Settings sidebar after 15+ min idle, note in
+  both themes.
+- Deferred (no harness can do it): markdown-compose step 8 (only Chromium seen),
+  keyboard-first-ux step 7, instant-folder-switch click-through (needs IMAP creds).
+
+**Deploy not run:** `2026-10-22-deploy-and-login-lock.md` — the env must set
+`EMMMAIL_PROVIDER=migadu`, **not** `EMMMAIL_FORCE_PRESET` (see the 10-23 merge plan).
+
+**Done, manually verified:** `2026-10-06-footer.md` (light theme not seen),
+`2026-10-02-solid-toast-and-login-memory.md`, `2026-09-29-browser-notifications.md`
+(Brave/macOS only). Everything else is done.
 
 ## Open items
 - Open decision: drop the unused `search_cache` table (one migration + 3 dead helpers). Destructive; needs an explicit yes.
@@ -141,9 +84,9 @@ knowledge **out** of this file; add it there and link it from here. Budget: 150 
   `handle_read`/`reply`/`forward` ignore `selectFolder()`'s result (read-only, so it degrades to
   "message not found"); cron-driven sync needs a credential story; nested `INBOX.Deleted Items`
   is not recognised as Trash anywhere (pinned by a test; the delete copy now warns anyway).
-- Known, unfixed, from the 2026-10-02 plan: right after **Clear local cache** the sidebar is
-  empty until an inbox visit — `g i` still works, the other five roles do not. And a server
-  that sends a non-UTF-8 folder name makes every folder-list write fail, so the listings
-  re-LIST each visit. Both are documented in
-  [plans/2026-10-02-empty-folder-sidebar.md](plans/2026-10-02-empty-folder-sidebar.md).
-- **Fixed (browser pass NOT run):** empty Spam/Trash under a count; gate is `thread_folder_is_member()`, `db_list_threads()` drops Trash/Junk rows.
+- Known, unfixed (see `2026-10-02-empty-folder-sidebar.md`): after **Clear local cache** the
+  sidebar is empty until an inbox visit; a non-UTF-8 folder name makes every folder-list
+  write fail, so listings re-LIST each visit.
+- Known, unfixed: Undo opens a draft, which overwrites `forward_src`; a forward composer open
+  in another tab then attaches the draft's parts.
+- **Fixed (browser pass NOT run):** empty Spam/Trash under a count (`thread_folder_is_member()`).

@@ -247,7 +247,8 @@ running count since the tab was last focused. `tag: 'emmmail-inbox'` makes a sec
 second poll replace the banner instead of stacking, and `visibilitychange`/`focus` closes it
 and zeroes the total. `doc.hidden || !doc.hasFocus()` is the gate: telling a user about mail in
 a tab they are looking at is noise. A fixed tag plus a try/catch around the constructor covers
-Android Chrome, which grants permission and then throws.
+Android Chrome, which grants permission and then throws. macOS Focus / Do Not Disturb hides
+the banners (they land in Notification Center); that is not a bug.
 
 ## Conversations in the list and the reader
 A conversation row is an ordinary `.mail` row plus `data-thread`/`data-thread-uids`. Two

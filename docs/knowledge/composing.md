@@ -103,6 +103,8 @@ Two invariants that are easy to break:
 Sent reply surfaces) and the row's `data-uid` on the folder newest (for the cursor).
 `db_thread_members()` excludes Drafts/Trash/Junk. A conversation row's read toggle posts
 `thread=<key>` to `?page=markRead`; the box picks every in-folder member.
+`db_list_threads()` also drops Trash/Junk rows, and `thread_folder_is_member()` is the gate:
+without it Spam/Trash showed empty under a non-zero count.
 
 ## Drafts
 **IMAP has no update.** Saving an existing draft appends and then deletes the old copy, so
@@ -138,13 +140,31 @@ lines the source starts with; otherwise it is serialized. Without that position 
 could post a body that differs from the editor.
 
 ## Undo send
-A session queue, `$_SESSION['undo_queue']`. `handle_send` stores when the period is > 0, a JS
-countdown bar shows an Undo button, `handle_flush_undo` sends after expiry, and
-`handle_undo_send` cancels. All AJAX.
+A session queue, `$_SESSION['undo_queue']`. Send is a **plain POST** in both modes:
+`handle_send` queues (before any SMTP connect) and redirects to Sent, so the composer closes.
+`render_page()` shows `view_undo_bars()` on every signed-in page, outside `<main>` (which
+`loadMailbox()` replaces). The JS counts against a deadline (background tabs throttle
+timers), POSTs `flushUndo` at 0 (a late entry at once), and Undo POSTs `undoSend`, which
+cancels **first** and then saves the message to Drafts (`undo_save_draft()`) and returns its URL.
+A failed flush also goes to Drafts; if Drafts fails too the entry stays, and `tries` (a minute
+apart) drop it at `UNDO_FLUSH_TRIES`.
 
-**In a submit handler, round-trip feedback is unconditional; only the AJAX interception may be
-conditional.** The `if (undoSeconds <= 0) return;` sat *before* `markBusy(btn)`, so in the
-DEFAULT configuration (undo off) Send never spun and the nav bar never ran.
+**The new draft's UID** cannot be found by Message-ID (c-client has no `HEADER` search). It is
+the one `UNDELETED` UID at or above the `UIDNEXT` read before the append; anything else opens
+the Drafts list.
+
+**JSON handlers use `imap_for_session(false)`.** The default redirects to logout, and inside a
+`fetch()` that destroys the session and every queued message.
+
+**The session lock is the double-send guard.** Flush and undo hold it (file sessions), so two
+tabs cannot take one entry. Never add `session_write_close()` to either handler.
+
+**A composer sends once.** `render_compose()` stamps a `compose_id`; `compose_mark_sent()`
+records it on queue or send, and a repeat is refused. That is what makes Back to a sent
+composer safe, while Back after a *failed* send still gives the text back.
+
+**In a submit handler, round-trip feedback is unconditional.** The old AJAX path had
+`if (undoSeconds <= 0) return;` *before* `markBusy(btn)`, so with undo off Send never spun.
 
 ## POST overflow
 Past `post_max_size` PHP empties `$_POST` and `$_FILES`. `detect_post_overflow()` and

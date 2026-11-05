@@ -4532,15 +4532,18 @@ $m->setFolderMap(['sent' => 'My Sent', 'trash' => 'Waste']);
 // Without a real connection, getFolders() will fail, but the map is set.
 assert_true(true, 'setFolderMap does not throw');
 
-group('view_compose() includes undo_period_seconds');
+group('view_compose() carries no undo period');
 
+// The composer used to read it to post by AJAX and stay open. Send is a plain
+// POST now, so the period lives on the server only.
 $composeForm = view_compose([
   'csrf' => 'tok', 'to' => '', 'subject' => '', 'body' => '',
   'cc' => '', 'bcc' => '', 'forward_attachments' => [],
   'undo_period_seconds' => 15,
 ]);
-assert_contains('name="undo_period_seconds"', $composeForm, 'undo period hidden input present');
-assert_contains('value="15"', $composeForm, 'undo period value passed to compose');
+assert_not_contains('name="undo_period_seconds"', $composeForm, 'no undo period input in the composer');
+assert_eq(1, substr_count(file_get_contents(__DIR__ . '/../index.php'), "'undo_period_seconds' => (int)user_setting("),
+    'only the settings page reads the period for a view');
 
 group('view_sidebar() accepts folder map');
 
@@ -5660,18 +5663,125 @@ assert_contains("'own_addresses' => own_identity_addresses", $saSrc,
 assert_contains("'identities' => \$identities", $saSrc,
     'the compose paths pass the identity list to the view');
 
-group('undo-send reports a refused alias instead of dropping it');
+group('undo send: a failed flush moves the message to Drafts');
 
-$flushAt = strpos($saSrc, 'function handle_flush_undo()');
-$flushEnd = $flushAt === false ? false : strpos($saSrc, "\nfunction ", $flushAt + 10);
-$flushBody = ($flushAt !== false && $flushEnd !== false) ? substr($saSrc, $flushAt, $flushEnd - $flushAt) : '';
+$fnBody = function (string $src, string $name): string {
+    $at = strpos($src, 'function ' . $name . '(');
+    $end = $at === false ? false : strpos($src, "\nfunction ", $at + 10);
+    return ($at !== false && $end !== false) ? substr($src, $at, $end - $at) : '';
+};
+$flushBody = $fnBody($saSrc, 'handle_flush_undo');
 assert_contains("smtp_send(\$smtp, \$from,", $flushBody, 'the flush sends with the queued from');
-$okAt = strpos($flushBody, "if (!\$ok) {");
-$unsetAt = strpos($flushBody, "unset(\$_SESSION['undo_queue'][\$token]);", $okAt === false ? 0 : $okAt);
-assert_true($unsetAt !== false && $okAt !== false && $okAt < $unsetAt,
-    'the queue entry survives a failed send and is dropped only after success');
-assert_contains('res.ok', js_inline(), 'the flush client reads the JSON result');
-assert_contains('res.error', js_inline(), 'and shows the server error');
+assert_not_contains("'expired'", $flushBody, 'a late entry is sent, not dropped');
+assert_not_contains('session_write_close', $flushBody,
+    'the session lock stays held: it is what stops two tabs sending one message');
+assert_not_contains('imap_for_session()', $flushBody, 'no IMAP failure can redirect the fetch to logout');
+assert_contains('imap_for_session(false)', $flushBody, 'the IMAP step connects without the redirect');
+assert_contains("json_out(['ok' => true, 'gone' => true]);", $flushBody,
+    'a token another tab already handled is not an error');
+$failAt = strpos($flushBody, 'undo_save_draft(');
+assert_true($failAt !== false, 'a failed send is saved to Drafts');
+$failBody = $failAt === false ? '' : substr($flushBody, $failAt);
+assert_contains('if ($location !== null)', $failBody, 'the entry is dropped after a failure only once Drafts has it');
+assert_contains('UNDO_FLUSH_TRIES', $failBody, 'or once the tries are used up');
+assert_contains("'tries'", $failBody, 'and a failed save counts as a try');
+assert_eq(3, defined('UNDO_FLUSH_TRIES') ? constant('UNDO_FLUSH_TRIES') : null, 'three tries');
+
+group('undo send: Undo cancels first, then saves the draft');
+
+$undoBody = $fnBody($saSrc, 'handle_undo_send');
+$undoUnset = strpos($undoBody, "unset(\$_SESSION['undo_queue'][\$token]);");
+$undoSave = strpos($undoBody, 'undo_save_draft(imap_for_session(false), $entry)');
+assert_true($undoUnset !== false && $undoSave !== false && $undoUnset < $undoSave,
+    'the send is cancelled before anything can fail');
+assert_not_contains('session_write_close', $undoBody, 'and the lock is held here too');
+assert_contains('could not be saved to Drafts', $undoBody, 'a failed save says so');
+
+$saveBody = $fnBody($saSrc, 'undo_save_draft');
+$stAt = strpos($saveBody, 'statusFor(');
+$apAt = strpos($saveBody, 'appendToFolder(');
+$delAt = strpos($saveBody, 'deleteEmailByUid(');
+assert_true($stAt !== false && $apAt !== false && $delAt !== false && $stAt < $apAt && $apAt < $delAt,
+    'UIDNEXT is read before the append, and the old draft goes only after it');
+assert_contains('smtp_raw_with_bcc(', $saveBody, 'the draft keeps its Bcc');
+assert_contains("uidSet('UNDELETED')", $saveBody, 'the new UID is found without HEADER search (c-client has none)');
+assert_contains('?page=compose&draft=', $saveBody, 'the draft opens in the composer');
+assert_contains("'?page=folder&folder=' . urlencode(", $saveBody, 'or the Drafts list, when the UID is unknown');
+
+group('undo send: Send closes the composer');
+
+$sendBody = $fnBody($saSrc, 'handle_send');
+$queueAt = strpos($sendBody, 'if ($undoPeriod > 0)');
+$connAt = strpos($sendBody, 'smtp_connect(');
+assert_true($queueAt !== false && $connAt !== false && $queueAt < $connAt,
+    'the message is queued before any SMTP connection');
+$queueBody = $queueAt === false ? '' : substr($sendBody, $queueAt, $connAt - $queueAt);
+assert_not_contains('json_out(', $queueBody, 'the queue branch has no AJAX reply');
+assert_contains("redirect('?page=folder&folder=' . urlencode(", $queueBody, 'it goes to Sent, like a sent message');
+assert_not_contains("undoSeconds", js_inline(), 'the composer does not post by AJAX');
+assert_not_contains("alert(d.error", js_inline(), 'and its alert() error path is gone');
+
+group('view_undo_bars() shows each queued message');
+
+if (!function_exists('view_undo_bars')) {
+    failTest('view_undo_bars() exists');
+} else {
+    assert_eq('', view_undo_bars([], 100), 'no queue, no bars');
+    $bars = view_undo_bars([
+        'a"b' => ['expires' => 107],
+        'cd'  => ['expires' => 90],
+    ], 100);
+    assert_eq(1, substr_count($bars, 'class="undo-stack"'), 'one stack');
+    assert_eq(2, substr_count($bars, 'class="undo-bar"'), 'one bar per message');
+    assert_contains('data-undo-token="a&quot;b" data-undo-left="7"', $bars, 'the token is escaped, with the time left');
+    assert_contains('data-undo-token="cd" data-undo-left="0"', $bars, 'a late entry has no time left');
+    assert_contains('role="status"', $bars, 'the bar is announced');
+    assert_contains('<span class="undo-bar-countdown" aria-hidden="true">7s</span>', $bars, 'the ticking number is not');
+    assert_contains('<button type="button" class="btn btn-sm undo-bar-btn">Undo</button>', $bars, 'with an Undo button');
+    assert_contains('<span class="undo-bar-text">Sending message. Logging out cancels it. '
+        . 'Closing the window sends it on your next visit.</span>', $bars,
+        'the bar says what a logout and a closed window do; the JS rewrites it while it sends');
+}
+
+group('undo send: one composer sends once');
+
+$markBody = $fnBody($saSrc, 'compose_mark_sent');
+if (!function_exists('compose_mark_sent')) {
+    failTest('compose_mark_sent() exists');
+} else {
+    $prevIds = $_SESSION['sent_compose_ids'] ?? null;
+    $_SESSION['sent_compose_ids'] = [];
+    compose_mark_sent('');
+    assert_eq([], $_SESSION['sent_compose_ids'], 'a composer with no id is not recorded');
+    for ($i = 0; $i < 55; $i++) {
+        compose_mark_sent('c' . $i);
+    }
+    assert_eq(50, count($_SESSION['sent_compose_ids']), 'only the newest 50 are kept');
+    assert_true(isset($_SESSION['sent_compose_ids']['c54']) && !isset($_SESSION['sent_compose_ids']['c4']),
+        'the oldest go first');
+    $_SESSION['sent_compose_ids'] = $prevIds;
+}
+$dupAt = strpos($sendBody, "isset(\$_SESSION['sent_compose_ids'][\$composeId])");
+assert_true($dupAt !== false && $dupAt < strpos($sendBody, 'compose_recipients('),
+    'a second Send from the same composer is refused before anything else');
+assert_eq(2, substr_count($sendBody, 'compose_mark_sent($composeId);'), 'both the queue and the sent path record it');
+$markQueueAt = strpos($sendBody, 'compose_mark_sent($composeId);');
+assert_true($markQueueAt > $queueAt && $markQueueAt < $connAt, 'the queue records it');
+$markSentAt = strrpos($sendBody, 'compose_mark_sent($composeId);');
+$okFailAt = strpos($sendBody, "if (!\$ok) {");
+assert_true($okFailAt !== false && $markSentAt > $okFailAt, 'the sent path records it only after a good send');
+assert_contains("\$d['compose_id'] = bin2hex(random_bytes(", $fnBody($saSrc, 'render_compose'), 'every composer gets a fresh id');
+assert_contains('name="compose_id" value="abc"', view_compose(['csrf' => 't', 'to' => '', 'subject' => '', 'body' => '',
+    'cc' => '', 'bcc' => '', 'forward_attachments' => [], 'compose_id' => 'abc']), 'and posts it');
+assert_contains("time() - (int)(\$entry['last_try'] ?? 0) >= 60", $flushBody,
+    'a burst of failed page loads counts as one try');
+assert_contains('if ($authed) {' . "\n" . '    // Outside <main>', $fnBody($saSrc, 'render_page'),
+    'only a signed-in page shows the bars');
+$pageBody = $fnBody($saSrc, 'render_page');
+$barsAt = strpos($pageBody, 'view_undo_bars(');
+assert_true($barsAt !== false && $barsAt < strpos($pageBody, '<main class="app">'),
+    'every signed-in page shows the bars, outside the content that loadMailbox() replaces');
+assert_not_contains('--card-bg', css_inline(), 'the bar uses a token that exists');
 
 group('compose From select styling');
 

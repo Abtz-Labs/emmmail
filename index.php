@@ -72,6 +72,7 @@ define('LOGIN_WINDOW_SECONDS', 900);       // 15 min
 define('SEARCH_CACHE_TTL_SECONDS', 604800); // 7 days
 define('SCHEMA_VERSION', 4);               // see db_migration_step()
 define('FOLDER_LIST_TTL_SECONDS', 900);    // 15 min; LIST rarely changes
+define('UNDO_FLUSH_TRIES', 3);             // a queued message that can be neither sent nor saved
 define('SYNC_FULL_INTERVAL_SECONDS', 60);  // flag reconcile cadence
 define('SYNC_WINDOW', 500);                // newest N messages cached per folder
 define('SYNC_BACKFILL_BATCH', 20);         // attachment flags resolved per sync
@@ -4941,7 +4942,9 @@ function current_user(): ?string
 }
 
 // Build an IMAP connection for the logged-in user (or fail to login).
-function imap_for_session(): ?MailImap
+// $redirectOnFail = false is for the JSON handlers: a redirect to logout inside a
+// fetch() would destroy the session, and the undo queue with it.
+function imap_for_session(bool $redirectOnFail = true): ?MailImap
 {
   if (empty($_SESSION['email']) || empty($_SESSION['pass'])) {
     return null;
@@ -4951,6 +4954,9 @@ function imap_for_session(): ?MailImap
   $ic    = imap_config();
   $imap  = new MailImap($ic['server'], $ic['port'], $email, $pass, $ic['enc']);
   if (!$imap->isConnected()) {
+    if (!$redirectOnFail) {
+      return null;
+    }
     flash_set('error', 'Unable to connect to the mail server: ' . $imap->lastError);
     redirect('?page=logout');
   }
@@ -5553,7 +5559,6 @@ function handle_compose(): void
     'cc'          => '',
     'bcc'         => '',
     'forward_attachments' => [],
-    'undo_period_seconds' => (int)user_setting('undo_period_seconds', 0),
     'csrf'        => csrf_page_token(),
   ]);
 }
@@ -5601,7 +5606,6 @@ function handle_edit_draft(int $uid): void
     'in_reply_to' => $email['in_reply_to'] ?? '',
     'references'  => $email['references'] ?? '',
     'forward_attachments' => $email['attachments'],
-    'undo_period_seconds' => (int)user_setting('undo_period_seconds', 0),
     'csrf'        => csrf_page_token(),
   ]);
 }
@@ -5634,7 +5638,6 @@ function render_reply_form(bool $all): void
   $identities = send_as_identities($me);
   render_compose(reply_form_data($email, $me, $all, $identities) + [
     'identities' => $identities,
-    'undo_period_seconds' => (int)user_setting('undo_period_seconds', 0),
     'csrf' => csrf_page_token(),
   ]);
 }
@@ -5668,7 +5671,6 @@ function handle_forward(): void
     'cc'          => '',
     'bcc'         => '',
     'forward_attachments' => $email['attachments'],
-    'undo_period_seconds' => (int)user_setting('undo_period_seconds', 0),
     'csrf'        => csrf_page_token(),
   ]);
 }
@@ -5820,6 +5822,14 @@ function handle_send(): void
   }
   $me = (string)current_user();
 
+  // One composer sends once. Back can bring a sent composer back filled in (the
+  // bfcache, or a reload that restores the fields), with Send live again.
+  $composeId = is_string($_POST['compose_id'] ?? null) ? $_POST['compose_id'] : '';
+  if ($composeId !== '' && isset($_SESSION['sent_compose_ids'][$composeId])) {
+    flash_set('error', 'This message was already sent or queued.');
+    redirect('?page=folder&folder=' . urlencode(imap_for_session()->findSentFolder() ?: 'INBOX'));
+  }
+
   $identities = send_as_identities($me);
   $requested = is_string($_POST['from'] ?? null) ? $_POST['from'] : '';
   $identity = identity_resolve($requested, $identities, $me);
@@ -5853,20 +5863,14 @@ function handle_send(): void
 
   $attachments = compose_gather_attachments($imap);
 
-  // Build + send via SMTP.
-  $sc = smtp_config();
-  $smtp = smtp_connect($sc['server'], $sc['port'], $me, session_decrypt($_SESSION['pass']), $smtpErr, $sc['enc']);
-  if (!$smtp) {
-    flash_set('error', 'SMTP connection failed: ' . $smtpErr);
-    redirect('?page=compose');
-  }
-
   // $bcc is passed for completeness but never becomes a header: the blind
   // recipients are in the envelope below, and in the Sent copy further down.
   $raw = smtp_build_raw_message($from, $to, $subject, md_email_html($body), $fromName, $attachments, $cc, $bcc, $inReplyTo, $references, textBody: $body);
 
   // Undo send: when enabled, hold the message in the session for a configurable
-  // period so the user can cancel and edit before it actually goes out.
+  // period so the user can cancel and edit before it actually goes out. Queued
+  // before any SMTP connection: this request does not send. The composer
+  // closes, and every page shows the countdown (view_undo_bars()).
   $undoPeriod = (int)user_setting('undo_period_seconds', 0);
   if ($undoPeriod > 0) {
     $token = bin2hex(random_bytes(16));
@@ -5880,11 +5884,16 @@ function handle_send(): void
       'expires'     => time() + $undoPeriod,
       'draft_uid'   => (int)($_POST['draft_uid'] ?? 0),
     ];
-    if (request_wants_json($_POST, $_SERVER)) {
-      json_out(['ok' => true, 'undo' => true, 'token' => $token, 'seconds' => $undoPeriod]);
-    }
-    flash_set('success', 'Message queued. You have ' . $undoPeriod . ' seconds to undo.');
-    redirect('?page=inbox');
+    compose_mark_sent($composeId);
+    redirect('?page=folder&folder=' . urlencode($imap->findSentFolder() ?: 'INBOX'));
+  }
+
+  // Build + send via SMTP.
+  $sc = smtp_config();
+  $smtp = smtp_connect($sc['server'], $sc['port'], $me, session_decrypt($_SESSION['pass']), $smtpErr, $sc['enc']);
+  if (!$smtp) {
+    flash_set('error', 'SMTP connection failed: ' . $smtpErr);
+    redirect('?page=compose');
   }
 
   $ok = smtp_send($smtp, $from, $recipients, $raw, $smtpErr);
@@ -5894,6 +5903,7 @@ function handle_send(): void
     flash_set('error', 'Failed to send: ' . $smtpErr);
     redirect('?page=compose');
   }
+  compose_mark_sent($composeId);
 
   // Record recipients as contacts + append to Sent.
   $imap->selectFolder('INBOX');
@@ -5927,8 +5937,57 @@ function handle_send(): void
   redirect('?page=folder&folder=' . urlencode($sent ?: 'INBOX'));
 }
 
+// Remember a composer that was sent or queued, so handle_send() refuses it a
+// second time. The newest 50 are enough: each one is a page in this session.
+function compose_mark_sent(string $composeId): void
+{
+  if ($composeId === '') {
+    return;
+  }
+  $_SESSION['sent_compose_ids'][$composeId] = true;
+  $_SESSION['sent_compose_ids'] = array_slice($_SESSION['sent_compose_ids'], -50, null, true);
+}
+
+/**
+ * Save a queued message to Drafts and say where to open it. Used when the user
+ * presses Undo, and when a flush fails, so the text is never lost.
+ *
+ * Returns the URL of the new draft, the Drafts list when its UID is unknown, or
+ * null when nothing was saved. The c-client search has no HEADER key, so the new
+ * UID is the one at or above the UIDNEXT read before the append.
+ */
+function undo_save_draft(?MailImap $imap, array $entry): ?string
+{
+  $drafts = $imap ? $imap->findDraftsFolder() : null;
+  if (!$drafts) {
+    return null;
+  }
+  $uidnext = $imap->statusFor($drafts)['uidnext'] ?? null;
+  if (!$imap->appendToFolder($drafts, smtp_raw_with_bcc((string)$entry['raw'], (string)$entry['bcc']), '\\Draft \\Seen')) {
+    return null;
+  }
+  // Only now that the new copy exists is the old one expendable.
+  $me = (string)$entry['me'];
+  $draftUid = (int)($entry['draft_uid'] ?? 0);
+  if ($draftUid > 0 && $imap->selectFolder($drafts)) {
+    $imap->deleteEmailByUid($draftUid);
+    db_delete_messages($me, $drafts, [$draftUid]);
+  }
+  cache_invalidate_folder($me, $drafts);
+  $list = '?page=folder&folder=' . urlencode($drafts);
+  if ($uidnext === null || !$imap->selectFolder($drafts)) {
+    return $list;
+  }
+  $new = array_values(array_filter($imap->uidSet('UNDELETED') ?? [], fn(int $uid) => $uid >= $uidnext));
+  return count($new) === 1 ? '?page=compose&draft=' . $new[0] : $list;
+}
+
 // Cancel a queued undo-send message. The token identifies the entry in the
-// session's undo_queue.
+// session's undo_queue. The send is cancelled first, whatever happens next; the
+// message then goes to Drafts, and the client opens it.
+//
+// Flush and undo rely on the session lock: two tabs cannot both take one entry.
+// Never add session_write_close() to either handler.
 function handle_undo_send(): void
 {
   require_login();
@@ -5938,13 +5997,22 @@ function handle_undo_send(): void
   }
   $token = trim($_POST['token'] ?? '');
   if ($token === '' || !isset($_SESSION['undo_queue'][$token])) {
-    json_out(['ok' => false, 'error' => 'Message not found or already sent.']);
+    json_out(['ok' => false, 'error' => 'This message is no longer queued.']);
   }
+  $entry = $_SESSION['undo_queue'][$token];
   unset($_SESSION['undo_queue'][$token]);
-  json_out(['ok' => true]);
+  $location = undo_save_draft(imap_for_session(false), $entry);
+  if ($location === null) {
+    json_out(['ok' => true, 'location' => null,
+      'error' => 'Send cancelled, but the message could not be saved to Drafts.']);
+  }
+  json_out(['ok' => true, 'location' => $location]);
 }
 
-// Flush an undo-send message: actually send it after the countdown expires.
+// Flush an undo-send message: send it once the countdown is over. A late entry
+// (the tab was closed) is sent too. A failure moves the message to Drafts; if
+// that fails as well, the entry stays for the next page load, UNDO_FLUSH_TRIES
+// times at most.
 function handle_flush_undo(): void
 {
   require_login();
@@ -5954,34 +6022,51 @@ function handle_flush_undo(): void
   }
   $token = trim($_POST['token'] ?? '');
   if ($token === '' || !isset($_SESSION['undo_queue'][$token])) {
-    json_out(['ok' => false, 'error' => 'Message not found or already sent.']);
+    // Another tab, or a page restored from the cache, got here first.
+    json_out(['ok' => true, 'gone' => true]);
   }
   $entry = $_SESSION['undo_queue'][$token];
-
-  // Expired? Ignore silently — the window already passed.
-  if (time() > (int)$entry['expires']) {
-    unset($_SESSION['undo_queue'][$token]);
-    json_out(['ok' => true, 'expired' => true]);
-  }
 
   $me = $entry['me'];
   $from = (string)($entry['from'] ?? $me);
   $sc = smtp_config();
   $smtp = smtp_connect($sc['server'], $sc['port'], $me, session_decrypt($_SESSION['pass']), $smtpErr, $sc['enc']);
-  if (!$smtp) {
-    json_out(['ok' => false, 'error' => 'SMTP connection failed: ' . $smtpErr]);
+  if ($smtp) {
+    $ok = smtp_send($smtp, $from, $entry['recipients'], $entry['raw'], $smtpErr);
+    smtp_disconnect($smtp);
+    $error = $ok ? '' : 'Failed to send: ' . ($smtpErr ?: 'no reply from the server');
+  } else {
+    $error = 'SMTP connection failed: ' . ($smtpErr ?: 'no reply from the server');
   }
-  $ok = smtp_send($smtp, $from, $entry['recipients'], $entry['raw'], $smtpErr);
-  smtp_disconnect($smtp);
-  if (!$ok) {
-    json_out(['ok' => false, 'error' => 'Failed to send: ' . $smtpErr]);
+  $error = rtrim($error, '. ');
+  $imap = imap_for_session(false);
+  if ($error !== '') {
+    $location = undo_save_draft($imap, $entry);
+    if ($location !== null) {
+      unset($_SESSION['undo_queue'][$token]);
+      json_out(['ok' => false, 'error' => $error . '. The message is in Drafts.']);
+    }
+    // A burst of page loads while offline is one try, not three: tries count
+    // only a minute apart.
+    $tries = (int)($entry['tries'] ?? 0);
+    if (time() - (int)($entry['last_try'] ?? 0) >= 60) {
+      $tries++;
+      $_SESSION['undo_queue'][$token]['last_try'] = time();
+    }
+    if ($tries >= UNDO_FLUSH_TRIES) {
+      unset($_SESSION['undo_queue'][$token]);
+      json_out(['ok' => false, 'error' => $error . '. The message could not be sent or saved, and was dropped.']);
+    }
+    $_SESSION['undo_queue'][$token]['tries'] = $tries;
+    json_out(['ok' => false, 'error' => $error . '. It will be tried again.']);
   }
-  // The message is away. A failed send keeps the entry so the error is not
-  // followed by a silent loss.
+  // The message is away.
   unset($_SESSION['undo_queue'][$token]);
+  if (!$imap) {
+    json_out(['ok' => true]);
+  }
 
   // Record recipients + append to Sent.
-  $imap = imap_for_session();
   $imap->selectFolder('INBOX');
   foreach ($entry['recipients'] as $addr) {
     $addr = trim($addr);
@@ -6695,6 +6780,27 @@ function handle_contacts_api(): void
 
 // [8] Views ------------------------------------------------------------------
 
+// The undo-send countdown, on every signed-in page until the message is sent or
+// cancelled. Pure. The server owns the clock: each page load restarts the count
+// from what is left, and a late entry (0) is flushed at once by the JS. Only the
+// bar is a live region; the ticking number would be read out every second.
+function view_undo_bars(array $queue, int $now): string
+{
+  if ($queue === []) {
+    return '';
+  }
+  $h = '<div class="undo-stack">';
+  foreach ($queue as $token => $entry) {
+    $left = max(0, (int)($entry['expires'] ?? 0) - $now);
+    $h .= '<div class="undo-bar" role="status" data-undo-token="' . h((string)$token) . '" data-undo-left="' . $left . '">'
+      . '<span class="undo-bar-text">Sending message. Logging out cancels it. '
+      . 'Closing the window sends it on your next visit.</span>'
+      . '<span class="undo-bar-countdown" aria-hidden="true">' . $left . 's</span>'
+      . '<button type="button" class="btn btn-sm undo-bar-btn">Undo</button></div>';
+  }
+  return $h . '</div>';
+}
+
 function render_page(string $title, string $content, bool $authenticated): void
 {
   // Compress HTML responses. Enabled here, not globally, because
@@ -6784,6 +6890,10 @@ function render_page(string $title, string $content, bool $authenticated): void
     echo '<div class="toast toast-error" role="alert">' . h($flash['error']) . '</div>';
   }
   echo '</div>';
+  if ($authed) {
+    // Outside <main>: loadMailbox() swaps the list in place and must not take it.
+    echo view_undo_bars($_SESSION['undo_queue'] ?? [], time());
+  }
   echo '<main class="app">' . $content . '</main>';
   if ($authed) {
     echo '<dialog class="modal" id="delete-dialog">'
@@ -6878,6 +6988,8 @@ function render_read(array $email, int $uid, string $folder, string $me = '', ar
 
 function render_compose(array $d): void
 {
+  // A fresh id per composer: handle_send() sends each one once.
+  $d['compose_id'] = bin2hex(random_bytes(12));
   // The From select swaps signatures in the editor, so the view needs them all.
   $me = (string)current_user();
   foreach ($d['identities'] ?? [] as $i => $identity) {
@@ -7163,10 +7275,12 @@ body.nav-open .nav-backdrop { opacity:1; pointer-events:auto; }
 @media (prefers-reduced-motion:reduce) { .sync.syncing .sync-btn svg.ti { animation:none; } }
 
 /* --- Undo send bar ------------------------------------------------------ */
-.undo-bar { position:fixed; bottom:20px; left:50%; transform:translateX(-50%);
-  display:flex; align-items:center; gap:12px; padding:10px 20px;
-  background:var(--card-bg); border:1px solid var(--border-soft); border-radius:8px;
-  box-shadow:0 4px 12px rgba(0,0,0,0.15); z-index:1000; }
+/* Above the nav backdrop (50), below the open drawer (60). */
+.undo-stack { position:fixed; bottom:20px; left:50%; transform:translateX(-50%); z-index:55;
+  width:min(360px, calc(100vw - 32px)); display:flex; flex-direction:column; gap:8px; }
+.undo-bar { display:flex; align-items:center; gap:12px; padding:10px 20px;
+  background:var(--surface); border:1px solid var(--border-soft); border-radius:8px;
+  box-shadow:var(--shadow-md); }
 .undo-bar-text { font-size:0.9rem; }
 .undo-bar-countdown { font-weight:600; color:var(--accent); min-width:3ch; }
 .undo-bar-btn { margin-left:8px; }
@@ -8544,77 +8658,56 @@ function js_inline(): string
     // and the chrome bar runs. A normal submit navigates away and `pageshow`
     // clears both, so nothing has to un-spin it here.
     markBusy(btn);
-    // Check if undo send is enabled (hidden input added by PHP). Only the AJAX
-    // interception is conditional on it: with undo off the browser posts the
-    // form itself.
-    var undoInput = form.querySelector('input[name="undo_period_seconds"]');
-    var undoSeconds = undoInput ? parseInt(undoInput.value, 10) : 0;
-    if (undoSeconds <= 0) return;
-    ev.preventDefault();
-    var fd = new FormData(form);
-    fd.append('ajax', '1');
-    win.fetch(form.action, { method: 'POST', body: fd })
-      .then(function(r){ return r.json(); })
-      .then(function(d){
-        clearBusy();
-        if (!d.ok) {
-          alert(d.error || 'Send failed.');
+    // No AJAX, with undo on or off: the browser posts the form, the server
+    // sends or queues it, and the composer closes. A second Send from the same
+    // composer (Back) is refused by the server (compose_id).
+  });
+  // The undo-send bar, on every signed-in page (view_undo_bars()). It counts
+  // against a deadline, not by steps, because a background tab slows its
+  // timers. At 0 it flushes; Undo cancels, and opens the draft the server saved.
+  $('.undo-bar').each(function(){
+    var bar = this;
+    var token = bar.getAttribute('data-undo-token');
+    var end = Date.now() + (parseInt(bar.getAttribute('data-undo-left'), 10) || 0) * 1000;
+    var text = bar.querySelectorAll('.undo-bar-text')[0];
+    var cd = bar.querySelectorAll('.undo-bar-countdown')[0];
+    var btn = bar.querySelectorAll('.undo-bar-btn')[0];
+    var timer = null, done = false;
+    function drop(){ if (bar.parentNode) bar.parentNode.removeChild(bar); }
+    function json(r){ return r.json(); }
+    function tick(){
+      var ms = end - Date.now();
+      if (ms > 0) {
+        if (cd) cd.textContent = Math.ceil(ms / 1000) + 's';
+        timer = win.setTimeout(tick, ms % 1000 || 1000);
+        return;
+      }
+      // In flight: Undo can no longer win, so it goes.
+      done = true;
+      if (text) text.textContent = 'Sending\u2026';
+      [cd, btn].forEach(function(el){ if (el && el.parentNode) el.parentNode.removeChild(el); });
+      $.post('?page=flushUndo', { token: token }).then(json).then(function(res){
+        drop();
+        if (res && res.ok) {
+          if (!res.gone) win.toast('Message sent.', 'success');
           return;
         }
-        if (d.undo) {
-          // Show the undo countdown bar.
-          var bar = doc.createElement('div');
-          bar.className = 'undo-bar';
-          bar.innerHTML = '<span class="undo-bar-text">Message sent.</span>'
-            + '<span class="undo-bar-countdown">' + d.seconds + 's</span>'
-            + '<button type="button" class="btn btn-sm undo-bar-btn">Undo</button>';
-          doc.body.appendChild(bar);
-          var remaining = d.seconds;
-          var timer = win.setInterval(function(){
-            remaining--;
-            var cd = bar.querySelector('.undo-bar-countdown');
-            if (cd) cd.textContent = remaining + 's';
-            if (remaining <= 0) {
-              win.clearInterval(timer);
-              bar.remove();
-              // Flush the message.
-              var fd2 = new FormData();
-              fd2.append('csrf_token', form.querySelector('input[name="csrf_token"]').value);
-              fd2.append('token', d.token);
-              fd2.append('ajax', '1');
-              win.fetch('?page=flushUndo', { method: 'POST', body: fd2 })
-                .then(function(r){ return r.json(); })
-                .then(function(res){
-                  if (res && res.ok) return;
-                  win.toast((res && res.error) || 'Send failed.', 'error');
-                })
-                .catch(function(){ win.toast('Send failed.', 'error'); });
-            }
-          }, 1000);
-          bar.querySelector('.undo-bar-btn').addEventListener('click', function(){
-            win.clearInterval(timer);
-            bar.remove();
-            var fd3 = new FormData();
-            fd3.append('csrf_token', form.querySelector('input[name="csrf_token"]').value);
-            fd3.append('token', d.token);
-            fd3.append('ajax', '1');
-            win.fetch('?page=undoSend', { method: 'POST', body: fd3 })
-              .then(function(r){ return r.json(); })
-              .then(function(res){
-                if (res.ok) {
-                  // Re-enable form for editing.
-                  form.querySelector('button[type="submit"]').disabled = false;
-                }
-              });
-          });
-        } else {
-          win.location.href = '?page=inbox';
-        }
-      })
-      .catch(function(){
+        win.toast((res && res.error) || 'Send failed.', 'error');
+      }).catch(function(){ drop(); win.toast('Send failed.', 'error'); });
+    }
+    if (btn) $(btn).on('click', function(){
+      if (done) return;
+      done = true;
+      win.clearTimeout(timer);
+      markBusy(btn);
+      $.post('?page=undoSend', { token: token }).then(json).then(function(res){
+        if (res && res.location) { win.location.href = res.location; return; }
         clearBusy();
-        alert('Network error. Please try again.');
-      });
+        drop();
+        win.toast((res && res.error) || 'Undo failed.', 'error');
+      }).catch(function(){ clearBusy(); drop(); win.toast('Undo failed.', 'error'); });
+    });
+    tick();
   });
   // The sticky action row draws its separator only while it is stuck. A stuck
   // row sits 1px out of view (bottom:-1px), so it is never fully visible.
@@ -9816,6 +9909,9 @@ JS
     // the request went with it: the timer is gone, the chain is wedged, and the
     // mail that arrived in between is unseen. Start over, and check now.
     if (!ev || !ev.persisted) return;
+    // An undo bar from the cache shows a countdown that may be over: the server
+    // has the true queue, so ask it again.
+    if (doc.querySelector('.undo-bar')) { win.location.reload(); return; }
     syncBusy = false;
     syncStale = false;
     syncStopped = false;
@@ -11981,7 +12077,7 @@ function view_compose(array $d): string
   $h = '<div class="card">';
   $h .= '<form method="POST" action="?page=compose" class="compose-form" enctype="multipart/form-data">'
     . '<input type="hidden" name="csrf_token" value="' . h($d['csrf']) . '">'
-    . '<input type="hidden" name="undo_period_seconds" value="' . (int)($d['undo_period_seconds'] ?? 0) . '">'
+    . (!empty($d['compose_id']) ? '<input type="hidden" name="compose_id" value="' . h($d['compose_id']) . '">' : '')
     . (!empty($d['draft_uid']) ? '<input type="hidden" name="draft_uid" value="' . (int)$d['draft_uid'] . '">' : '')
     . (!empty($d['in_reply_to']) ? '<input type="hidden" name="in_reply_to_id" value="' . h($d['in_reply_to']) . '">' : '')
     . (!empty($d['references']) ? '<input type="hidden" name="references" value="' . h($d['references']) . '">' : '')

@@ -199,12 +199,13 @@ Limits:
    account display name. Add `Name <address>` to give it one.
 4. A failed send does not restore the composer text. This is true for every send
    failure, not only an address the provider refuses.
-5. The signature follows a From change only in the rich editor, and only while
+6. The signature follows a From change only in the rich editor, and only while
    the old signature is unchanged. With JavaScript off (or the plain textarea
    fallback), or after you edit the signature, change it by hand. Ctrl+Z after a
    swap is not reliable. A signature with an unclosed code fence is not swapped.
-5. If undo send is on and the flush fails, the error is shown, but the message is
-   not returned to the composer.
+5. If undo send is on and the send fails after the countdown, the message goes to
+   Drafts and the error says so. If Drafts cannot take it either, it is tried
+   again on later page loads (a minute apart), and dropped after 3 tries.
 
 ## Notifications
 
@@ -417,7 +418,13 @@ Each account configures its own copy of these (Settings page, stored per user):
   asks the server once a minute; turn this off and it asks only when you click
   the sync button. The interval is fixed, and a server-side throttle stops a
   burst of clicks from becoming a burst of IMAP work
-- Undo send: hold sent messages for a short window so a send can be recalled
+- Undo send: hold sent messages for a short window so a send can be recalled.
+  Send closes the composer and goes to Sent; a countdown bar with Undo shows on
+  every page until the message goes. Undo opens it again as a draft (Drafts
+  folder needed). A message whose countdown ended while the tab was closed is
+  sent at the next page load. The queue lives in the session: logging out
+  during the countdown drops it, and the bar says so. A composer sends once; Back to it and Send
+  again is refused
 
 Per browser, on the same page but outside that form, because it acts at once and
 never leaves the browser: notifications (see

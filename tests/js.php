@@ -418,6 +418,8 @@ function fakeTimers(win, start) {
   return {
     get now() { return now; },
     pending: () => queue.size,
+    // Move the clock without firing anything: a background tab whose timers run late.
+    jump(ms) { now += ms; },
     // Advance to `now + ms`, firing everything that comes due on the way. A
     // callback that reschedules inside the window fires in the same tick, so a
     // poll loop can be run to a fixed point.
@@ -1569,6 +1571,164 @@ async function main() {
     // is already busy, so the browser is told to hold its horses.
     const evDup = c.form.dispatch('submit');
     ok('S26 a second send while Send is busy is refused', evDup.defaultPrevented);
+  }
+
+  // S26b — Send is a plain POST with undo on too: the server queues it and
+  // the composer closes. An old page that still carries the period input must
+  // not bring the AJAX path back.
+  {
+    const doc = makeDoc(); buildMeta(doc);
+    const win = makeWin();
+    const c = buildCompose(doc);
+    const undo = doc.createElement('input'); undo.setAttribute('name', 'undo_period_seconds'); undo.value = '10';
+    c.form.appendChild(undo);
+    const calls = [];
+    boot(doc, win, () => ({ ok: true, json: () => Promise.resolve({ ok: true }) }), calls);
+    const ev = c.form.dispatch('submit', null, { submitter: c.send });
+    ok('S26b with undo on the browser posts the form itself', !ev.defaultPrevented);
+    ok('S26b and Send spins', c.send.classList.contains('busy'));
+    eq('S26b no AJAX send', calls.length, 0);
+
+    // Back to this page keeps the text: the server refuses a second Send.
+    win.dispatch('pageshow', { persisted: true });
+    eq('S26b Back to a composer keeps it (the server guards the resend)', win._reloads, 0);
+  }
+
+  // S26c — the undo bar, on any page: it counts down against a deadline,
+  // flushes at 0, and Undo opens the draft the server saved.
+  {
+    const mkBar = (left, reply) => {
+      const doc = makeDoc(); buildMeta(doc);
+      const win = makeWin();
+      const clock = fakeTimers(win);
+      const toasts = doc.createElement('div'); toasts.className = 'toast-container'; doc.add(toasts);
+      const nav = doc.createElement('div'); nav.className = 'nav-progress'; doc.add(nav);
+      const stack = doc.createElement('div'); stack.className = 'undo-stack';
+      const bar = doc.createElement('div'); bar.className = 'undo-bar';
+      bar.setAttribute('data-undo-token', 'tok1'); bar.setAttribute('data-undo-left', String(left));
+      const text = doc.createElement('span'); text.className = 'undo-bar-text'; text.textContent = 'Sending message.';
+      // Not the server's number, so the first write is the JS's own.
+      const cd = doc.createElement('span'); cd.className = 'undo-bar-countdown'; cd.textContent = '99s';
+      const btn = doc.createElement('button'); btn.className = 'btn btn-sm undo-bar-btn';
+      bar.appendChild(text); bar.appendChild(cd); bar.appendChild(btn); stack.appendChild(bar);
+      doc.add(stack);
+      const calls = [];
+      boot(doc, win, url => ({ ok: true, json: () => Promise.resolve(reply(url)) }), calls);
+      return { doc, win, clock, toasts, nav, stack, bar, text, cd, btn, calls,
+        gone: () => stack.children.indexOf(bar) === -1 };
+    };
+    const toastText = t => t.toasts.children.map(x => x.textContent).join('|');
+    const toastKind = t => t.toasts.children.map(x => x.className).join('|');
+
+    const s = mkBar(3, () => ({ ok: true }));
+    eq('S26c the countdown starts at the server value', s.cd.textContent, '3s');
+    await s.clock.tick(1000);
+    eq('S26c and ticks down', s.cd.textContent, '2s');
+    eq('S26c nothing is posted yet', s.calls.length, 0);
+    await s.clock.tick(2000);
+    eq('S26c at 0 it flushes', s.calls.length, 1);
+    eq('S26c to flushUndo', s.calls[0] && s.calls[0].url, '?page=flushUndo');
+    ok('S26c with the token and the csrf token', s.calls[0] && s.calls[0].body.indexOf('token=tok1') !== -1
+      && s.calls[0].body.indexOf('csrf_token=' + TOKEN) !== -1);
+    await settle(); await settle();
+    ok('S26c a sent message drops its bar', s.gone());
+    eq('S26c and says so', toastText(s), 'Message sent.');
+    eq('S26c as a success', toastKind(s), 'toast toast-success');
+    s.clock.restore();
+
+    // A background tab fires its timer late. The bar shows the deadline, not
+    // the number of ticks it got.
+    const th = mkBar(10, () => ({ ok: true }));
+    th.clock.jump(5500);
+    await th.clock.tick(0);
+    eq('S26c a late timer shows the real time left', th.cd.textContent, '5s');
+    // The page comes back from the bfcache: its countdown may be over.
+    th.win.dispatch('pageshow', { persisted: true });
+    eq('S26c a cached page with an undo bar asks the server again', th.win._reloads, 1);
+    th.clock.restore();
+
+    // At 0 the request is in flight: Undo is gone and the text says so.
+    const w = mkBar(1, () => new Promise(() => {}));
+    await w.clock.tick(1000);
+    eq('S26c while it sends the bar says so', w.text.textContent, 'Sending\u2026');
+    ok('S26c and has no Undo button', w.bar.children.indexOf(w.btn) === -1);
+    w.btn.dispatch('click');
+    eq('S26c a stale Undo click posts nothing', w.calls.length, 1);
+    w.clock.restore();
+
+    const late = mkBar(0, () => ({ ok: true, gone: true }));
+    await late.clock.tick(0);
+    eq('S26c a late message flushes at once', late.calls.length, 1);
+    await settle(); await settle();
+    ok('S26c a message another tab handled drops its bar', late.gone());
+    eq('S26c without a toast', toastText(late), '');
+    late.clock.restore();
+
+    const bad = mkBar(0, () => ({ ok: false, error: 'Failed to send: 550. The message is in Drafts.' }));
+    await bad.clock.tick(0); await settle(); await settle();
+    eq('S26c a failed send shows the server error', toastText(bad), 'Failed to send: 550. The message is in Drafts.');
+    eq('S26c as an error', toastKind(bad), 'toast toast-error');
+    ok('S26c and drops the bar', bad.gone());
+    bad.clock.restore();
+
+    const u = mkBar(5, url => url === '?page=undoSend' ? { ok: true, location: '?page=compose&draft=42' } : { ok: true });
+    u.btn.dispatch('click');
+    eq('S26c Undo posts undoSend', u.calls[0] && u.calls[0].url, '?page=undoSend');
+    ok('S26c with the token', u.calls[0] && u.calls[0].body.indexOf('token=tok1') !== -1);
+    await settle(); await settle();
+    eq('S26c and opens the saved draft', u.win.location.href, '?page=compose&draft=42');
+    await u.clock.tick(6000);
+    eq('S26c an undone message is never flushed', u.calls.length, 1);
+    u.clock.restore();
+
+    const un = mkBar(5, url => url === '?page=undoSend'
+      ? { ok: true, location: null, error: 'Send cancelled, but the message could not be saved to Drafts.' } : { ok: true });
+    un.btn.dispatch('click');
+    await settle(); await settle();
+    eq('S26c a failed draft save says so', toastText(un), 'Send cancelled, but the message could not be saved to Drafts.');
+    ok('S26c and the bar goes', un.gone());
+    eq('S26c nothing to open', un.win.location.href, undefined);
+    ok('S26c and the Undo wait is over', !un.nav.classList.contains('loading'));
+    un.clock.restore();
+
+    const gone = mkBar(5, url => url === '?page=undoSend' ? { ok: false, error: 'This message is no longer queued.' } : { ok: true });
+    gone.btn.dispatch('click');
+    ok('S26c Undo reports the wait', gone.nav.classList.contains('loading'));
+    await settle(); await settle();
+    eq('S26c an Undo the server cannot match says so', toastText(gone), 'This message is no longer queued.');
+    ok('S26c and clears the wait', !gone.nav.classList.contains('loading'));
+    gone.clock.restore();
+
+    const notJson = r => ({ ok: true, json: () => Promise.reject(new SyntaxError('not json')) });
+    {
+      const doc = makeDoc(); buildMeta(doc);
+      const win = makeWin();
+      const toasts = doc.createElement('div'); toasts.className = 'toast-container'; doc.add(toasts);
+      const stack = doc.createElement('div'); stack.className = 'undo-stack';
+      const bar = doc.createElement('div'); bar.className = 'undo-bar';
+      bar.setAttribute('data-undo-token', 't'); bar.setAttribute('data-undo-left', '0');
+      stack.appendChild(bar); doc.add(stack);
+      boot(doc, win, notJson, []);
+      await settle(); await settle();
+      eq('S26c a reply that is not JSON still ends the wait', toasts.children.map(x => x.textContent).join('|'), 'Send failed.');
+      ok('S26c and drops the bar', stack.children.indexOf(bar) === -1);
+    }
+    {
+      const doc = makeDoc(); buildMeta(doc);
+      const win = makeWin();
+      const nav = doc.createElement('div'); nav.className = 'nav-progress'; doc.add(nav);
+      const toasts = doc.createElement('div'); toasts.className = 'toast-container'; doc.add(toasts);
+      const stack = doc.createElement('div'); stack.className = 'undo-stack';
+      const bar = doc.createElement('div'); bar.className = 'undo-bar';
+      bar.setAttribute('data-undo-token', 't'); bar.setAttribute('data-undo-left', '30');
+      const btn = doc.createElement('button'); btn.className = 'undo-bar-btn';
+      bar.appendChild(btn); stack.appendChild(bar); doc.add(stack);
+      boot(doc, win, () => { throw new Error('offline'); }, []);
+      btn.dispatch('click');
+      await settle(); await settle();
+      eq('S26c an Undo with no network says so', toasts.children.map(x => x.textContent).join('|'), 'Undo failed.');
+      ok('S26c and clears the wait', !nav.classList.contains('loading'));
+    }
   }
 
   // S27 — the editor's DOM back to Markdown. Trees from PHP are real
