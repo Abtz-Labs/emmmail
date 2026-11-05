@@ -19,6 +19,12 @@ a single red line rather than a dead half-suite, hiding roughly 190 tests.
 **When a suite count jumps by hundreds, suspect a stub gap, not new coverage.** Same family as
 the old missing `hasAttribute()`.
 
+## The IMAP stub latches capabilities
+c-client reads capabilities from the greeting and keeps them for the connection. If a test
+adds `QUOTA` to the scenario after `connect()`, that stream can never issue
+`GETQUOTAROOT`. Write the scenario first, then `connect()`, then `resetLog()`. The stub
+writes its greeting at accept time for this reason.
+
 ## Source-level guards
 This repo already uses them, and they are the only way to test some things:
 

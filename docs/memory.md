@@ -50,6 +50,8 @@ knowledge **out** of this file; add it there and link it from here. Budget: 150 
 Details, decisions and owed checks live in each plan; keep its `status:` header honest.
 
 **Code complete, browser pass NOT run** (what is owed, in brief):
+- `2026-11-05-provider-storage-usage.md` — Settings storage card: RFC 2087 QUOTA, or
+  cached-message estimate. Owed: Gmail live, a non-QUOTA server, both themes, phone width.
 - `2026-11-05-undo-send-closes-composer.md` — plain-POST Send to Sent, undo bar on every page
   (says logout cancels), Undo via Drafts, `compose_id` send-once. Owed: page moves, Undo with
   attachment / no Drafts, closed tab, Back + Send, phone width.

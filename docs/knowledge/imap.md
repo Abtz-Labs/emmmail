@@ -22,6 +22,22 @@ live test against an unreachable host — there is no other way to bound that co
 - `imap_errors()` must be **drained** after a failed CREATE/DELETE, or c-client's queued
   error is dumped at PHP shutdown against whatever ran last.
 
+## QUOTA
+`imap_get_quotaroot($conn, 'INBOX')` is the one provider-neutral storage source: RFC 2087
+`GETQUOTAROOT`. c-client gates it on the server's QUOTA capability, so a server without
+it gets **no command** but still queues `Quota not available on this IMAP server`; drain
+`imap_errors()` after the call or PHP prints it at shutdown. The connection may be
+half-open with no mailbox selected, and the mailbox argument is sent verbatim (no server
+prefix).
+
+- The response is in **1024-octet units**, not bytes. Multiply by 1024.
+- ext-imap returns a nested `STORAGE => ['usage','limit']` plus flat `usage`/`limit`
+  siblings. Only the nested array is authoritative; `MESSAGE` is a message-count quota,
+  not storage.
+- `limit <= 0` means no limit, not zero bytes. An OK with no quota data yields `[]`.
+- Gmail advertises QUOTA. iCloud, Outlook and Yahoo do not.
+- Capability is latched per connection from the greeting, not re-read per command.
+
 ## Batching
 **No CONDSTORE/QRESYNC. No batched BODYSTRUCTURE API** — but c-client's lookahead *does* batch
 it, if the structures are requested ASCENDING and BEFORE the envelopes. That was the single

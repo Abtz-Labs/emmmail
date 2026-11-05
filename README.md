@@ -89,6 +89,10 @@ That's the whole stack.
   highlight, Enter picks it)
 - Per-account settings (messages per page, display name, send-as addresses,
   signature, automatic check, undo send, remote images, protected-folder map)
+- Provider storage usage on Settings: a percentage and bar when the mail server
+  reports it through IMAP QUOTA (RFC 2087), otherwise an approximate total from
+  the local header cache, labelled as such (see
+  [Storage usage](#storage-usage))
 - Session-based authentication with IP binding and rate-limit on logins;
   the login page remembers the last email used and the mail-server settings
   (the preset, or your own IMAP/SMTP fields), focuses the field you still
@@ -432,6 +436,24 @@ Each account configures its own copy of these (Settings page, stored per user):
 Per browser, on the same page but outside that form, because it acts at once and
 never leaves the browser: notifications (see
 [Notifications](#notifications)).
+
+### Storage usage
+
+Settings shows the account's storage when the mail server reports it through the
+IMAP QUOTA extension (RFC 2087): a percentage, a bar, and "used of limit". Gmail
+and many Dovecot/Cyrus servers report it. iCloud, Outlook and Yahoo do not
+advertise QUOTA; Migadu's limits are soft and shared across the account, so it
+may not report a per-mailbox figure. There is no "Get storage" or "Clean up
+space" link.
+
+When the server does not report storage, the card shows an approximate total: the
+size of the messages whose headers are already in the local cache. It covers the
+folders this app has opened, not the whole mailbox, and the card says so. The
+SQLite file size is not used; it is a small header index, not the mailbox.
+
+Checking the provider costs one IMAP connection when Settings opens. If the server
+is unreachable, the page stays usable and shows the cached estimate instead of
+ending the session.
 
 ## Projects / Pages
 

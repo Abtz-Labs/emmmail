@@ -4520,6 +4520,164 @@ $noSig = view_settings([
 assert_contains('id="auto-poll" name="auto_poll" value="1" checked', $noSig, 'the automatic check defaults to on');
 assert_contains('value="0"', $noSig, 'undo period defaults to off');
 
+// ------------------------------------------------------ storage usage ----+
+
+group('format_bytes() renders storage sizes');
+
+if (!function_exists('format_bytes')) {
+  failTest('format_bytes() exists');
+} else {
+  assert_eq('0 B', format_bytes(0), 'zero bytes');
+  assert_eq('1023 B', format_bytes(1023), 'under a kilobyte');
+  assert_eq('1 KB', format_bytes(1024), 'one kilobyte');
+  assert_eq('1.5 KB', format_bytes(1536), 'fractional kilobytes');
+  assert_eq('1 MB', format_bytes(1024 * 1024), 'one megabyte');
+  assert_eq('1 MB', format_bytes(1048575), 'rounds up to the next unit, never 1024 KB');
+  assert_eq('15 MB', format_bytes(15 * 1024 * 1024), 'whole megabytes');
+  assert_eq('15 GB', format_bytes(15 * 1024 * 1024 * 1024), 'whole gigabytes');
+  assert_eq('3.88 GB', format_bytes((int)round(3.88 * 1024 * 1024 * 1024)), 'two decimals below 10');
+}
+
+group('quota_storage_from_response() normalises RFC 2087 KB');
+
+if (!function_exists('quota_storage_from_response')) {
+  failTest('quota_storage_from_response() exists');
+} else {
+  // The exact shape ext-imap returns: a nested resource array plus flat
+  // siblings. MESSAGE is an array; the flat usage/limit are integers, so a
+  // scan that assumes every value is an array crashes on a live server.
+  $realQuota = [
+    'STORAGE' => ['usage' => 1024, 'limit' => 2048],
+    'MESSAGE' => ['usage' => 5, 'limit' => 10],
+    'usage'   => 1024,
+    'limit'   => 2048,
+  ];
+  assert_eq(['used' => 1048576, 'limit' => 2097152], quota_storage_from_response($realQuota),
+    'nested STORAGE is in KB');
+  assert_eq(['used' => 1048576, 'limit' => null],
+    quota_storage_from_response(['storage' => ['usage' => 1024, 'limit' => 0]]),
+    'lowercase key; a zero limit is unknown');
+  assert_eq(['used' => 1048576, 'limit' => 2097152],
+    quota_storage_from_response(['STORAGE-2' => ['usage' => 1024, 'limit' => 2048]]),
+    'a resource variant beginning with STORAGE is accepted');
+  assert_eq(null, quota_storage_from_response([]), 'an empty response is no data');
+  assert_eq(null, quota_storage_from_response(['MESSAGE' => ['usage' => 5, 'limit' => 10]]),
+    'MESSAGE-only is not storage');
+  assert_eq(null, quota_storage_from_response(['STORAGE' => ['limit' => 10]]),
+    'a missing usage is unusable');
+}
+
+group('quota_percent() clamps the bar');
+
+if (!function_exists('quota_percent')) {
+  failTest('quota_percent() exists');
+} else {
+  assert_eq(27, quota_percent(4 * 1024 * 1024 * 1024, 15 * 1024 * 1024 * 1024),
+    '4 of 15 GB is 27%');
+  assert_eq(0, quota_percent(0, 100), 'zero usage');
+  assert_eq(100, quota_percent(200, 100), 'over quota clamps to 100');
+  assert_eq(null, quota_percent(1, null), 'no limit is no percentage');
+  assert_eq(null, quota_percent(1, 0), 'a zero limit is no percentage');
+}
+
+group('db_cached_storage() sums the header cache per user');
+
+if (!function_exists('db_cached_storage')) {
+  failTest('db_cached_storage() exists');
+} else {
+  $storageUser = 'storage-unit@example.com';
+  $storageOther = 'storage-other@example.com';
+  db_upsert_messages($storageUser, 'INBOX', [
+    ['uid' => 1, 'subject' => 'a', 'date_ts' => 1, 'size' => 1000],
+    ['uid' => 2, 'subject' => 'b', 'date_ts' => 2, 'size' => 2000],
+  ]);
+  db_upsert_messages($storageOther, 'INBOX', [
+    ['uid' => 1, 'subject' => 'c', 'date_ts' => 1, 'size' => 9000],
+  ]);
+  $estimate = db_cached_storage($storageUser);
+  assert_eq(3000, $estimate['used'], 'sums only this user');
+  assert_eq(2, $estimate['cached'], 'counts only this user');
+  assert_eq(['used' => 0, 'cached' => 0], db_cached_storage('storage-empty@example.com'),
+    'no rows is zero');
+}
+
+group('view_settings() renders storage for both providers');
+
+$storageBase = [
+  'csrf' => 'tok', 'emails_per_page' => 20, 'display_name' => 'Test',
+  'show_remote_images' => false, 'image_whitelist' => '', 'signature' => '',
+  'auto_poll' => true, 'undo_period_seconds' => 0,
+  'protected_folders' => '{}', 'folder_list' => [], 'cached_messages' => 0,
+];
+$quotaCard = view_settings($storageBase + ['storage' => [
+  'mode' => 'quota',
+  'used' => 4 * 1024 * 1024 * 1024,
+  'limit' => 15 * 1024 * 1024 * 1024,
+]]);
+assert_contains('class="card cache-card storage-card"', $quotaCard, 'the card is a settings card');
+assert_contains('27% of 15 GB used', $quotaCard, 'percentage and limit');
+assert_contains('role="progressbar"', $quotaCard, 'the bar is accessible');
+assert_contains('4 GB of 15 GB', $quotaCard, 'used and limit in detail');
+assert_contains('Reported by your mail provider.', $quotaCard, 'says where the number comes from');
+assert_not_contains('Get storage', $quotaCard, 'no upsell');
+assert_not_contains('Clean up space', $quotaCard, 'no cleanup nudge');
+
+$noLimitCard = view_settings($storageBase + ['storage' => [
+  'mode' => 'quota', 'used' => 5 * 1024 * 1024 * 1024, 'limit' => null,
+]]);
+assert_contains('5 GB used', $noLimitCard, 'quota without a limit still shows usage');
+assert_contains('No storage limit is set.', $noLimitCard, 'and says the limit is unknown');
+assert_not_contains('class="storage-bar"', $noLimitCard, 'no bar without a limit');
+
+$cacheCard = view_settings($storageBase + ['storage' => [
+  'mode' => 'cache', 'reason' => 'unsupported', 'used' => 36 * 1024 * 1024, 'cached' => 561,
+]]);
+assert_contains('About 36 MB used', $cacheCard, 'the estimate is named as an estimate');
+assert_contains('Your provider does not report usage.', $cacheCard, 'the note says why it is an estimate');
+assert_contains('Size inferred from 561 messages currently cached.', $cacheCard, 'the note says what it counted');
+assert_not_contains('class="storage-bar"', $cacheCard, 'no bar without a limit');
+
+$emptyCacheCard = view_settings($storageBase + ['storage' => [
+  'mode' => 'cache', 'reason' => 'unsupported', 'used' => 0, 'cached' => 0,
+]]);
+assert_contains('No message headers cached yet', $emptyCacheCard, 'empty cache says so');
+assert_contains('Your provider does not report usage.', $emptyCacheCard, 'and still says why');
+assert_not_contains('Size inferred from', $emptyCacheCard, 'no size line when nothing is cached');
+
+$downCached = view_settings($storageBase + ['storage' => [
+  'mode' => 'cache', 'reason' => 'unreachable', 'used' => 12 * 1024 * 1024, 'cached' => 3,
+]]);
+assert_contains('About 12 MB used', $downCached, 'a dead server still shows the cached estimate');
+assert_contains('Could not reach the mail server.', $downCached, 'and names the connection, not the provider');
+assert_contains('Size inferred from 3 messages currently cached.', $downCached, 'the size line is still there');
+assert_not_contains('Your provider does not report usage.', $downCached, 'never blames the provider for a connection failure');
+
+$downCard = view_settings($storageBase + ['storage' => [
+  'mode' => 'cache', 'reason' => 'unreachable', 'used' => 0, 'cached' => 0,
+]]);
+assert_contains('Could not reach the mail server.', $downCard, 'a dead server is named, not blamed on the provider');
+assert_contains('No message headers cached yet', $downCard, 'empty cache says so');
+assert_not_contains('Size inferred from', $downCard, 'no size line when nothing is cached');
+
+$noStorage = view_settings($storageBase);
+assert_not_contains('storage-card', $noStorage, 'no storage data means no card');
+
+group('handle_settings() checks storage without logging the user out (source-level)');
+
+$storageSrc = (string)file_get_contents(__DIR__ . '/../index.php');
+if (preg_match('/function handle_settings\(\).*?\n\}/s', $storageSrc, $settingsFn)) {
+  assert_contains('imap_for_session(false)', $settingsFn[0],
+    'a failed quota probe does not redirect to logout');
+  assert_contains("storageQuota('INBOX')", $settingsFn[0],
+    'the settings page asks the provider for storage');
+  assert_contains('detect_folder_map($imap)', $settingsFn[0],
+    'detection reuses the storage connection');
+  assert_not_contains('detect_folder_map()', $settingsFn[0],
+    'a failed probe never opens a second connection that redirects to logout');
+} else {
+  failTest('handle_settings() is findable');
+}
+
 group('folder_is_protected() with custom map');
 
 $map = ['sent' => 'Outbox', 'trash' => 'Waste'];

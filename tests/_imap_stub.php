@@ -37,6 +37,8 @@ function scenario(string $f): array
         'uids'            => null,   // derived when absent (contiguous)
         'status_omit'     => [],     // e.g. ["uidnext","uidvalidity"]
         'status_fail'     => false,
+        'quota'           => null,   // ['usage'=>KB,'limit'=>KB] advertises QUOTA
+        'quota_fail'      => false,  // server answers NO to GETQUOTAROOT
         'select_fail'     => false,
         'create_fail'     => false,  // server answers NO to CREATE
         'delete_fail'     => false,  // server answers NO to DELETE
@@ -189,7 +191,12 @@ while (true) {
         if ($sock === $srv) {
             $c = @stream_socket_accept($srv, 0);
             if ($c) {
-                fwrite($c, "* OK [CAPABILITY IMAP4REV1 SORT UIDPLUS] stub ready\r\n");
+                // c-client latches capabilities from this greeting. Read the
+                // scenario here, not per command: a connection opened before
+                // the scenario gained QUOTA can never send GETQUOTAROOT.
+                $welcome = scenario($scenFile);
+                $caps = 'IMAP4REV1 SORT UIDPLUS' . ($welcome['quota'] !== null ? ' QUOTA' : '');
+                fwrite($c, "* OK [CAPABILITY $caps] stub ready\r\n");
                 $clients[(int)$c] = $c;
             }
             continue;
@@ -211,7 +218,11 @@ while (true) {
         $c  = $sock;
 
         if (str_starts_with($up, 'LOGIN'))      { fwrite($c, "$tag OK LOGIN done\r\n"); continue; }
-        if (str_starts_with($up, 'CAPABILITY')) { fwrite($c, "* CAPABILITY IMAP4REV1 SORT UIDPLUS\r\n$tag OK done\r\n"); continue; }
+        if (str_starts_with($up, 'CAPABILITY')) {
+            $caps = 'IMAP4REV1 SORT UIDPLUS' . ($s['quota'] !== null ? ' QUOTA' : '');
+            fwrite($c, "* CAPABILITY $caps\r\n$tag OK done\r\n");
+            continue;
+        }
         if (str_starts_with($up, 'NOOP'))       { fwrite($c, "$tag OK NOOP done\r\n"); continue; }
         if (str_starts_with($up, 'CHECK'))      { fwrite($c, "$tag OK CHECK done\r\n"); continue; }
         if (str_starts_with($up, 'CLOSE'))      { fwrite($c, "$tag OK CLOSE done\r\n"); continue; }
@@ -219,6 +230,20 @@ while (true) {
             fwrite($c, "* BYE\r\n$tag OK LOGOUT done\r\n");
             fclose($c);
             unset($clients[(int)$c]);
+            continue;
+        }
+
+        if (str_starts_with($up, 'GETQUOTAROOT')) {
+            if ($s['quota_fail'] || $s['quota'] === null) {
+                fwrite($c, "$tag NO QUOTA unavailable\r\n");
+                continue;
+            }
+            preg_match('/GETQUOTAROOT\s+(.+)$/i', $cmd, $qm);
+            $mbox = trim($qm[1] ?? 'INBOX');
+            $quota = $s['quota'];
+            fwrite($c, "* QUOTAROOT $mbox \"ROOT\"\r\n"
+                . '* QUOTA "ROOT" (STORAGE ' . (int)$quota['usage'] . ' ' . (int)$quota['limit'] . ")\r\n"
+                . "$tag OK GETQUOTAROOT done\r\n");
             continue;
         }
 

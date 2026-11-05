@@ -128,6 +128,42 @@ assert_eq(10, $st['messages'], 'other fields still present when some are omitted
 scenario(['messages' => 10, 'status_fail' => true]);
 assert_eq(null, $imap->statusFor('INBOX'), 'failed STATUS returns null, not an array of zeroes');
 
+group('storageQuota()');
+
+// c-client latches capabilities from the greeting, so a QUOTA scenario needs a
+// fresh connection after the scenario is written.
+if (!method_exists($imap, 'storageQuota')) {
+    failTest('MailImap::storageQuota() exists');
+} else {
+    scenario(['messages' => 0, 'quota' => ['usage' => 1024, 'limit' => 2048]]);
+    $imap = connect();
+    resetLog();
+    $quota = $imap->storageQuota('INBOX');
+    assert_eq(['used' => 1048576, 'limit' => 2097152], $quota,
+        'RFC 2087 KB becomes bytes');
+    $trace = billable();
+    assert_eq(['GETQUOTAROOT INBOX'], $trace,
+        'storageQuota costs exactly one GETQUOTAROOT for INBOX');
+    assert_eq(0, count(array_filter($trace, fn($c) => preg_match('/^(SELECT|LIST|STATUS)/i', $c))),
+        'quota does not select, list or status');
+
+    scenario(['messages' => 0]);
+    $imap = connect();
+    resetLog();
+    assert_eq(null, $imap->storageQuota('INBOX'), 'a server without QUOTA returns null');
+    assert_eq([], billable(), 'and sends no command');
+    $leftover = @imap_errors();
+    assert_true($leftover === false || $leftover === [],
+        'the no-capability error is drained');
+
+    scenario(['messages' => 0, 'quota' => ['usage' => 1, 'limit' => 2], 'quota_fail' => true]);
+    $imap = connect();
+    resetLog();
+    assert_eq(null, $imap->storageQuota('INBOX'), 'a NO reply returns null');
+    $leftover = @imap_errors();
+    assert_true($leftover === false || $leftover === [], 'the NO error is drained');
+}
+
 group('uidSet()');
 
 scenario(['messages' => 6, 'unseen' => [1002, 1004], 'deleted' => [1005], 'flagged' => []]);

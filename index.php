@@ -1053,6 +1053,81 @@ function parse_php_size(string $val): int
   };
 }
 
+// Human-readable size for the storage card. 1024-based, because RFC 2087
+// reports STORAGE in 1024-octet units.
+function format_bytes(int $bytes): string
+{
+  $bytes = max(0, $bytes);
+  if ($bytes < 1024) {
+    return $bytes . ' B';
+  }
+  $units = ['KB', 'MB', 'GB', 'TB', 'PB'];
+  $value = $bytes / 1024;
+  $i = 0;
+  while (true) {
+    $decimals = $value < 10 ? 2 : ($value < 100 ? 1 : 0);
+    $rounded = round($value, $decimals);
+    // Promote after rounding: 1,048,575 bytes is 1 MB, not 1,024 KB.
+    if ($rounded < 1024 || $i === count($units) - 1) {
+      break;
+    }
+    $value = $rounded / 1024;
+    $i++;
+  }
+  $text = rtrim(rtrim(number_format($rounded, $decimals, '.', ''), '0'), '.');
+  return $text . ' ' . $units[$i];
+}
+
+// Normalise imap_get_quotaroot()'s response. RFC 2087 reports STORAGE in
+// 1024-octet units. ext-imap returns the resource as a nested array with flat
+// usage/limit siblings; only the nested array is authoritative here. Values
+// are skipped when they are not arrays: MESSAGE is an array, the flat siblings
+// are integers.
+function quota_storage_from_response($raw): ?array
+{
+  if (!is_array($raw) || $raw === []) {
+    return null;
+  }
+  $storage = null;
+  $variant = null;
+  foreach ($raw as $key => $value) {
+    if (!is_array($value)) {
+      continue;
+    }
+    if (strcasecmp((string)$key, 'STORAGE') === 0) {
+      if (is_numeric($value['usage'] ?? null)) {
+        $storage = $value;
+        break;
+      }
+      continue;
+    }
+    if ($variant === null && stripos((string)$key, 'STORAGE') === 0
+        && is_numeric($value['usage'] ?? null)) {
+      $variant = $value;
+    }
+  }
+  $storage = $storage ?? $variant;
+  if ($storage === null) {
+    return null;
+  }
+  $used  = max(0, (int)$storage['usage']) * 1024;
+  $limit = null;
+  if (is_numeric($storage['limit'] ?? null) && (int)$storage['limit'] > 0) {
+    $limit = (int)$storage['limit'] * 1024;
+  }
+  return ['used' => $used, 'limit' => $limit];
+}
+
+// Percentage for the storage bar. Null when the server does not report a
+// usable limit; over-quota clamps to 100 so the bar never overflows.
+function quota_percent(int $used, ?int $limit): ?int
+{
+  if ($limit === null || $limit <= 0) {
+    return null;
+  }
+  return max(0, min(100, (int)round($used / $limit * 100)));
+}
+
 // True when the incoming request body was larger than the PHP post_max_size.
 // When PHP discards an oversized POST, $_POST and $_FILES are empty but
 // $_SERVER['CONTENT_LENGTH'] still holds the original size. Call this BEFORE
@@ -2368,6 +2443,29 @@ function db_count_cached_messages(string $email): int
     return (int)$stmt->fetchColumn();
   } catch (Throwable $e) {
     return 0;
+  }
+}
+
+// Approximate mail storage from the local header cache. Only used when the
+// server does not report RFC 2087 QUOTA: it covers the messages this app has
+// cached, not the mailbox. It never reads the SQLite file size, which is a
+// header index and says nothing about the provider's storage.
+function db_cached_storage(string $email): array
+{
+  $empty = ['used' => 0, 'cached' => 0];
+  $pdo = db_open();
+  if (!$pdo) return $empty;
+  try {
+    $stmt = $pdo->prepare('SELECT COUNT(*) AS cached, COALESCE(SUM(size), 0) AS used
+      FROM messages WHERE user_email = ?');
+    $stmt->execute([$email]);
+    $row = $stmt->fetch() ?: [];
+    return [
+      'used'   => (int)($row['used'] ?? 0),
+      'cached' => (int)($row['cached'] ?? 0),
+    ];
+  } catch (Throwable $e) {
+    return $empty;
   }
 }
 
@@ -4398,6 +4496,32 @@ class MailImap
       'uidnext'     => $read(SA_UIDNEXT, 'uidnext'),
       'uidvalidity' => $read(SA_UIDVALIDITY, 'uidvalidity'),
     ];
+  }
+
+  /**
+   * RFC 2087 storage quota for the account, in bytes.
+   *
+   * The connection is half-open and may have no mailbox selected; GETQUOTAROOT
+   * is valid there. The mailbox is sent verbatim (no server prefix), matching
+   * the PHP manual. A server that does not advertise QUOTA never receives a
+   * command, but c-client still queues an error, so the stack is drained on
+   * both paths -- an undrained error is dumped at PHP shutdown.
+   *
+   * Returns null when the server has no usable STORAGE quota. `limit` is null
+   * when the server reports no limit.
+   */
+  public function storageQuota(string $mailbox = 'INBOX'): ?array
+  {
+    if (!$this->conn || !function_exists('imap_get_quotaroot')) {
+      return null;
+    }
+    @imap_errors();
+    $raw = @imap_get_quotaroot($this->conn, $mailbox);
+    @imap_errors();
+    if (!is_array($raw)) {
+      return null;
+    }
+    return quota_storage_from_response($raw);
   }
 
   /**
@@ -6688,6 +6812,25 @@ function handle_settings(): void
     redirect('?page=settings');
   }
   $folderMapJson = (string)user_setting('protected_folders', '{}');
+  // One connection for storage + folder detection. imap_for_session(false)
+  // keeps a failed probe from logging the user out of Settings; with no
+  // connection, detection is skipped and the map modal opens empty, so a
+  // read-only probe never ends the session.
+  $imap = imap_for_session(false);
+  $needsDetection = (json_decode($folderMapJson, true) ?: []) === [];
+  $detected = [];
+  if ($needsDetection && $imap) {
+    $detected = detect_folder_map($imap);
+  }
+  $quota = $imap ? $imap->storageQuota('INBOX') : null;
+  $hadConnection = $imap !== null;
+  if ($imap) {
+    $imap->disconnect();
+  }
+  $storage = $quota !== null
+    ? ['mode' => 'quota'] + $quota
+    : ['mode' => 'cache', 'reason' => $hadConnection ? 'unsupported' : 'unreachable']
+      + db_cached_storage($me);
   render_settings([
     'emails_per_page' => (int)user_setting('emails_per_page', DEFAULT_EMAILS_PER_PAGE),
     'display_name'    => (string)user_setting('display_name', strstr($me, '@', true) ?: $me),
@@ -6703,13 +6846,14 @@ function handle_settings(): void
     'undo_period_seconds' => (int)user_setting('undo_period_seconds', 0),
     'protected_folders' => $folderMapJson,
     // Only pre-fill detection when the user has no map yet: their saved choices
-    // are the single source of truth once set. detect_folder_map() caches, so
-    // the settings page never pays for a second connection.
-    'detected_folder_map' => (json_decode($folderMapJson, true) ?: []) === []
-      ? detect_folder_map()
-      : [],
+    // are the single source of truth once set.
+    'detected_folder_map' => $detected,
     'folder_list' => cached_folder_list($me),
-    'cached_messages' => db_count_cached_messages($me),
+    // In cache mode this was just counted for the estimate, so reuse it.
+    'cached_messages' => $storage['mode'] === 'cache'
+      ? (int)$storage['cached']
+      : db_count_cached_messages($me),
+    'storage' => $storage,
     'csrf'            => csrf_page_token(),
   ]);
 }
@@ -7768,6 +7912,14 @@ html:has(.compose-actions) { scroll-padding-bottom:80px; }
 .cache-row { display:flex; justify-content:space-between; align-items:center; gap:20px; }
 .cache-info { flex:1; }
 .cache-action { flex-shrink:0; }
+/* Provider storage card. The heading is already inside a 24px card, so the
+   shared .settings-sub top margin would double the gap. */
+.storage-card .settings-sub:first-child { margin-top:0; }
+.storage-headline { font-size:1.15rem; font-weight:700; margin:6px 0 10px; }
+.storage-bar { height:8px; border-radius:999px; background:var(--surface-3);
+  overflow:hidden; margin:10px 0 8px; }
+.storage-bar > span { display:block; height:100%; background:var(--accent); border-radius:999px; }
+.storage-detail { color:var(--text-muted); font-size:.9rem; margin-top:2px; }
 .settings-note { color:var(--text-faint); font-size:.82rem; margin-top:6px; line-height:1.5; }
 
 /* Switch. The checkbox stays in the DOM and drives the track through :checked, so
@@ -12316,6 +12468,45 @@ function view_md_help_dialog(): string
     . '</dialog>';
 }
 
+function view_storage_card(array $s): string
+{
+  $h = '<div class="card cache-card storage-card"><div class="cache-row"><div class="cache-info">'
+    . '<h2 class="settings-sub">Storage</h2>';
+  if (($s['mode'] ?? '') === 'quota') {
+    $used  = (int)($s['used'] ?? 0);
+    $limit = isset($s['limit']) ? (int)$s['limit'] : null;
+    $pct   = quota_percent($used, $limit);
+    if ($pct !== null) {
+      $h .= '<div class="storage-headline">' . $pct . '% of ' . h(format_bytes($limit)) . ' used</div>'
+        . '<div class="storage-bar" role="progressbar" aria-valuenow="' . $pct . '" aria-valuemin="0"'
+        . ' aria-valuemax="100" aria-label="Mailbox storage used">'
+        . '<span style="width:' . $pct . '%"></span></div>'
+        . '<div class="storage-detail">' . h(format_bytes($used)) . ' of ' . h(format_bytes($limit)) . '</div>';
+    } else {
+      $h .= '<div class="storage-headline">' . h(format_bytes($used)) . ' used</div>';
+    }
+    $h .= '<div class="settings-note">Reported by your mail provider.'
+      . ($pct === null ? ' No storage limit is set.' : '') . '</div>';
+  } else {
+    $used        = (int)($s['used'] ?? 0);
+    $cached      = (int)($s['cached'] ?? 0);
+    $unreachable = ($s['reason'] ?? '') === 'unreachable';
+    $cause = $unreachable ? 'Could not reach the mail server.' : 'Your provider does not report usage.';
+    if ($cached <= 0) {
+      $h .= '<div class="storage-headline">No message headers cached yet</div>';
+      $h .= '<div class="settings-note">' . $cause . '</div>';
+    } else {
+      $messages = $cached === 1
+        ? '1 message currently cached'
+        : $cached . ' messages currently cached';
+      $h .= '<div class="storage-headline">About ' . h(format_bytes($used)) . ' used</div>';
+      $h .= '<div class="settings-note">' . $cause
+        . '<br>Size inferred from ' . $messages . '.</div>';
+    }
+  }
+  return $h . '</div></div></div>';
+}
+
 function view_settings(array $d): string
 {
   $h = '<div class="card"><h1>Settings</h1>';
@@ -12425,6 +12616,9 @@ function view_settings(array $d): string
 <a class="btn" href="?page=inbox">Cancel</a><button class="btn btn-primary" type="submit">' . icon('device-floppy') . ' Save</button></div>'
     . '</form>'
     . '</div>'
+    // Provider storage: outside the settings form, like the cache card. The
+    // data is read-only and must not post with Save.
+    . (isset($d['storage']) && is_array($d['storage']) ? view_storage_card($d['storage']) : '')
     . '<div class="card cache-card">'
     . '<div class="cache-row">'
     . '<div class="cache-info"><h2 class="settings-sub">Local cache</h2>'
