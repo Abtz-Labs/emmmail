@@ -27,8 +27,8 @@ knowledge **out** of this file; add it there and link it from here. Budget: 150 
 | The `$` toolkit, busy states, optimistic actions, the poll chain | [knowledge/frontend.md](knowledge/frontend.md) |
 | Tokens, specificity, tooltips, toolbars, composer | [knowledge/css-ui.md](knowledge/css-ui.md) |
 | TDD loop, source guards, the js stub | [knowledge/testing.md](knowledge/testing.md) |
-| Markdown, threading, drafts, undo send | [knowledge/composing.md](knowledge/composing.md) |
-| imap ext install, CA bundle, Migadu hosts | [knowledge/environment.md](knowledge/environment.md) |
+| Markdown, threading, send-as, drafts, undo send | [knowledge/composing.md](knowledge/composing.md) |
+| imap ext install, CA bundle, Migadu hosts and send-as identities | [knowledge/environment.md](knowledge/environment.md) |
 
 ## Decisions in force
 - Password only in the session, libsodium secretbox, key server-global

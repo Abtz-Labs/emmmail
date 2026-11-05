@@ -1671,6 +1671,14 @@ async function main() {
     ok('S26c and drops the bar', bad.gone());
     bad.clock.restore();
 
+    const noCopy = mkBar(0, () => ({ ok: true, warning: 'Message sent, but it could not be filed in Sent.' }));
+    await noCopy.clock.tick(0); await settle(); await settle();
+    eq('S26c a sent message with no Sent copy shows the warning',
+      toastText(noCopy), 'Message sent, but it could not be filed in Sent.');
+    eq('S26c as an error', toastKind(noCopy), 'toast toast-error');
+    ok('S26c and drops the bar', noCopy.gone());
+    noCopy.clock.restore();
+
     const u = mkBar(5, url => url === '?page=undoSend' ? { ok: true, location: '?page=compose&draft=42' } : { ok: true });
     u.btn.dispatch('click');
     eq('S26c Undo posts undoSend', u.calls[0] && u.calls[0].url, '?page=undoSend');

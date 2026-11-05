@@ -257,6 +257,11 @@ $fromName   = $identity['name'];   // primary carries display_name; alias is '' 
   error. There is no silent fallback to the account address. The composed fields
   are not restored (pre-existing behavior for any failed send); the README says
   so.
+- Recipients are deduplicated case-insensitively, keeping the first spelling and
+  header order.
+- The Sent append is checked. If the message goes out but cannot be filed in
+  Sent, `handle_send()` flashes and `handle_flush_undo()` returns a `warning`.
+  The message is never sent again.
 
 ## Reply and reply-all
 

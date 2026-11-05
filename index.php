@@ -5074,7 +5074,14 @@ function send_as_parse(string $raw, string $me): array
     $name = '';
     $address = $line;
     if (preg_match('/^(.*?)\s*<([^<>]+)>\s*$/', $line, $m)) {
-      $name = trim($m[1], " \t\"'");
+      $name = trim($m[1]);
+      // Strip only one balanced pair of surrounding double quotes, then undo the
+      // quoted-pair escapes. Trimming every quote would eat a legitimate
+      // apostrophe and leave a stray backslash before an escaped quote.
+      if (strlen($name) >= 2 && $name[0] === '"' && substr($name, -1) === '"') {
+        $name = substr($name, 1, -1);
+        $name = str_replace(['\\"', '\\\\'], ['"', '\\'], $name);
+      }
       $address = trim($m[2]);
     }
     if (strlen($address) > 254 || !filter_var($address, FILTER_VALIDATE_EMAIL)) {
@@ -5914,11 +5921,14 @@ function handle_send(): void
     }
   }
   $sent = $imap->findSentFolder();
+  $filed = false;
   if ($sent) {
     // Only the filed copy records the blind recipients.
-    $imap->appendToFolder($sent, smtp_raw_with_bcc($raw, $bcc), '\\Seen');
-    // The new message is on the server but not in our cache; make Sent resync.
-    cache_invalidate_folder($me, $sent);
+    $filed = $imap->appendToFolder($sent, smtp_raw_with_bcc($raw, $bcc), '\\Seen');
+    if ($filed) {
+      // The new message is on the server but not in our cache; make Sent resync.
+      cache_invalidate_folder($me, $sent);
+    }
   }
 
   // The message is away, so the draft it came from is finished. Done after the
@@ -5933,7 +5943,11 @@ function handle_send(): void
     }
   }
 
-  flash_set('success', 'Message sent successfully.');
+  if ($sent && !$filed) {
+    flash_set('error', 'Message sent, but it could not be filed in Sent.');
+  } else {
+    flash_set('success', 'Message sent successfully.');
+  }
   redirect('?page=folder&folder=' . urlencode($sent ?: 'INBOX'));
 }
 
@@ -6063,7 +6077,7 @@ function handle_flush_undo(): void
   // The message is away.
   unset($_SESSION['undo_queue'][$token]);
   if (!$imap) {
-    json_out(['ok' => true]);
+    json_out(['ok' => true, 'warning' => 'Message sent, but it could not be filed in Sent.']);
   }
 
   // Record recipients + append to Sent.
@@ -6075,9 +6089,12 @@ function handle_flush_undo(): void
     }
   }
   $sent = $imap->findSentFolder();
+  $filed = false;
   if ($sent) {
-    $imap->appendToFolder($sent, smtp_raw_with_bcc($entry['raw'], $entry['bcc']), '\\Seen');
-    cache_invalidate_folder($me, $sent);
+    $filed = $imap->appendToFolder($sent, smtp_raw_with_bcc($entry['raw'], $entry['bcc']), '\\Seen');
+    if ($filed) {
+      cache_invalidate_folder($me, $sent);
+    }
   }
 
   // Clean up the draft if one existed.
@@ -6091,6 +6108,9 @@ function handle_flush_undo(): void
     }
   }
 
+  if ($sent && !$filed) {
+    json_out(['ok' => true, 'warning' => 'Message sent, but it could not be filed in Sent.']);
+  }
   json_out(['ok' => true]);
 }
 
@@ -7604,8 +7624,8 @@ body.nav-open .nav-backdrop { opacity:1; pointer-events:auto; }
   outline:none; min-width:0; }
 .compose-row select { flex:1; border:none; background:transparent;
   padding:10px 0; font-size:.92rem; font-family:inherit; color:var(--text);
-  outline:none; min-width:0; max-width:100%; text-overflow:ellipsis; }
-.compose-row select:focus-visible { outline:2px solid var(--accent); outline-offset:2px; border-radius:4px; }
+  outline:none; min-width:0; max-width:100%; }
+.compose-row select:focus, .compose-row select:focus-visible { outline:2px solid var(--accent); outline-offset:2px; border-radius:4px; }
 .compose-cc-tog button, .compose-bcc-tog button {
   border:none; background:transparent; color:var(--accent); font-size:.82rem;
   font-weight:600; cursor:pointer; padding:4px 8px; border-radius:6px; }
@@ -8689,6 +8709,7 @@ function js_inline(): string
       $.post('?page=flushUndo', { token: token }).then(json).then(function(res){
         drop();
         if (res && res.ok) {
+          if (res.warning) { win.toast(res.warning, 'error'); return; }
           if (!res.gone) win.toast('Message sent.', 'success');
           return;
         }
@@ -11767,9 +11788,20 @@ function header_address_entries(string $header): array
   $parts = [];
   $buf = '';
   $inQuotes = false;
+  $escaped = false;
   $len = strlen($header);
   for ($i = 0; $i < $len; $i++) {
     $ch = $header[$i];
+    if ($escaped) {
+      $buf .= $ch;
+      $escaped = false;
+      continue;
+    }
+    if ($ch === '\\') {
+      $buf .= $ch;
+      $escaped = true;
+      continue;
+    }
     if ($ch === '"') {
       $inQuotes = !$inQuotes;
       $buf .= $ch;
@@ -11828,6 +11860,7 @@ function header_address_list(string $header): string
 function compose_recipients(string $to, string $cc, string $bcc): array
 {
   $recipients = [];
+  $seen = [];
   foreach ([$to, $cc, $bcc] as $header) {
     if (trim($header) === '') {
       continue;
@@ -11840,6 +11873,11 @@ function compose_recipients(string $to, string $cc, string $bcc): array
       if ($entry['address'] === '') {
         return ['ok' => false, 'error' => 'Invalid email address: ' . $entry['text'], 'recipients' => []];
       }
+      $key = strtolower($entry['address']);
+      if (isset($seen[$key])) {
+        continue;
+      }
+      $seen[$key] = true;
       $recipients[] = $entry['address'];
     }
   }
@@ -12295,12 +12333,12 @@ function view_settings(array $d): string
     . '<div class="form-group"><label>Messages per page</label>'
     . '<input type="number" name="emails_per_page" min="5" max="200" value="' . h($d['emails_per_page']) . '">'
     . '<div class="settings-note">Between 5 and 200.</div></div>'
-    . '<div class="form-group"><label>Display name (shown on sent mail)</label>'
+    . '<div class="form-group"><label>Display name for the primary address (shown on its sent mail)</label>'
     . '<input type="text" name="display_name" value="' . h($d['display_name']) . '"></div>'
     . '<div class="form-group"><label for="send-as">Send as</label>'
     . '<textarea id="send-as" name="send_as" rows="4" placeholder="alias@example.com or Name &lt;alias@example.com&gt;">'
     . h($d['send_as'] ?? '') . '</textarea>'
-    . '<div class="settings-note">One address per line. Use <code>Name &lt;address&gt;</code> to set a display '
+    . '<div class="settings-note">One address per line, up to 20. Use <code>Name &lt;address&gt;</code> to set a display '
     . 'name for that address. Your account address is always available'
     . ($accountEmail !== '' ? ' (<strong>' . h($accountEmail) . '</strong>)' : '') . '. '
     . 'Your mail provider must allow sending from every address.</div></div>'

@@ -71,7 +71,13 @@ falls back to B-encoding for non-ASCII. `smtp_build_raw_message()` is its only c
 
 **Recipient parsing is separate from the header.** `compose_recipients()` turns To/Cc/Bcc into
 individual `RCPT TO` addresses; the headers keep the text as typed. A multi-address To was
-rejected as one address before this, so reply-all to a group did not work.
+rejected as one address before this, so reply-all to a group did not work. The splitter honours
+a quoted display name, including an escaped `\"`, so a comma inside it is never a second
+recipient. Recipients are deduplicated case-insensitively, keeping the first spelling and order.
+
+**The Sent copy is checked.** `appendToFolder()` returns bool. A failed append is reported —
+`handle_send()` flashes, `handle_flush_undo()` returns a `warning` — and the message is never
+sent twice. The cache is invalidated only when the append succeeded.
 
 ## The conversation view
 

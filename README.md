@@ -87,8 +87,8 @@ That's the whole stack.
 - Search across a folder (local cache first, then IMAP)
 - Contacts auto-populated from recipients, with autocomplete (arrow keys move the
   highlight, Enter picks it)
-- Per-account settings (messages per page, display name, signature, automatic check,
-  undo send, remote images, protected-folder map)
+- Per-account settings (messages per page, display name, send-as addresses,
+  signature, automatic check, undo send, remote images, protected-folder map)
 - Session-based authentication with IP binding and rate-limit on logins;
   the login page remembers the last email used and the mail-server settings
   (the preset, or your own IMAP/SMTP fields), focuses the field you still
@@ -189,6 +189,9 @@ with `may_send` (often created with `password_use: mailbox`), not a receive-only
 *Alias*. Gmail and Outlook need a verified send-as address. If the server refuses
 the envelope sender, the send fails with its error and nothing is filed in Sent.
 
+If the message goes out but the Sent copy cannot be filed, the app says so. It
+does not send the message again.
+
 Limits:
 
 1. The list is manual. There is no provider-neutral discovery. The Migadu API
@@ -199,11 +202,11 @@ Limits:
    account display name. Add `Name <address>` to give it one.
 4. A failed send does not restore the composer text. This is true for every send
    failure, not only an address the provider refuses.
-6. The signature follows a From change only in the rich editor, and only while
+5. The signature follows a From change only in the rich editor, and only while
    the old signature is unchanged. With JavaScript off (or the plain textarea
    fallback), or after you edit the signature, change it by hand. Ctrl+Z after a
    swap is not reliable. A signature with an unclosed code fence is not swapped.
-5. If undo send is on and the send fails after the countdown, the message goes to
+6. If undo send is on and the send fails after the countdown, the message goes to
    Drafts and the error says so. If Drafts cannot take it either, it is tried
    again on later page loads (a minute apart), and dropped after 3 tries.
 
@@ -402,10 +405,10 @@ An operator can pin the app to one mail server, one sign-in domain, or both.
 Each account configures its own copy of these (Settings page, stored per user):
 
 - Messages per page (5–200)
-- Display name, shown on sent mail
+- Display name for the primary address, shown on its sent mail
 - Send-as addresses: aliases or provider identities, one per line, optionally
-  `Name <address>`. The account address is always available and is the default
-  for a new message
+  `Name <address>`. Up to 20. The account address is always available and is the
+  default for a new message
 - Signature, inserted at the top of the compose editor, above any quoted reply
   or forward. One for the account address and one for each send-as address; an
   address with an empty box has no signature
