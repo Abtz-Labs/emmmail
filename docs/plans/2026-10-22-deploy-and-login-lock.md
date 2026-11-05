@@ -1,5 +1,5 @@
 ---
-status: in progress
+status: done
 ---
 
 # Deploy to webmail.abtz.co + login lock

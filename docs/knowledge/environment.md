@@ -35,6 +35,25 @@ mailbox password.
   `EMMMAIL_PROVIDER=migadu`. Both are read per request. `EMMMAIL_FORCE_PRESET` is **gone**:
   the code ignores it, so a stale one shows the server picker again.
 
+## Releases
+`bare deploy` packages the **working tree**, bumps `package.json` (patch by default),
+and creates `releases/<timestamp>-<version>` under `/home/abtz2/web/webmail.abtz.co`.
+Use `--minor` or `--major` for a feature or breaking release, and `--no-bump` to reuse
+the version.
+
+The local `preScripts` entry in the git-ignored `bare.config.json` runs after the bump
+and before packaging. It syncs `APP_VERSION` in `index.php` to the `package.json`
+version, then commits and pushes `package.json` + `index.php`. It refuses when
+`index.php` has other uncommitted changes, so commit code before releasing.
+
+`bare list` shows current/previous, `bare use <id>` switches release, `bare cleanup`
+prunes to `keepReleases`. `bare` alone prints help. **Never pass `--help` to a
+subcommand:** `bare deploy --help` is a real deploy, and `bare use --help` switches to
+a release named `--help`.
+
+The post-script must set `EMMMAIL_PROVIDER`, not `EMMMAIL_FORCE_PRESET`; the latter is
+ignored by the app and leaves the provider picker visible.
+
 ## TCP timeouts
 `imap_open()` blocks forever on an unreachable host and segfaults PHP at shutdown, and c-client
 ignores `default_socket_timeout` for TCP connect. See [imap.md](imap.md) for the bounded probe

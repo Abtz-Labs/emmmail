@@ -49,9 +49,13 @@ knowledge **out** of this file; add it there and link it from here. Budget: 150 
 ## Plan status
 Details, decisions and owed checks live in each plan; keep its `status:` header honest.
 
+**Production:** `0.2.0`, deployed 2026-11-06. `bare deploy` bumps and the pre-script
+commits/pushes the version; the Migadu login lock is verified (no provider picker).
+
 **Code complete, browser pass NOT run** (what is owed, in brief):
 - `2026-11-05-provider-storage-usage.md` — Settings storage card: RFC 2087 QUOTA, or
-  cached-message estimate. Owed: Gmail live, a non-QUOTA server, both themes, phone width.
+  cached-message estimate. Deployed in `0.2.0`. Owed: Gmail live, a non-QUOTA server,
+  both themes, phone width.
 - `2026-11-05-undo-send-closes-composer.md` — plain-POST Send to Sent, undo bar on every page
   (says logout cancels), Undo via Drafts, `compose_id` send-once. Owed: page moves, Undo with
   attachment / no Drafts, closed tab, Back + Send, phone width.
@@ -72,10 +76,8 @@ Details, decisions and owed checks live in each plan; keep its `status:` header 
 - Deferred (no harness can do it): markdown-compose step 8 (only Chromium seen),
   keyboard-first-ux step 7, instant-folder-switch click-through (needs IMAP creds).
 
-**Deploy not run:** `2026-10-22-deploy-and-login-lock.md` — the env must set
-`EMMMAIL_PROVIDER=migadu`, **not** `EMMMAIL_FORCE_PRESET` (see the 10-23 merge plan).
-
-**Done, manually verified:** `2026-10-06-footer.md` (light theme not seen),
+**Done, manually verified:** `2026-10-22-deploy-and-login-lock.md` (0.2.0, login lock
+verified without the provider picker), `2026-10-06-footer.md` (light theme not seen),
 `2026-10-02-solid-toast-and-login-memory.md`, `2026-09-29-browser-notifications.md`
 (Brave/macOS only). Everything else is done.
 
