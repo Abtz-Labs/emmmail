@@ -602,6 +602,14 @@ assert_contains('Content-Disposition: attachment', $raw3, 'attachment dispositio
 $raw4 = smtp_build_raw_message('f@e.com', 't@e.com', 'S', 'body', '', [], 'cc@example.com', '', '');
 assert_contains('Cc: cc@example.com', $raw4, 'Cc header present');
 
+// Trace headers belong to the receiving MTA, never to the sender. Postfix reads
+// Delivered-To: as proof that the message already reached that recipient and
+// bounces it as a forwarding loop (5.4.6) -- netcup did exactly that to a reply
+// addressed to mail@sysscore.com. Return-Path is the same class: RFC 5321 says
+// the final delivery MTA inserts it.
+assert_not_contains('Delivered-To:', $raw, 'the sender does not forge Delivered-To');
+assert_not_contains('Return-Path:', $raw, 'the sender does not forge Return-Path');
+
 // Bcc must NEVER be a header on the transmitted message: the whole point is that
 // the recipients travel in the SMTP envelope only.
 $rawB = smtp_build_raw_message('f@e.com', 't@e.com', 'S', 'body', '', [], 'cc@e.com', 'secret@e.com', '');

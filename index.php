@@ -1336,9 +1336,12 @@ function smtp_build_raw_message($from, $to, $subject, $body, $fromName = '', $at
     $textBody = html_entity_decode($textBody, ENT_QUOTES | ENT_HTML5, 'UTF-8');
   }
 
+  // Trace headers belong to the receiving MTA, never to the sender. Postfix
+  // reads Delivered-To: as proof that the message already reached that
+  // recipient and bounces it as a forwarding loop (5.4.6); Return-Path is
+  // inserted by the final delivery MTA (RFC 5321 4.4). The SMTP envelope
+  // carries the sender and From: names it.
   $headers = [];
-  $headers[] = 'Return-Path: <' . $from . '>';
-  $headers[] = 'Delivered-To: ' . $to;
   if ($fromName !== '') {
     if (preg_match('/[^\x20-\x7E]/', $fromName)) {
       $encName = '=?UTF-8?B?' . base64_encode($fromName) . '?=';

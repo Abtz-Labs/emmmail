@@ -14,7 +14,7 @@ Read the relevant file before touching the matching area.
 | [frontend.md](frontend.md) | The `$` toolkit and its three banned APIs, the round-trip feedback vocabulary, JS/DOM contracts, optimistic actions, the conversation reader's active-message seam, the JS test stub, the poll chain |
 | [css-ui.md](css-ui.md) | Dark tokens in three places, specificity and source-order traps, tooltips, toolbars, composer layout, the reader toolbar |
 | [testing.md](testing.md) | TDD loop, source-level guards, why a crash is not a failing test, terminal-browser verification, what no harness can prove |
-| [composing.md](composing.md) | The Markdown composer, outbound threading, the conversation view, drafts and attachments, undo send, the signature, POST overflow |
+| [composing.md](composing.md) | The Markdown composer, outbound headers and threading, the conversation view, drafts and attachments, undo send, the signature, POST overflow |
 | [environment.md](environment.md) | The `imap` extension install, the CA bundle, Migadu hosts, TCP timeouts |
 
 ## Rules that follow from the index

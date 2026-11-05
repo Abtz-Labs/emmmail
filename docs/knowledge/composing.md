@@ -40,6 +40,14 @@ submit.
 render it. `References` = parent chain + parent Message-ID. `Reply-To` beats `From` for reply
 and reply-all.
 
+## Outbound headers
+**The sender sets only headers it owns.** `smtp_build_raw_message()` must never emit
+`Delivered-To:` or `Return-Path:`. Postfix's delivery agents read `Delivered-To:` to break
+forwarding loops (`delivered_hdr_find()`), so a message that already names the recipient there is
+rejected with `5.4.6 mail forwarding loop for <rcpt>` — netcup did this to a reply addressed to
+`mail@sysscore.com` on 2026-11-05. `Return-Path:` is inserted by the final delivery MTA
+(RFC 5321 4.4). Identity travels in the SMTP envelope (`MAIL FROM`) and `From:`.
+
 ## The conversation view
 
 `thread_root()` (`index.php`) is the whole identity: first `References` token, else
