@@ -8172,6 +8172,7 @@ function js_inline(): string
   function fitSrcdoc(){
     $('iframe.srcdoc').each(function(){
       var frame = this;
+      wireFrameKeys(frame);
       var body = fitOne(frame);
       // Images and web fonts settle after load and change the height. Observe the
       // body once, so a late reflow resizes the frame instead of clipping it.
@@ -8180,6 +8181,20 @@ function js_inline(): string
         frame._ro.observe(body);
       }
     });
+  }
+  // A click in the message moves focus into the body iframe. From then on its
+  // keydowns land in the frame's document and never bubble to this one, so Esc
+  // and every reader shortcut looked dead until a control in the chrome was
+  // clicked. Forward them to the one dispatcher, which owns the guards (open
+  // dialog, editable target, the off-switch). allow-same-origin is what makes
+  // the inner document reachable at all.
+  function wireFrameKeys(frame){
+    var innerDoc = null;
+    try { innerDoc = frame.contentWindow ? frame.contentWindow.document : null; } catch (e) { return; }
+    if (!innerDoc || !innerDoc.addEventListener || frame._keyDoc === innerDoc) return;
+    // A fresh document after a reload is a fresh binding target.
+    frame._keyDoc = innerDoc;
+    innerDoc.addEventListener('keydown', function(ev){ kbDispatch(ev); });
   }
   $('iframe.srcdoc').on('load', fitSrcdoc);
   // srcdoc can finish loading before this script runs, so the load listener above
@@ -9718,16 +9733,30 @@ JS
     kbBusy(kbFolderLink(name));
     openFolder('?page=folder&folder=' + encodeURIComponent(name));
   }
+  // Chromium (Brave) treats Esc as the "stop loading" accelerator. A navigation
+  // started inside the keydown is cancelled before the request reaches the
+  // network: the spinner runs, no request appears, and u works while Esc does
+  // not. Start the navigation on the next task, after the key's own default
+  // action has been handled.
+  function kbNavSoon(href){
+    win.setTimeout(function(){ win.location.href = href; }, 0);
+  }
   function kbBack(){
-    // Reader: the open message's own folder (the Back link's href). Elsewhere:
-    // Inbox, Superhuman-style. The two-step query keeps the selector flat: the
-    // js harness matches() has no descendant combinator.
+    // Reader: the open message's own folder (the Back link's href). A single
+    // message keeps it in .actions-bar; a conversation keeps one for the whole
+    // thread in .thread-top and none in the per-message bars. Elsewhere: Inbox,
+    // Superhuman-style. The two-step query keeps the selector flat: the js
+    // harness matches() has no descendant combinator.
     var bar = doc.querySelector('.actions-bar');
     var back = bar ? bar.querySelector('a[data-tip="Back"]') : null;
-    if (back) { markBusy(back); win.location.href = back.getAttribute('href'); return; }
+    if (!back) {
+      var thread = doc.querySelector('.thread-top');
+      back = thread ? thread.querySelector('a[data-tip="Back"]') : null;
+    }
+    if (back) { markBusy(back); kbNavSoon(back.getAttribute('href')); return; }
     // Listing: spin the Inbox link when the sidebar is on screen.
     kbBusy(kbFolderLink('INBOX'));
-    win.location.href = '?page=inbox';
+    kbNavSoon('?page=inbox');
   }
   function kbFocusSearch(){
     var search = doc.querySelector('.search');
@@ -9748,7 +9777,7 @@ JS
   // saved, so navigating away throws the draft away.
   function kbDiscard(){
     var discard = doc.querySelector('.compose-discard');
-    win.location.href = (discard && discard.getAttribute('href')) || '?page=inbox';
+    kbNavSoon((discard && discard.getAttribute('href')) || '?page=inbox');
   }
   // Blur a focused field (the search box, a settings input) so Esc steps out of
   // the field before it acts on the page behind it. Returns true when it did.

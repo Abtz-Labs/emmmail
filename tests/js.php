@@ -2099,6 +2099,51 @@ async function main() {
     const dlg = buildDialog(doc, 'delete-dialog');
     return { topbar, bar, dlg, card: r.card, r };
   }
+  // The reader plus the sandboxed body iframe. A click in the message moves
+  // focus into that frame's document, whose keydowns never bubble to the page.
+  function buildKbReaderBody(doc, attrs) {
+    const x = buildKbReader(doc, attrs);
+    const iframe = doc.createElement('iframe');
+    iframe.className = 'body-iframe srcdoc';
+    const body = doc.createElement('body', doc);
+    body.scrollHeight = 20;
+    const inner = {
+      body,
+      documentElement: { scrollHeight: 20 },
+      _handlers: {},
+      addEventListener(type, fn) { (this._handlers[type] = this._handlers[type] || []).push(fn); },
+      dispatch(type, init) {
+        const ev = Object.assign({ type, target: body, defaultPrevented: false,
+          preventDefault() { this.defaultPrevented = true; } }, init || {});
+        for (const fn of this._handlers[type] || []) fn(ev);
+        return ev;
+      },
+    };
+    iframe.contentWindow = { document: inner };
+    x.card.appendChild(iframe);
+    x.inner = inner;
+    return x;
+  }
+  // A conversation page: one Back control for the whole thread, in .thread-top,
+  // plus per-message action bars that carry no Back of their own.
+  function buildKbThread(doc, folder) {
+    const topbar = doc.createElement('div'); topbar.className = 'topbar'; doc.add(topbar);
+    doc.body.setAttribute('data-kb-map', JSON.stringify({ i: 'INBOX' }));
+    const bar = doc.createElement('div'); bar.className = 'nav-progress'; doc.add(bar);
+    const card = doc.createElement('div'); card.className = 'card thread';
+    const top = doc.createElement('div'); top.className = 'thread-top';
+    const back = doc.createElement('a');
+    back.className = 'btn btn-sm';
+    back.setAttribute('data-tip', 'Back');
+    back.setAttribute('href', '?page=folder&folder=' + folder);
+    const svg = doc.createElement('svg'); const use = doc.createElement('use');
+    use.setAttribute('href', '#tabler-arrow-back'); svg.appendChild(use); back.appendChild(svg);
+    top.appendChild(back); card.appendChild(top);
+    const actions = doc.createElement('div'); actions.className = 'actions-bar';
+    card.appendChild(actions);
+    doc.add(card);
+    return { card, bar, back };
+  }
   // A sidebar of folder links, so a keyboard folder jump can spin the same icon
   // a click would.
   function buildKbSidebar(doc, folders) {
@@ -2302,6 +2347,7 @@ async function main() {
     await settle();
     eq('S40 s leaves for the folder', win.location.href, '?page=folder&folder=INBOX');
     doc.dispatch('keydown', { key: 'u' });
+    await settle(1);
     eq('S40 u returns via the Back link', win.location.href, '?page=folder&folder=INBOX');
   }
 
@@ -2361,6 +2407,7 @@ async function main() {
     doc.dispatch('keydown', { key: '/' });
     ok('S41 / focuses search', search.input._focused);
     doc.dispatch('keydown', { key: 'u' });
+    await settle(1);
     eq('S41 u on a listing goes to Inbox', win.location.href, '?page=inbox');
     doc.dispatch('keydown', { key: 'c' });
     eq('S41 c composes', win.location.href, '?page=compose');
@@ -2537,6 +2584,7 @@ async function main() {
     const bar = doc.createElement('div'); bar.className = 'nav-progress'; doc.add(bar);
     boot(doc, win, () => ({ ok: true, json: () => Promise.resolve({ ok: true }) }), []);
     doc.dispatch('keydown', { key: 'Escape' });
+    await settle(1);
     eq('S51 Esc discards the composer', win.location.href, '?page=inbox');
   }
 
@@ -4092,6 +4140,98 @@ async function main() {
     await settle();
     eq('S95 another reader action still returns to its folder',
       win2.location.href, '?page=folder&folder=Sent');
+  }
+
+  // S97 — keys pressed after clicking the message body reach the app. The body
+  // is a same-origin iframe, so its keydowns never bubble to the page: before
+  // the frame was wired, Escape and every shortcut looked dead until the user
+  // clicked a control in the chrome.
+  {
+    const doc = makeDoc(); buildMeta(doc);
+    const win = makeWin();
+    const x = buildKbReaderBody(doc, { 'data-uid': '7', 'data-folder': 'INBOX' });
+    boot(doc, win, () => ({ json: () => Promise.resolve({ ok: true }) }), []);
+    ok('S97 the body frame is wired', x.inner._handlers.keydown && x.inner._handlers.keydown.length === 1);
+    x.inner.dispatch('keydown', { key: 'Escape' });
+    ok('S97 and acknowledges it on the Back link at once', x.r.back.classList.contains('busy'));
+    await settle(1);
+    eq('S97 Escape inside the message body goes back', win.location.href, '?page=folder&folder=INBOX');
+  }
+  {
+    // A modified key belongs to the browser: Ctrl/Cmd+C copies the selection in
+    // the message, it must not be hijacked as a shortcut.
+    const doc = makeDoc(); buildMeta(doc);
+    const win = makeWin();
+    const x = buildKbReaderBody(doc, { 'data-uid': '7', 'data-folder': 'INBOX' });
+    boot(doc, win, () => ({ json: () => Promise.resolve({ ok: true }) }), []);
+    x.inner.dispatch('keydown', { key: 'c', metaKey: true });
+    eq('S97 a copy inside the message is left alone', win.location.href, undefined);
+  }
+  {
+    // An open dialog owns the keyboard. Esc closes it natively; it must not
+    // navigate the page behind it.
+    const doc = makeDoc(); buildMeta(doc);
+    const win = makeWin();
+    const x = buildKbReaderBody(doc, { 'data-uid': '7', 'data-folder': 'INBOX' });
+    boot(doc, win, () => ({ json: () => Promise.resolve({ ok: true }) }), []);
+    x.dlg.dialog.showModal();
+    x.inner.dispatch('keydown', { key: 'Escape' });
+    eq('S97 Esc with a dialog open does not leave the reader', win.location.href, undefined);
+  }
+
+  // S98 — a conversation keeps one Back control in .thread-top, and the
+  // per-message action bars carry none. Esc and u must find that control (and
+  // spin it), not fall through to ?page=inbox.
+  {
+    const doc = makeDoc(); buildMeta(doc);
+    const win = makeWin();
+    const x = buildKbThread(doc, 'Archive');
+    boot(doc, win, () => ({ json: () => Promise.resolve({ ok: true }) }), []);
+    doc.dispatch('keydown', { key: 'Escape' });
+    ok('S98 and spins the thread Back control', x.back.classList.contains('busy'));
+    await settle(1);
+    eq('S98 Esc on a conversation returns to its own folder',
+      win.location.href, '?page=folder&folder=Archive');
+  }
+  {
+    const doc = makeDoc(); buildMeta(doc);
+    const win = makeWin();
+    const x = buildKbThread(doc, 'Sent');
+    boot(doc, win, () => ({ json: () => Promise.resolve({ ok: true }) }), []);
+    doc.dispatch('keydown', { key: 'u' });
+    ok('S98 u spins the thread Back control', x.back.classList.contains('busy'));
+    await settle(1);
+    eq('S98 u on a conversation returns to its own folder',
+      win.location.href, '?page=folder&folder=Sent');
+  }
+
+  // S99 — Esc starts its navigation on the next task, never inside the key
+  // event. Brave/Chromium treats Esc as "stop loading", so a navigation started
+  // in the keydown is cancelled before the request leaves the browser: the
+  // spinner ran, no request appeared, and u worked while Esc did not.
+  {
+    const doc = makeDoc(); buildMeta(doc);
+    const win = makeWin();
+    const x = buildKbThread(doc, 'Archive');
+    boot(doc, win, () => ({ json: () => Promise.resolve({ ok: true }) }), []);
+    doc.dispatch('keydown', { key: 'Escape' });
+    eq('S99 Esc does not navigate inside the key event', win.location.href, undefined);
+    ok('S99 but acknowledges at once', x.back.classList.contains('busy'));
+    await settle(1);
+    eq('S99 and navigates on the next task', win.location.href, '?page=folder&folder=Archive');
+  }
+  {
+    // The composer's Esc-to-discard is the same kind of navigation.
+    const doc = makeDoc(); buildMeta(doc);
+    const win = makeWin();
+    buildCompose(doc);
+    const topbar = doc.createElement('div'); topbar.className = 'topbar'; doc.add(topbar);
+    const bar = doc.createElement('div'); bar.className = 'nav-progress'; doc.add(bar);
+    boot(doc, win, () => ({ ok: true, json: () => Promise.resolve({ ok: true }) }), []);
+    doc.dispatch('keydown', { key: 'Escape' });
+    eq('S99 Esc does not discard inside the key event', win.location.href, undefined);
+    await settle(1);
+    eq('S99 and discards on the next task', win.location.href, '?page=inbox');
   }
 
   } catch (e) {

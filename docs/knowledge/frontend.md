@@ -310,6 +310,27 @@ and `e` call the bulk paths (`bulkAction`, `bulkMoveTo`, `bulkDelete`, `bulkSpam
 cursor behaviour. The old version always acted on one message while the user was
 looking at several.
 
+**The message body is a same-origin iframe, and it must forward its keys.** A click in the
+message moves focus into `iframe.srcdoc`'s own document, and its `keydown` never bubbles to
+the page. `wireFrameKeys()` binds a listener on that inner document (once per document,
+tracked by `frame._keyDoc`, and re-bound after a reload because the document is new) and
+passes the event to `kbDispatch`. Without it, Esc and every reader shortcut look dead until
+the user clicks a control in the chrome. The forwarding adds no guards of its own: `kbDispatch`
+still applies modal, editable and off-switch rules, so Cmd/Ctrl+C inside the body stays a copy
+and an open dialog keeps Esc.
+
+`kbBack()` reads the Back control from `.actions-bar` (a single message) or `.thread-top` (a
+conversation, whose per-message bars carry none) before it falls back to `?page=inbox`. Missing
+the conversation's own Back sent Esc down the slow Inbox path and spun no button, so the only
+feedback was the chrome bar.
+
+**Esc starts its navigation on the next task.** Chromium (Brave) treats Esc as the "stop
+loading" accelerator. A navigation started inside the keydown is cancelled before the request
+leaves the browser: the spinner and the chrome bar run, the Network tab stays empty, and `u`
+works while Esc does not. `kbNavSoon()` defers the assignment with `setTimeout(…, 0)`; the
+acknowledgement still happens synchronously. `kbDiscard()` (Esc in the composer) uses the same
+helper.
+
 **Escape hatch:** `?` opens the sheet *before* the `kbEnabled` flag is read, so a user who
 clicked "Disable shortcuts" is never trapped. The sheet's link is a toggle
 (set/remove `emmmail-kb`) and the avatar-menu Help item always opens it.

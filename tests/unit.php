@@ -3493,6 +3493,10 @@ assert_false((bool)preg_match('/\.body-iframe\s*\{[^}]*overflow:hidden[^}]*\}/',
     'the .body-iframe rule does not hide overflow unconditionally');
 assert_contains('catch', $jsFit, 'the measurement is guarded against a cross-origin throw');
 assert_contains('ResizeObserver', $jsFit, 'late reflows (images, fonts) are re-measured');
+assert_contains("innerDoc.addEventListener('keydown', function(ev){ kbDispatch(ev); })", $jsFit,
+    'keys pressed inside the message body reach the page keyboard layer');
+assert_contains('frame._keyDoc === innerDoc', $jsFit,
+    'the frame keys are bound once per document, not on every measurement');
 
 
 
@@ -4880,6 +4884,12 @@ assert_contains("Enable shortcuts", $kbJs, 'js: the sheet label reflects the sta
 assert_contains('function kbBusy', $kbJs, 'js: navigation shortcuts run the shared busy helper');
 assert_contains('function kbFolderLink', $kbJs, 'js: a folder jump can spin the folder link');
 assert_contains('markBusy(back)', $kbJs, 'js: reader Back spins its control');
+assert_contains("doc.querySelector('.thread-top')", $kbJs,
+    'js: a conversation Back is found in .thread-top, not only in .actions-bar');
+assert_contains('function kbNavSoon', $kbJs,
+    'js: Esc-started navigations are deferred past the key event');
+assert_contains("kbNavSoon((discard && discard.getAttribute('href'))", $kbJs,
+    'js: Esc-to-discard uses the same deferred navigation');
 // Esc unwinds the composer, and a suggestion dropdown first.
 assert_contains('function kbDiscard', $kbJs, 'js: Esc discards the composer');
 assert_contains('function kbCloseAutocomplete', $kbJs, 'js: Esc closes a suggestion dropdown first');
