@@ -9,10 +9,12 @@ knowledge **out** of this file; add it there and link it from here. Budget: 150 
   sockets for SMTP, vanilla JS, SQLite (PDO). Single `index.php`, routes via `?page=<page>`
   (full list in `README.md`; unknown -> 404, empty -> inbox/login).
 - DB `emmmail.sqlite` (`EMMMAIL_DB_PATH`), forward-only `PRAGMA user_version`
-  (  `SCHEMA_VERSION`). 8 tables: settings, contacts, search_cache (unused), login_attempts,
-  messages (+ `thread_key`, v4), folder_state, folder_list_cache, folder_counts (v3). Bodies are never stored;
-  headers are cached and `read_mark_seen()` keeps a 500-char snippet. The cache survives
-  logout by design.
+  (  `SCHEMA_VERSION`). 9 tables: settings, contacts, search_cache (unused), login_attempts,
+  messages (+ `thread_key`, v4), message_bodies (v5), folder_state, folder_list_cache,
+  folder_counts (v3). Headers are cached; bodies are cached **encrypted** under a key derived
+  from the mail password at login (see [knowledge/imap.md](knowledge/imap.md) and
+  [knowledge/security.md](knowledge/security.md)); `read_mark_seen()` keeps a 500-char snippet.
+  The cache survives logout by design (bodies as opaque blobs).
 - TDD, zero deps. `just test` == `php tests/run.php`; suites `unit js imap smoke`; one with
   `php tests/<name>.php`. **No subset runner** — `run.php` ignores `$argv`, so naming suites
   runs all four. `_`-prefixed files are support, not suites. `smoke` is live (skips w/o
@@ -44,7 +46,9 @@ knowledge **out** of this file; add it there and link it from here. Budget: 150 
   native `confirm()`** — all three test-guarded. All `js_inline()` code stays stub-guarded.
 - Perf shape: `folder_view_data()` takes an IMAP **factory**, so nothing connects unless the
   cache cannot answer. The header cache took a render from 52 IMAP commands (~2310ms) to 0
-  (~30ms warm).
+  (~30ms warm). `message_read_through()` does the same for the reader: a cached, already-read
+  message opens with **no connection**; a miss is `SELECT` + 3 FETCH-class commands. The
+  stylesheet and script are immutable-cached routes (`?page=asset`), not inlined.
 
 ## Plan status
 Details, decisions and owed checks live in each plan; keep its `status:` header honest.
@@ -53,6 +57,11 @@ Details, decisions and owed checks live in each plan; keep its `status:` header 
 commits/pushes the version; the Migadu login lock is verified (no provider picker).
 
 **Code complete, browser pass NOT run** (what is owed, in brief):
+- `2026-11-06-read-and-sync-performance.md` — encrypted body cache + prefetch, one-body
+  conversations with lazy members, 3-command reads, direct-folder open, 5-min reconcile,
+  in-place post-sync refresh, `?page=asset`. Owed: the whole browser pass (see the plan),
+  especially an expanding collapsed member, Show images from one, and a login after deploy
+  (old sessions have no `body_key`, so they run without the body cache until re-login).
 - `2026-11-05-provider-storage-usage.md` — Settings storage card: RFC 2087 QUOTA, or
   cached-message estimate. Deployed in `0.2.0`. Owed: Gmail live, a non-QUOTA server,
   both themes, phone width.
@@ -85,9 +94,13 @@ verified without the provider picker), `2026-10-06-footer.md` (light theme not s
 - Open decision: drop the unused `search_cache` table (one migration + 3 dead helpers). Destructive; needs an explicit yes.
 - Known, unfixed, low priority: server-side-search pagination drops `server=1`; per-row output
   boilerplate is ~660 of 1485 bytes; `MailImap::__construct` pays a wasted TCP probe (~40ms);
-  `handle_read`/`reply`/`forward` ignore `selectFolder()`'s result (read-only, so it degrades to
+  `reply`/`forward` ignore `selectFolder()`'s result (read-only, so it degrades to
   "message not found"); cron-driven sync needs a credential story; nested `INBOX.Deleted Items`
   is not recognised as Trash anywhere (pinned by a test; the delete copy now warns anyway).
+- Known, by design: a body cached display-only (one text part) serves reply/forward from its
+  HTML via `strip_html_for_quote()`, like an HTML-only message; the `\Seen` STORE after a
+  cache hit waits on the response only where `fastcgi_finish_request()` exists (php -S has
+  none). Prefetch is INBOX/current/Sent only — whatever the poll syncs.
 - Known, unfixed (see `2026-10-02-empty-folder-sidebar.md`): after **Clear local cache** the
   sidebar is empty until an inbox visit; a non-UTF-8 folder name makes every folder-list
   write fail, so listings re-LIST each visit.

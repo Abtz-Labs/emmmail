@@ -211,8 +211,13 @@ it once was a live bug: a sync in flight during a folder swap dragged the user b
 folder. A page with no chip (reader, compose, settings) names `INBOX`, and the server syncs
 INBOX alongside whatever folder was named.
 
-A refresh is `win.location.href = win.location.href` — the current URL, so the pagination
-survives. It happens only when `syncCanSwap()`: a `.sync` chip is present (so there is an open
+A refresh is `syncSwap()`: on `?page=folder…` or `?page=inbox` it calls `loadMailbox()` on
+the folder partial (`?page=inbox` is mapped to `?page=folder&folder=INBOX`, which is also what
+the sidebar's active entry matches on) and only falls back to `win.location.href =
+win.location.href` when the swap fails or the page is not a folder listing (search). A reload
+re-ships the chrome and re-runs the script; the swap moves only the rows. The js stub cannot
+parse `innerHTML`, so every swap there *fails* and the S63 rows assert the fetched partial URL
+plus the fallback href assignment. It happens only when `syncCanSwap()`: a `.sync` chip is present (so there is an open
 listing at all), and no `dialog[open]`, no `.row-gone`/`.busy`/`.opening`, `kbCursor < 0`,
 `pickCount() === 0`, `scrollY === 0`, page 1. The chip check is the one that saves a draft: the reader, compose and
 settings have no chip, `changed` there is the Inbox's, and reloading the composer would throw
@@ -276,7 +281,11 @@ lets the reader scale from one message to many:
   ['no_title' => true])`): the conversation has one subject and each summary already carries
   the sender and date, so repeating them per message is noise.
 - A `toggle` listener re-runs `fitSrcdoc()`, because a collapsed `<details>` gives its iframe
-  no box to measure.
+  no box to measure. The same listener calls **`loadThreadMessage()`**: a member whose body was
+  not on hand at render carries `data-lazy` on its `.thread-msg-body`; the first open fetches
+  that URL (`?page=read…&ajax=1`, action bar + body as `html`), drops the attribute so it
+  happens once, and binds `load` on the new iframes. A bad reply leaves a note in the slot.
+  js S100; the markup is pinned in `tests/unit.php`.
 
 ## Mark-as-unread cannot reload
 `handle_read()` marks read on every view, so `win.markUnreadBack()` posts and then navigates

@@ -147,7 +147,8 @@ could post a body that differs from the editor.
 
 ## Undo send
 A session queue, `$_SESSION['undo_queue']`. Send is a **plain POST** in both modes:
-`handle_send` queues (before any SMTP connect) and redirects to Sent, so the composer closes.
+`handle_send` queues (before any SMTP connect) and redirects to the Inbox, so the composer
+closes. (It went to Sent until 2026-11-06; reading is what follows a send, not checking.)
 `render_page()` shows `view_undo_bars()` on every signed-in page, outside `<main>` (which
 `loadMailbox()` replaces). The JS counts against a deadline (background tabs throttle
 timers), POSTs `flushUndo` at 0 (a late entry at once), and Undo POSTs `undoSend`, which

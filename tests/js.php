@@ -3265,7 +3265,8 @@ async function main() {
   // S63 — new mail reloads the open listing, but only when the page is idle.
   // A refresh that would throw away work is deferred, not dropped.
   {
-    // a) idle, on the current URL: reload that URL, do not rebuild one.
+    // a) idle, on the current URL: swap the listing in place through the ajax
+    //    partial; a reply that is not a partial falls back to reloading that URL.
     {
       const doc = makeDoc(); buildPollPage(doc, 'INBOX', 60);
       const win = makeWin();
@@ -3275,9 +3276,38 @@ async function main() {
       const clock = fakeTimers(win);
       boot(doc, win, () => syncReply({ body: { ok: true, synced: '1 new', changed: 1, arrivals: 0 } }), calls);
       await clock.tick(60000);
-      eq('S63 it reloads the URL it is already on', win.location.href, '?page=folder&folder=INBOX');
+      eq('S63 it fetches the listing it is on, in place', calls[1] && calls[1].url, '?page=folder&folder=INBOX&ajax=1');
+      eq('S63 and no other request', calls.length, 2);
+      eq('S63 an unswappable partial reloads the URL it is already on', win.location.href, '?page=folder&folder=INBOX');
       eq('S63 by assigning href once', win._hrefs, before + 1);
-      eq('S63 and does not re-fetch the listing', calls.length, 1);
+      clock.restore();
+    }
+    {
+      // ?page=inbox is the Inbox listing under another name; the swap names the
+      // folder, which is also what the sidebar's active entry matches on.
+      const doc = makeDoc(); buildPollPage(doc, 'INBOX', 60);
+      const win = makeWin();
+      win.location.href = '?page=inbox';
+      const calls = [];
+      const clock = fakeTimers(win);
+      boot(doc, win, () => syncReply({ body: { ok: true, synced: '1 new', changed: 1, arrivals: 0 } }), calls);
+      await clock.tick(60000);
+      eq('S63 the inbox page swaps the INBOX listing', calls[1] && calls[1].url, '?page=folder&folder=INBOX&ajax=1');
+      clock.restore();
+    }
+    {
+      // A listing page that is not a folder (search results) has no partial to
+      // swap: it reloads, and fetches nothing else.
+      const doc = makeDoc(); buildPollPage(doc, 'INBOX', 60);
+      const win = makeWin();
+      win.location.href = '?page=search&q=x&folder=INBOX';
+      const before = win._hrefs;
+      const calls = [];
+      const clock = fakeTimers(win);
+      boot(doc, win, () => syncReply({ body: { ok: true, synced: '1 new', changed: 1, arrivals: 0 } }), calls);
+      await clock.tick(60000);
+      eq('S63 a search page reloads instead', win._hrefs, before + 1);
+      eq('S63 without fetching a partial', calls.length, 1);
       clock.restore();
     }
 
@@ -4588,6 +4618,57 @@ async function main() {
     eq('S99 Esc does not discard inside the key event', win.location.href, undefined);
     await settle(1);
     eq('S99 and discards on the next task', win.location.href, '?page=inbox');
+  }
+
+  // S100 — a collapsed conversation member whose body was not on hand carries
+  // data-lazy. Opening it loads the partial once, into its body slot; a reply
+  // that is not a partial leaves an honest note instead of an empty slot.
+  {
+    const doc = makeDoc(); buildMeta(doc);
+    const win = makeWin();
+    const mk = (uid, lazy) => {
+      const d = doc.createElement('details'); d.className = 'thread-msg';
+      d.setAttribute('data-uid', String(uid));
+      const slot = doc.createElement('div'); slot.className = 'thread-msg-body';
+      if (lazy) slot.setAttribute('data-lazy', '?page=read&uid=' + uid + '&folder=INBOX&ajax=1');
+      d.appendChild(slot);
+      doc.add(d);
+      return { d, slot };
+    };
+    const a = mk(1001, true);
+    const b = mk(1002, false);
+    const calls = [];
+    boot(doc, win, url => {
+      if (url.indexOf('ajax=1') !== -1) return { ok: true, json: () => Promise.resolve({ ok: true, html: '<div class="actions-bar"></div><div class="body">loaded 1001</div>' }) };
+      return { ok: true, json: () => Promise.resolve({ ok: true }) };
+    }, calls);
+    eq('S100 nothing is loaded before a toggle', calls.length, 0);
+    b.d.setAttribute('open', '');
+    b.d.dispatch('toggle');
+    eq('S100 a member rendered in full loads nothing', calls.length, 0);
+    a.d.setAttribute('open', '');
+    a.d.dispatch('toggle');
+    await settle(); await settle();
+    eq('S100 opening a lazy member fetches its partial', calls.length, 1);
+    eq('S100 from the URL the markup named', calls[0].url, '?page=read&uid=1001&folder=INBOX&ajax=1');
+    ok('S100 and puts it in the body slot', a.slot.innerHTML.indexOf('loaded 1001') !== -1);
+    ok('S100 the hook is consumed', !a.slot.hasAttribute('data-lazy'));
+    a.d.dispatch('toggle');
+    await settle();
+    eq('S100 so a second toggle loads nothing again', calls.length, 1);
+  }
+  {
+    const doc = makeDoc(); buildMeta(doc);
+    const win = makeWin();
+    const d = doc.createElement('details'); d.className = 'thread-msg';
+    const slot = doc.createElement('div'); slot.className = 'thread-msg-body';
+    slot.setAttribute('data-lazy', '?page=read&uid=5&folder=INBOX&ajax=1');
+    d.appendChild(slot); doc.add(d);
+    boot(doc, win, () => ({ ok: true, json: () => Promise.resolve({ ok: false, error: 'nope' }) }), []);
+    d.setAttribute('open', '');
+    d.dispatch('toggle');
+    await settle(); await settle();
+    ok('S100 a refused partial leaves a note, not a blank', slot.innerHTML.indexOf('Could not load') !== -1);
   }
 
   } catch (e) {

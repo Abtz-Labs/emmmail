@@ -82,6 +82,22 @@ server-global (`EMMMAIL_ENCRYPTION_KEY`), not session-scoped. One CSRF token per
 shared by all forms (`csrf_page_token()`). The login page is a preset dropdown only — never
 auto-detect, and never derive the server from the email domain. `login_attempts` throttles.
 
+## Cached bodies are ciphertext
+Message bodies in `message_bodies` are secretbox'd under a key derived from the **mail
+password** at login (`body_key_derive`), not under the server key: the server key protects a
+copied session file, this one protects a copied database. The key exists only in a live
+session, so after logout the rows are opaque, and a password change makes them misses. The
+stored JSON is the *unsanitized* decoded message; the sanitizer and the iframe sandbox apply
+at render as always, so the cache adds no new HTML surface. Attachments are never stored.
+**Never add a plain fallback**: no sodium means no body cache (`body_cache_key()` is null).
+Settings says how many bodies are held, and Clear local cache removes them.
+
+## The stylesheet and the script are routes
+`?page=asset&k=css|js&v=<hash>` serves `css_inline()` (without its `<style>` wrapper) and
+`js_inline()` with `Cache-Control: immutable`; `render_page()` links them. No login — the
+login page needs both. The CSP's `script-src 'self'` covers them; `'unsafe-inline'` stays
+for the theme-flash and onboarding snippets. The js suite still reads `js_inline()` directly.
+
 The operator can lock the server from the environment: `EMMMAIL_PROVIDER`, or the
 `EMMMAIL_IMAP_HOST`/`EMMMAIL_SMTP_HOST` pair, or `EMMMAIL_MAIL_SERVER`. A locked deployment
 renders no dropdown, and `handle_login()` ignores the posted preset and custom fields. A

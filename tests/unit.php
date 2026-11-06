@@ -733,6 +733,15 @@ assert_eq(SCHEMA_VERSION, db_schema_version(db_open()), 'fresh db is at the curr
 // busy_timeout for it), so guard that WAL is still actually enabled.
 assert_eq('wal', strtolower((string)db_open()->query('PRAGMA journal_mode')->fetchColumn()),
     'db_open enables WAL');
+// In WAL mode NORMAL is durable across application crashes and skips the fsync
+// per commit, which every per-row cache write otherwise paid.
+assert_eq(1, (int)db_open()->query('PRAGMA synchronous')->fetchColumn(),
+    'db_open sets synchronous=NORMAL');
+
+// The flag reconcile (SELECT + five UID SEARCHes) must not run on every poll:
+// with the interval equal to the poll period the cheap STATUS-only path never won.
+assert_true(SYNC_FULL_INTERVAL_SECONDS >= 5 * SYNC_CLIENT_MIN_PERIOD,
+    'the reconcile interval is several poll periods long');
 
 // Forward-only migrations must be safe to re-run on every request.
 db_migrate(db_open());
@@ -1255,6 +1264,100 @@ assert_eq(null, db_get_folder_state($cc, 'INBOX'), 'folder state removed');
 assert_eq(null, db_get_folder_list($cc, 300), 'cached folder list removed');
 assert_eq('Keep Me', db_get_setting($cc, 'display_name'), 'user settings are NOT cleared');
 assert_eq(1, db_count_cached_messages($cd), 'another user\'s cache is untouched');
+
+// ------------------------------------------------------- body cache --------+
+group('Tier 2 — body cache (encrypted at rest)');
+
+assert_true(SCHEMA_VERSION >= 5, 'schema is at least v5');
+assert_true(db_has_column(db_open(), 'message_bodies', 'blob'), 'message_bodies table exists');
+
+if (!function_exists('sodium_crypto_pwhash')) {
+    skip('libsodium missing: body cache tests skipped');
+} else {
+    $bu = 'bodies@example.com';
+    $bodyKey = body_key_derive('hunter2', $bu);
+    assert_eq(SODIUM_CRYPTO_SECRETBOX_KEYBYTES, strlen((string)$bodyKey), 'the key is a secretbox key');
+    assert_eq($bodyKey, body_key_derive('hunter2', $bu), 'derivation is deterministic');
+    assert_eq($bodyKey, body_key_derive('hunter2', 'Bodies@Example.com'), 'and case-insensitive on the address');
+    assert_true($bodyKey !== body_key_derive('hunter2', 'other@example.com'), 'but differs per account');
+    assert_true($bodyKey !== body_key_derive('hunter3', $bu), 'and per password');
+
+    $otherKey = body_key_derive('hunter3', $bu);
+    $message = ['uid' => 7, 'subject' => 'Hi', 'from' => 'A <a@x.io>', 'from_address' => 'a@x.io', 'to' => 'me',
+        'cc' => '', 'bcc' => '', 'reply_to_address' => '', 'message_id' => '<m7@x.io>', 'in_reply_to' => '',
+        'references' => '', 'date' => 'Mon, 1 Jan 2026 10:00:00 +0000', 'timestamp' => 1767261600,
+        'body_html' => '<p>Hello <b>there</b></p>', 'body_text' => '', 'attachments' => [['part_number' => '2', 'filename' => 'a.pdf', 'size' => 10, 'subtype' => 'pdf']], 'unread' => true];
+    db_upsert_messages($bu, 'INBOX', [$msg(7, 1767261600)]);
+
+    assert_eq(null, body_cache_get($bu, 'INBOX', 7, $bodyKey), 'a miss is null');
+    assert_false(body_cache_put($bu, 'INBOX', 7, $message, null), 'no key, no store');
+    assert_eq(null, body_cache_get($bu, 'INBOX', 7, $bodyKey), 'and nothing was written');
+    assert_true(body_cache_put($bu, 'INBOX', 7, $message, $bodyKey), 'a body is stored with a key');
+    $hit = body_cache_get($bu, 'INBOX', 7, $bodyKey);
+    assert_eq($message['body_html'], $hit['body_html'] ?? null, 'the HTML body round-trips');
+    assert_eq($message['attachments'], $hit['attachments'] ?? null, 'the attachment list round-trips');
+    assert_eq(null, body_cache_get($bu, 'INBOX', 7, $otherKey), 'another key reads it as a miss, not an error');
+    assert_eq(null, body_cache_get($bu, 'INBOX', 7, null), 'no key reads it as a miss');
+    $rawBlob = db_open()->query("SELECT blob FROM message_bodies WHERE user_email = 'bodies@example.com' AND uid = 7")->fetchColumn();
+    assert_not_contains('Hello', (string)$rawBlob, 'the stored blob is ciphertext');
+    assert_not_contains('a.pdf', (string)$rawBlob, 'including the attachment names');
+
+    // A row that would blow the per-body limit is served but not kept.
+    $huge = $message + [];
+    $huge['body_html'] = str_repeat('x', BODY_CACHE_MAX_BYTES + 1);
+    assert_false(body_cache_put($bu, 'INBOX', 8, $huge, $bodyKey), 'an oversized body is not stored');
+
+    // The budget evicts the oldest fetched first.
+    for ($i = 100; $i < 100 + BODY_CACHE_MAX_ROWS + 5; $i++) {
+        body_cache_put($bu, 'INBOX', $i, $message + ['uid' => $i], $bodyKey, time() + $i);
+    }
+    $stats = db_body_stats($bu);
+    assert_eq(BODY_CACHE_MAX_ROWS, $stats['count'], 'the row budget holds');
+    assert_eq(null, body_cache_get($bu, 'INBOX', 7, $bodyKey), 'the oldest row was evicted');
+    assert_true(body_cache_get($bu, 'INBOX', 100 + BODY_CACHE_MAX_ROWS + 4, $bodyKey) !== null, 'the newest survives');
+    assert_true($stats['bytes'] > 0, 'the byte total is tracked');
+
+    // A body dies with its header row, and with the cache.
+    db_delete_messages($bu, 'INBOX', [100 + BODY_CACHE_MAX_ROWS + 4]);
+    assert_eq(null, body_cache_get($bu, 'INBOX', 100 + BODY_CACHE_MAX_ROWS + 4, $bodyKey), 'deleting the header deletes the body');
+    db_delete_messages($bu, 'INBOX');
+    assert_eq(0, db_body_stats($bu)['count'], 'purging the folder purges its bodies');
+    body_cache_put($bu, 'Sent', 1, $message, $bodyKey);
+    body_cache_put('keep@example.com', 'Sent', 1, $message, $bodyKey);
+    db_clear_cache_for_user($bu);
+    assert_eq(0, db_body_stats($bu)['count'], 'Clear local cache clears the bodies');
+    assert_eq(1, db_body_stats('keep@example.com')['count'], 'for that user only');
+
+    // The read-through: a hit never calls the factory; a miss fetches, stores,
+    // and returns what the server said.
+    $calls = 0;
+    $fake = new class {
+        public $msg = ['uid' => 9, 'subject' => 'S', 'from' => 'f', 'from_address' => 'f@x.io', 'to' => 't', 'cc' => '',
+            'bcc' => '', 'reply_to_address' => '', 'message_id' => '', 'in_reply_to' => '', 'references' => '',
+            'date' => '', 'timestamp' => 1, 'body_html' => '<p>nine</p>', 'body_text' => '', 'attachments' => [], 'unread' => false];
+        public function selectFolder(string $f, bool $force = false): bool { return true; }
+        public function getEmailByUid(int $uid, bool $allParts = true): ?array { return $uid === 9 ? $this->msg : null; }
+    };
+    $factory = function () use (&$calls, $fake) { $calls++; return $fake; };
+    $got = message_read_through($factory, $bu, 'INBOX', 9, $bodyKey);
+    assert_eq('<p>nine</p>', $got['body_html'] ?? null, 'a miss fetches the message');
+    assert_eq(1, $calls, 'through the factory, once');
+    $got = message_read_through($factory, $bu, 'INBOX', 9, $bodyKey);
+    assert_eq('<p>nine</p>', $got['body_html'] ?? null, 'a hit serves the same message');
+    assert_eq(1, $calls, 'without touching the factory');
+    assert_eq(null, message_read_through($factory, $bu, 'INBOX', 10, $bodyKey), 'an unknown uid is null');
+    $noConn = function () { return null; };
+    assert_eq(null, message_read_through($noConn, $bu, 'INBOX', 11, $bodyKey), 'no connection on a miss is null');
+
+    // The snippet comes from the plain part, else from the HTML.
+    assert_eq('nine', message_snippet($fake->msg), 'an HTML-only body is stripped for the snippet');
+    assert_eq('plain', message_snippet(['body_text' => ' plain ', 'body_html' => '<p>x</p>']), 'the plain part wins when present');
+}
+
+// The README limitation is lifted together with the code.
+$readmeSrc = file_get_contents(__DIR__ . '/../README.md');
+assert_not_contains('bodies** are not stored', $readmeSrc, 'README no longer says bodies are never stored');
+assert_contains('encrypted', $readmeSrc, 'README documents the encrypted body cache');
 
 // ------------------------------------------------ sync endpoint (Phase 6) ---+group('relative_time()');
 
@@ -2199,7 +2302,23 @@ group('render_page() carries the shared JS even when logged out');
 ob_start();
 render_page('T', '<div id="probe">x</div>', false);
 $page = ob_get_clean();
-assert_contains('Em.prototype.each', $page, 'render_page: shared toolkit present when logged out');
+// The toolkit is linked, not inlined: ~190 KB of CSS+JS per navigation was
+// never cacheable, and the reader is a full navigation on every message open.
+assert_contains('<script src="?page=asset&amp;k=js&amp;v=' . asset_version() . '"></script>', $page,
+    'render_page: shared toolkit linked when logged out');
+assert_not_contains('Em.prototype.each', $page, 'render_page: the toolkit source is not inlined');
+assert_contains('<link rel="stylesheet" href="?page=asset&amp;k=css&amp;v=' . asset_version() . '">', $page,
+    'render_page: the stylesheet is linked');
+assert_not_contains('--nord0:', $page, 'render_page: the stylesheet is not inlined');
+assert_true((bool)preg_match('/^[0-9a-f]{8,}$/', asset_version()), 'asset_version() is a content hash');
+assert_eq(js_inline(), asset_body('js'), 'asset_body(js) is the toolkit source');
+assert_true(strpos((string)asset_body('css'), '<style') === false, 'asset_body(css) has no <style> wrapper');
+assert_contains('--nord0:', (string)asset_body('css'), 'asset_body(css) is the stylesheet');
+assert_eq(null, asset_body('svg'), 'an unknown asset kind is null');
+// Served before any login check: the login page needs both.
+$routerSrc = substr(file_get_contents(__DIR__ . '/../index.php'), strpos(file_get_contents(__DIR__ . '/../index.php'), '// [10] Router/bootstrap'));
+assert_contains("case 'asset':", $routerSrc, 'the asset route exists');
+assert_contains('max-age=31536000, immutable', file_get_contents(__DIR__ . '/../index.php'), 'assets are immutable-cached');
 
 group('render_page() ships an inline SVG favicon');
 // On the logged-out page, so the login screen has it too. The payload is
@@ -2656,7 +2775,32 @@ $posMeta = strpos($threadView, 'class="meta"');
 assert_true($posActions !== false && $posMeta !== false && $posActions < $posMeta,
     'each message puts its actions above the message');
 
-group('view_message_actions() can drop the Back control');
+group('view_thread() renders a collapsed member lazily');
+
+// handle_thread() fetched every member's body up front: 37 commands for ten
+// messages, of which the reader showed one. A member whose body is not on hand
+// renders its summary from the header cache and a hook the client loads on
+// toggle; a member whose body IS on hand (the cache) renders in full.
+$lazyMsgs = [
+    $tmsg(1001, 'A <a@x.io>', 'Mon, 1 Jan 2026 09:00:00 +0000', '') + ['lazy' => true],
+    $tmsg(1002, 'B <b@x.io>', 'Tue, 2 Jan 2026 09:00:00 +0000', '<p>two</p>'),
+];
+$lazyMsgs[0]['email']['body_html'] = '';
+$lazyView = view_thread($lazyMsgs, 'INBOX', 'Thread subject', 'me@x.io', $threadFolders);
+assert_eq(2, substr_count($lazyView, '<details'), 'both members are listed');
+assert_eq(1, substr_count($lazyView, 'class="actions-bar"'), 'only the loaded member has an action bar');
+assert_eq(1, substr_count($lazyView, '<iframe'), 'and only it has a body iframe');
+assert_contains('data-lazy="?page=read&amp;uid=1001&amp;folder=INBOX&amp;ajax=1"', $lazyView,
+    'the collapsed member names the request that loads it');
+assert_contains('a@x.io', $lazyView, 'its summary still shows the sender');
+assert_contains('thread-loading', $lazyView, 'with a loading placeholder in the body slot');
+assert_contains('data-reply="?page=reply&amp;uid=1001&amp;folder=INBOX"', $lazyView,
+    'the keyboard hooks need no body');
+$thSrcLazy = (string)file_get_contents(__DIR__ . '/../index.php');
+assert_contains('function loadThreadMessage', js_inline(), 'js: the toggle loads the member');
+assert_contains("'.thread-msg-body'", js_inline(), 'js: into the body slot the markup names');
+assert_contains('message_read_through(', $thSrcLazy, 'handle_read reads through the body cache');
+
 
 $noBack = view_message_actions($threadMsgs[1]['email'], 1002, 'INBOX', 'me@x.io', '', false);
 assert_not_contains('data-tip="Back"', $noBack, 'the per-message bar drops Back');
@@ -5961,7 +6105,8 @@ assert_true($queueAt !== false && $connAt !== false && $queueAt < $connAt,
     'the message is queued before any SMTP connection');
 $queueBody = $queueAt === false ? '' : substr($sendBody, $queueAt, $connAt - $queueAt);
 assert_not_contains('json_out(', $queueBody, 'the queue branch has no AJAX reply');
-assert_contains("redirect('?page=folder&folder=' . urlencode(", $queueBody, 'it goes to Sent, like a sent message');
+assert_contains("redirect('?page=inbox')", $queueBody, 'it goes back to the Inbox, like a sent message');
+assert_not_contains("findSentFolder() ?: 'INBOX'", $sendBody, 'Send never lands the user in Sent');
 assert_not_contains("undoSeconds", js_inline(), 'the composer does not post by AJAX');
 assert_not_contains("alert(d.error", js_inline(), 'and its alert() error path is gone');
 

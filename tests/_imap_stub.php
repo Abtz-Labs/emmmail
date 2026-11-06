@@ -54,6 +54,7 @@ function scenario(string $f): array
         'flagged'         => [],
         'answered'        => [],
         'attachment_uids' => [],
+        'alternative_uids' => [], // multipart/alternative: text/plain + text/html
     ];
     if ($s['uids'] === null) {
         $s['uids'] = [];
@@ -143,6 +144,9 @@ function fetchResponse(array $s, int $msgno, int $uid, string $items, bool $forc
         if (in_array($uid, $s['attachment_uids'], true)) {
             $pdf = '("APPLICATION" "PDF" ("NAME" "a.pdf") NIL NIL "BASE64" 1000 NIL ("ATTACHMENT" ("FILENAME" "a.pdf")) NIL)';
             $parts[] = 'BODYSTRUCTURE (' . $text . $pdf . ' "MIXED")';
+        } elseif (in_array($uid, array_map('intval', $s['alternative_uids']), true)) {
+            $html = '("TEXT" "HTML" ("CHARSET" "utf-8") NIL NIL "7BIT" 120 5 NIL NIL NIL)';
+            $parts[] = 'BODYSTRUCTURE (' . $text . $html . ' "ALTERNATIVE")';
         } else {
             $parts[] = 'BODYSTRUCTURE ("TEXT" "PLAIN" ("CHARSET" "utf-8") NIL NIL "7BIT" 100 5 NIL NIL NIL)';
         }

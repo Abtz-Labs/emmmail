@@ -70,16 +70,20 @@ define('DEFAULT_SHOW_REMOTE_IMAGES', '0');
 define('LOGIN_MAX_FAILURES', 5);
 define('LOGIN_WINDOW_SECONDS', 900);       // 15 min
 define('SEARCH_CACHE_TTL_SECONDS', 604800); // 7 days
-define('SCHEMA_VERSION', 4);               // see db_migration_step()
+define('SCHEMA_VERSION', 5);               // see db_migration_step()
 define('FOLDER_LIST_TTL_SECONDS', 900);    // 15 min; LIST rarely changes
 define('UNDO_FLUSH_TRIES', 3);             // a queued message that can be neither sent nor saved
-define('SYNC_FULL_INTERVAL_SECONDS', 60);  // flag reconcile cadence
+define('SYNC_FULL_INTERVAL_SECONDS', 300); // flag reconcile cadence; STATUS catches arrivals, expunges and reads
 define('SYNC_WINDOW', 500);                // newest N messages cached per folder
 define('SYNC_BACKFILL_BATCH', 20);         // attachment flags resolved per sync
 define('SYNC_MIN_INTERVAL_SECONDS', 15);   // throttle for the sync endpoint
 define('SYNC_CLIENT_MIN_PERIOD', 60);      // how often an open tab checks for new mail
 define('THREAD_MAX_MESSAGES', 30);         // conversations render this many newest messages
 define('COUNTS_SWEEP_INTERVAL_SECONDS', 60); // sidebar counters: STATUS per closed folder
+define('SYNC_BODY_PREFETCH', 10);          // bodies fetched per sync for the newest arrivals
+define('BODY_CACHE_MAX_ROWS', 300);        // bodies kept per user
+define('BODY_CACHE_MAX_TOTAL', 50 * 1024 * 1024); // bytes of ciphertext kept per user
+define('BODY_CACHE_MAX_BYTES', 1024 * 1024); // a body above this is served, never stored
 define('ENCRYPTION_KEY', getenv('EMMMAIL_ENCRYPTION_KEY') ?: 'dev-only-change-me-32-char-key!!');
 
 $dbPath = getenv('EMMMAIL_DB_PATH') ?: __DIR__ . '/emmmail.sqlite';
@@ -1582,6 +1586,10 @@ function db_open($path = null)
       // Keep whatever journal mode the database already has.
     }
     $pdo->exec('PRAGMA foreign_keys=ON');
+    // WAL + NORMAL: durable across an application crash, and no fsync per
+    // commit. The cache writes one row at a time in places, and each of those
+    // commits paid a full sync under the default.
+    $pdo->exec('PRAGMA synchronous=NORMAL');
     db_migrate($pdo);
     return $pdo;
   } catch (Throwable $e) {
@@ -1783,6 +1791,25 @@ function db_migration_step(PDO $pdo, int $version): void
       // let the next visit to each folder cold-sync with real keys.
       $pdo->exec("DELETE FROM messages");
       $pdo->exec("UPDATE folder_state SET cached_rows = 0, last_full_ts = 0");
+      break;
+
+    case 5:
+      // Message bodies, encrypted with a key derived from the mail password at
+      // login (see body_key_derive). `blob` is nonce + secretbox ciphertext of
+      // the JSON message array; `bytes` is its length, for the per-user budget.
+      // A row lives and dies with its header row in `messages`.
+      $pdo->exec("CREATE TABLE IF NOT EXISTS message_bodies (
+        user_email TEXT    NOT NULL,
+        folder     TEXT    NOT NULL,
+        uid        INTEGER NOT NULL,
+        blob       BLOB    NOT NULL,
+        bytes      INTEGER NOT NULL,
+        fetched_at INTEGER NOT NULL,
+        UNIQUE(user_email, folder, uid)
+    )");
+      // Eviction walks the oldest fetched first.
+      $pdo->exec("CREATE INDEX IF NOT EXISTS idx_body_age
+        ON message_bodies(user_email, fetched_at)");
       break;
 
     default:
@@ -2230,6 +2257,8 @@ function db_delete_messages(string $email, string $folder, ?array $uids = null):
   $pdo = db_open();
   if (!$pdo) return 0;
   if ($uids !== null && !$uids) return 0;
+  // The body lives and dies with its header row.
+  db_delete_bodies($email, $folder, $uids);
   try {
     if ($uids === null) {
       $stmt = $pdo->prepare('DELETE FROM messages WHERE user_email = ? AND folder = ?');
@@ -2381,6 +2410,225 @@ function cache_apply_move(string $email, string $from, int $uid, ?string $to = n
   }
 }
 
+// --- Body cache ---
+//
+// Bodies are stored encrypted with a key that exists only in a live session:
+// body_key_derive() at login, kept like the password. The cache therefore
+// survives logout as opaque blobs, a copied database is useless without the
+// password, and a changed password turns old rows into misses the next fetch
+// overwrites. Without libsodium there is no body cache at all, never a plain one.
+
+function body_key_derive(string $password, string $email): ?string
+{
+  if (!function_exists('sodium_crypto_pwhash')) {
+    return null;
+  }
+  // The salt is per account, so two users with one password get two keys.
+  $salt = substr(hash('sha256', 'emmmail-body:' . strtolower(trim($email)), true), 0, SODIUM_CRYPTO_PWHASH_SALTBYTES);
+  return sodium_crypto_pwhash(
+    SODIUM_CRYPTO_SECRETBOX_KEYBYTES,
+    $password,
+    $salt,
+    SODIUM_CRYPTO_PWHASH_OPSLIMIT_INTERACTIVE,
+    SODIUM_CRYPTO_PWHASH_MEMLIMIT_INTERACTIVE,
+    SODIUM_CRYPTO_PWHASH_ALG_ARGON2ID13
+  );
+}
+
+// The session's body key, or null when there is none (no sodium, or a session
+// from before the cache existed).
+function body_cache_key(): ?string
+{
+  if (empty($_SESSION['body_key']) || !function_exists('sodium_crypto_secretbox')) {
+    return null;
+  }
+  $key = session_decrypt((string)$_SESSION['body_key']);
+  return strlen($key) === SODIUM_CRYPTO_SECRETBOX_KEYBYTES ? $key : null;
+}
+
+function body_seal(array $message, string $key): ?string
+{
+  $json = json_encode($message, JSON_INVALID_UTF8_SUBSTITUTE);
+  if (!is_string($json)) {
+    return null;
+  }
+  $nonce = random_bytes(SODIUM_CRYPTO_SECRETBOX_NONCEBYTES);
+  return $nonce . sodium_crypto_secretbox($json, $nonce, $key);
+}
+
+function body_open(string $blob, string $key): ?array
+{
+  if (strlen($blob) <= SODIUM_CRYPTO_SECRETBOX_NONCEBYTES) {
+    return null;
+  }
+  $nonce = substr($blob, 0, SODIUM_CRYPTO_SECRETBOX_NONCEBYTES);
+  $plain = @sodium_crypto_secretbox_open(substr($blob, SODIUM_CRYPTO_SECRETBOX_NONCEBYTES), $nonce, $key);
+  if (!is_string($plain)) {
+    return null; // another key: a miss, not an error
+  }
+  $message = json_decode($plain, true);
+  return is_array($message) ? $message : null;
+}
+
+function db_get_body(string $email, string $folder, int $uid): ?string
+{
+  $pdo = db_open();
+  if (!$pdo) return null;
+  try {
+    $stmt = $pdo->prepare('SELECT blob FROM message_bodies WHERE user_email = ? AND folder = ? AND uid = ?');
+    $stmt->execute([$email, $folder, $uid]);
+    $blob = $stmt->fetchColumn();
+    return is_string($blob) ? $blob : null;
+  } catch (Throwable $e) {
+    return null;
+  }
+}
+
+function db_put_body(string $email, string $folder, int $uid, string $blob, int $now): bool
+{
+  $pdo = db_open();
+  if (!$pdo) return false;
+  try {
+    $stmt = $pdo->prepare('INSERT INTO message_bodies (user_email, folder, uid, blob, bytes, fetched_at)
+        VALUES (?,?,?,?,?,?)
+        ON CONFLICT(user_email, folder, uid) DO UPDATE SET
+          blob = excluded.blob, bytes = excluded.bytes, fetched_at = excluded.fetched_at');
+    $stmt->bindValue(1, $email);
+    $stmt->bindValue(2, $folder);
+    $stmt->bindValue(3, $uid, PDO::PARAM_INT);
+    $stmt->bindValue(4, $blob, PDO::PARAM_LOB);
+    $stmt->bindValue(5, strlen($blob), PDO::PARAM_INT);
+    $stmt->bindValue(6, $now, PDO::PARAM_INT);
+    return $stmt->execute();
+  } catch (Throwable $e) {
+    return false;
+  }
+}
+
+// Enforce the per-user budget, oldest fetched first. Returns rows evicted.
+function db_trim_bodies(string $email, int $maxRows, int $maxTotal): int
+{
+  $pdo = db_open();
+  if (!$pdo) return 0;
+  try {
+    $stats = db_body_stats($email);
+    if ($stats['count'] <= $maxRows && $stats['bytes'] <= $maxTotal) {
+      return 0;
+    }
+    $stmt = $pdo->prepare('SELECT folder, uid, bytes FROM message_bodies WHERE user_email = ? ORDER BY fetched_at ASC, uid ASC');
+    $stmt->execute([$email]);
+    $count = $stats['count'];
+    $bytes = $stats['bytes'];
+    $del = $pdo->prepare('DELETE FROM message_bodies WHERE user_email = ? AND folder = ? AND uid = ?');
+    $evicted = 0;
+    $pdo->beginTransaction();
+    foreach ($stmt->fetchAll() as $row) {
+      if ($count <= $maxRows && $bytes <= $maxTotal) break;
+      $del->execute([$email, $row['folder'], (int)$row['uid']]);
+      $count--;
+      $bytes -= (int)$row['bytes'];
+      $evicted++;
+    }
+    $pdo->commit();
+    return $evicted;
+  } catch (Throwable $e) {
+    if ($pdo->inTransaction()) $pdo->rollBack();
+    return 0;
+  }
+}
+
+function db_delete_bodies(string $email, string $folder, ?array $uids = null): int
+{
+  $pdo = db_open();
+  if (!$pdo) return 0;
+  if ($uids !== null && !$uids) return 0;
+  try {
+    if ($uids === null) {
+      $stmt = $pdo->prepare('DELETE FROM message_bodies WHERE user_email = ? AND folder = ?');
+      $stmt->execute([$email, $folder]);
+      return $stmt->rowCount();
+    }
+    $ints = array_map('intval', $uids);
+    $in = implode(',', array_fill(0, count($ints), '?'));
+    $stmt = $pdo->prepare("DELETE FROM message_bodies WHERE user_email = ? AND folder = ? AND uid IN ($in)");
+    $stmt->execute(array_merge([$email, $folder], $ints));
+    return $stmt->rowCount();
+  } catch (Throwable $e) {
+    return 0;
+  }
+}
+
+function db_body_stats(string $email): array
+{
+  $pdo = db_open();
+  if (!$pdo) return ['count' => 0, 'bytes' => 0];
+  try {
+    $stmt = $pdo->prepare('SELECT COUNT(*) AS n, COALESCE(SUM(bytes), 0) AS b FROM message_bodies WHERE user_email = ?');
+    $stmt->execute([$email]);
+    $row = $stmt->fetch() ?: [];
+    return ['count' => (int)($row['n'] ?? 0), 'bytes' => (int)($row['b'] ?? 0)];
+  } catch (Throwable $e) {
+    return ['count' => 0, 'bytes' => 0];
+  }
+}
+
+function body_cache_get(string $email, string $folder, int $uid, ?string $key): ?array
+{
+  if ($key === null || !function_exists('sodium_crypto_secretbox_open')) {
+    return null;
+  }
+  $blob = db_get_body($email, $folder, $uid);
+  return $blob === null ? null : body_open($blob, $key);
+}
+
+// Store one fetched message. False when there is no key, the body is over the
+// per-body limit, or the write failed; the caller has the message either way.
+function body_cache_put(string $email, string $folder, int $uid, array $message, ?string $key, ?int $now = null): bool
+{
+  if ($key === null || !function_exists('sodium_crypto_secretbox')) {
+    return false;
+  }
+  $blob = body_seal($message, $key);
+  if ($blob === null || strlen($blob) > BODY_CACHE_MAX_BYTES) {
+    return false;
+  }
+  if (!db_put_body($email, $folder, $uid, $blob, $now ?? time())) {
+    return false;
+  }
+  db_trim_bodies($email, BODY_CACHE_MAX_ROWS, BODY_CACHE_MAX_TOTAL);
+  return true;
+}
+
+// One message, from the body cache when it is there, else from the server --
+// and then into the cache. $getImap is called only on a miss. $allParts is
+// passed through to getEmailByUid(); a cached copy wins whatever it holds.
+function message_read_through(callable $getImap, string $email, string $folder, int $uid, ?string $key, bool $allParts = false): ?array
+{
+  $hit = body_cache_get($email, $folder, $uid, $key);
+  if ($hit !== null) {
+    return $hit;
+  }
+  $imap = $getImap();
+  if (!$imap || !$imap->selectFolder($folder)) {
+    return null;
+  }
+  $message = $imap->getEmailByUid($uid, $allParts);
+  if ($message) {
+    body_cache_put($email, $folder, $uid, $message, $key);
+  }
+  return $message;
+}
+
+// The 500-char search snippet: the plain part, else the HTML stripped. Pure.
+function message_snippet(array $email): string
+{
+  $text = trim((string)($email['body_text'] ?? ''));
+  if ($text === '') {
+    $text = trim(html_entity_decode(strip_tags((string)($email['body_html'] ?? '')), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+  }
+  return mb_substr($text, 0, 500);
+}
+
 // Escape LIKE wildcards so a query containing % or _ matches literally.
 function _like_escape(string $s): string
 {
@@ -2481,7 +2729,7 @@ function db_clear_cache_for_user(string $email): bool
   if (!$pdo) return false;
   try {
     $pdo->beginTransaction();
-    foreach (['messages', 'folder_state', 'folder_list_cache', 'folder_counts'] as $table) {
+    foreach (['messages', 'message_bodies', 'folder_state', 'folder_list_cache', 'folder_counts'] as $table) {
       $stmt = $pdo->prepare("DELETE FROM $table WHERE user_email = ?");
       $stmt->execute([$email]);
     }
@@ -3508,8 +3756,14 @@ function sync_folder(MailImap $imap, string $email, string $folder, array $opts 
       }
     }
   }
-  foreach ($result['flag_updates'] as $uid => $flags) {
-    db_set_message_flags($email, $folder, (int)$uid, $flags);
+  if ($result['flag_updates']) {
+    $pdo = db_open();
+    // One transaction for the batch: each UPDATE was its own commit.
+    if ($pdo) $pdo->beginTransaction();
+    foreach ($result['flag_updates'] as $uid => $flags) {
+      db_set_message_flags($email, $folder, (int)$uid, $flags);
+    }
+    if ($pdo && $pdo->inTransaction()) $pdo->commit();
   }
   if ($result['delete_uids']) {
     db_delete_messages($email, $folder, $result['delete_uids']);
@@ -3526,6 +3780,26 @@ function sync_folder(MailImap $imap, string $email, string $folder, array $opts 
     $prevUidnext === null ? null : (int)$prevUidnext,
     $plan['purge_all']
   );
+
+  // Bounded body prefetch for the newest arrivals, on the connection that is
+  // already open and selected, so their first open is a cache hit. Only the
+  // poll asks for it: the render path passes no budget, like backfill. Not
+  // counted in 'changed' either.
+  $prefetch = (int)($opts['prefetch'] ?? 0);
+  $bodyKey  = $opts['body_key'] ?? null;
+  if ($prefetch > 0 && is_string($bodyKey) && $new) {
+    $uids = array_map(fn($r) => (int)$r['uid'], $new);
+    rsort($uids, SORT_NUMERIC);
+    foreach (array_slice($uids, 0, $prefetch) as $uid) {
+      if (body_cache_get($email, $folder, $uid, $bodyKey) !== null) {
+        continue;
+      }
+      $message = $imap->getEmailByUid($uid, false);
+      if ($message) {
+        body_cache_put($email, $folder, $uid, $message, $bodyKey, $now);
+      }
+    }
+  }
 
   // Bounded attachment backfill. Deliberately excluded from 'changed': it would
   // otherwise report work on every sync and the client would reload in a loop.
@@ -3565,7 +3839,13 @@ class MailImap
   private $folderMap = null;
   public  $lastError = '';
 
-  public function __construct(string $server, int $port, string $username, string $password, string $encryption = 'ssl')
+  /**
+   * $mailbox, when given, is selected by the open itself: one SELECT instead
+   * of the half-open's NOOP + SELECT on the first selectFolder(). A mailbox the
+   * server refuses falls back to the half-open, so a bad folder name reads as
+   * "message not found" downstream and never as "unable to connect".
+   */
+  public function __construct(string $server, int $port, string $username, string $password, string $encryption = 'ssl', string $mailbox = '')
   {
     if (!function_exists('imap_open')) {
       $this->lastError = 'PHP IMAP extension is not installed.';
@@ -3585,6 +3865,19 @@ class MailImap
 
     $verify = IMAP_VERIFY_CERT ? '' : '/novalidate-cert';
     $this->serverPrefix = '{' . $server . ':' . $port . '/imap/' . $encryption . $verify . '}';
+    if ($mailbox !== '') {
+      @imap_errors();
+      $this->conn = @imap_open($this->serverPrefix . $mailbox, $username, $password, OP_SILENT, 1);
+      $errs = @imap_errors();
+      if ($this->conn && !$errs) {
+        $this->currentFolder = $mailbox;
+        return;
+      }
+      if ($this->conn) {
+        @imap_close($this->conn);
+        $this->conn = null;
+      }
+    }
     $this->conn = @imap_open(
       $this->serverPrefix . 'INBOX',
       $username,
@@ -3976,7 +4269,12 @@ class MailImap
     return $emails;
   }
 
-  public function getEmailByUid(int $uid): ?array
+  /**
+   * One message by UID. With $allParts the body carries every text alternative
+   * (quoting and draft editing want the plain one); without it, one part is
+   * fetched, HTML preferred, which is all the reader shows.
+   */
+  public function getEmailByUid(int $uid, bool $allParts = true): ?array
   {
     // imap_msgno() throws a ValueError below 1, and '@' does not stop it.
     if ($uid < 1) {
@@ -3986,12 +4284,14 @@ class MailImap
     if (!$msgno) {
       return null;
     }
-    $header = @imap_headerinfo($this->conn, $msgno);
+    // Structure BEFORE header: c-client then asks for BODYSTRUCTURE in the same
+    // FETCH as the envelope. The other way round costs a second command.
     $structure = @imap_fetchstructure($this->conn, $msgno);
+    $header = @imap_headerinfo($this->conn, $msgno);
     if (!$header || !$structure) {
       return null;
     }
-    $body = $this->getBody($msgno, $structure);
+    $body = $this->getBody($msgno, $structure, $allParts);
 
     $fromAddress = $this->extractEmail($header->fromaddress ?? '');
     if (empty($fromAddress) && !empty($header->from) && is_array($header->from)) {
@@ -4024,7 +4324,7 @@ class MailImap
     ];
   }
 
-  private function getBody(int $msgno, $structure): array
+  private function getBody(int $msgno, $structure, bool $allParts = true): array
   {
     $body = ['html' => '', 'text' => ''];
     if (empty($structure->parts)) {
@@ -4042,13 +4342,50 @@ class MailImap
       } else {
         $body['text'] = $decoded;
       }
-    } else {
+    } elseif ($allParts) {
       $this->parseParts($msgno, $structure->parts, '', $body);
+    } else {
+      // Display wants one part. Walk the structure (already fetched) for the
+      // candidates, then fetch the first HTML one, or the first plain one.
+      $cands = [];
+      $this->collectTextParts($structure->parts, '', $cands);
+      $pick = null;
+      foreach ($cands as $c) {
+        if ($c['html']) { $pick = $c; break; }
+      }
+      if ($pick === null && $cands) {
+        $pick = $cands[0];
+      }
+      if ($pick !== null) {
+        $data = @imap_fetchbody($this->conn, $msgno, $pick['number'], FT_PEEK);
+        if ($data !== false) {
+          $body[$pick['html'] ? 'html' : 'text'] = $this->decodeBody($data, $pick['part']);
+        }
+      }
     }
     if (empty($body['html']) && !empty($body['text'])) {
       $body['html'] = nl2br(h($body['text']));
     }
     return $body;
+  }
+
+  // The non-attachment text parts, in structure order, without fetching any.
+  private function collectTextParts(array $parts, string $prefix, array &$out): void
+  {
+    foreach ($parts as $index => $part) {
+      $partNumber = $prefix ? ($prefix . '.' . ($index + 1)) : (string)($index + 1);
+      if (($part->type ?? 0) === 1 && !empty($part->parts)) {
+        $this->collectTextParts($part->parts, $partNumber, $out);
+        continue;
+      }
+      if (($part->type ?? 0) === 0 && !$this->isAttachmentPart($part)) {
+        $out[] = [
+          'number' => $partNumber,
+          'part'   => $part,
+          'html'   => strtolower($part->subtype ?? 'plain') === 'html',
+        ];
+      }
+    }
   }
 
   private function parseParts(int $msgno, array $parts, string $prefix, array &$body): void
@@ -5078,7 +5415,8 @@ function current_user(): ?string
 // Build an IMAP connection for the logged-in user (or fail to login).
 // $redirectOnFail = false is for the JSON handlers: a redirect to logout inside a
 // fetch() would destroy the session, and the undo queue with it.
-function imap_for_session(bool $redirectOnFail = true): ?MailImap
+// $folder, when known, is selected by the open itself (see MailImap::__construct).
+function imap_for_session(bool $redirectOnFail = true, string $folder = ''): ?MailImap
 {
   if (empty($_SESSION['email']) || empty($_SESSION['pass'])) {
     return null;
@@ -5086,7 +5424,8 @@ function imap_for_session(bool $redirectOnFail = true): ?MailImap
   $email = $_SESSION['email'];
   $pass  = session_decrypt($_SESSION['pass']);
   $ic    = imap_config();
-  $imap  = new MailImap($ic['server'], $ic['port'], $email, $pass, $ic['enc']);
+  $mailbox = imap_folder_name_is_safe($folder) ? $folder : '';
+  $imap  = new MailImap($ic['server'], $ic['port'], $email, $pass, $ic['enc'], $mailbox);
   if (!$imap->isConnected()) {
     if (!$redirectOnFail) {
       return null;
@@ -5430,6 +5769,10 @@ function handle_login(): void
       $_SESSION['logged_in'] = true;
       $_SESSION['email']     = $email;
       $_SESSION['pass']      = session_encrypt($password);
+      // The body cache key: derived from the password, kept like it. Null when
+      // libsodium is missing, which means no body cache at all.
+      $bodyKey = body_key_derive($password, $email);
+      $_SESSION['body_key']  = $bodyKey === null ? '' : session_encrypt($bodyKey);
       $_SESSION['mail_config'] = $cfg;
       // Persist the config so the next login can prefill it.
       foreach (
@@ -5482,6 +5825,12 @@ function handle_logout(): void
 
 function handle_inbox(): void
 {
+  // The in-place refresh after a sync names the folder; Back/Forward may land
+  // on ?page=inbox itself, so it answers the partial too.
+  if (!empty($_GET['ajax'])) {
+    require_login();
+    json_out(folder_listing_json('INBOX', 'Inbox'));
+  }
   render_folder_listing('INBOX', 'Inbox');
 }
 
@@ -5573,6 +5922,25 @@ function render_folder_listing(string $folder, string $title): void
 
 // --- Read ---
 
+// One cached header row, for the "is it already read?" question.
+function db_get_message(string $email, string $folder, int $uid): ?array
+{
+  $pdo = db_open();
+  if (!$pdo) return null;
+  try {
+    $stmt = $pdo->prepare('SELECT * FROM messages WHERE user_email = ? AND folder = ? AND uid = ?');
+    $stmt->execute([$email, $folder, $uid]);
+    $row = $stmt->fetch();
+    return $row ? _cache_hydrate($row) : null;
+  } catch (Throwable $e) {
+    return null;
+  }
+}
+
+// Open one message. The body comes from the cache when it is there, so a warm
+// open connects for nothing but the \Seen flag -- and not even that when the
+// cached row already says read. With ajax=1 this answers the partial a
+// conversation loads into a collapsed member on toggle.
 function handle_read(): void
 {
   require_login();
@@ -5580,33 +5948,64 @@ function handle_read(): void
   if (!$uid) {
     redirect('?page=inbox');
   }
-  $imap = imap_for_session();
   $me = current_user();
-  $imap->selectFolder($folder);
-  $email = $imap->getEmailByUid($uid);
+  $imap = null;
+  $redirectOnFail = true;
+  $getImap = function () use (&$imap, &$redirectOnFail, $folder) {
+    if ($imap === null) {
+      $imap = imap_for_session($redirectOnFail, $folder);
+    }
+    return $imap;
+  };
+  $email = message_read_through($getImap, $me, $folder, $uid, body_cache_key(), false);
   if (!$email) {
     flash_set('error', 'Message not found.');
     redirect('?page=folder&folder=' . urlencode($folder));
   }
-  $imap->markAsReadByUid($uid);
   // Keep the cache in step, so the row is not still bold when the user goes
   // back to the list. Without this it stays unread until the next sync.
+  $row = db_get_message($me, $folder, $uid);
+  $needsSeen = $row === null || !empty($row['unread']);
   cache_mark_read($me, $folder, $uid, true);
-  db_set_message_snippet($me, $folder, $uid, mb_substr(trim(strip_tags($email['body_text'])), 0, 500));
+  db_set_message_snippet($me, $folder, $uid, message_snippet($email));
   // Remote images: the global setting, auto-show setting, this sender's
   // standing trust, or a one-off "&images=1" for this view alone.
   $sender = ($email['from_address'] ?? '') ?: ($email['from'] ?? '');
   $imagesOn = user_setting('show_remote_images', DEFAULT_SHOW_REMOTE_IMAGES) === '1';
   $whitelist = (string)user_setting('image_whitelist', '');
   $showOnce = !empty($_GET['images']);
-  render_read($email, $uid, $folder, (string)$me, [
-    'block_images' => !$showOnce && !images_allowed($sender, $imagesOn, $whitelist),
-  ]);
+  $opts = ['block_images' => !$showOnce && !images_allowed($sender, $imagesOn, $whitelist)];
+
+  if (!empty($_GET['ajax'])) {
+    if ($needsSeen) {
+      $conn = $getImap();
+      if ($conn) $conn->markAsReadByUid($uid);
+    }
+    $moveOptions = move_target_options(cached_folder_list((string)$me), $folder);
+    json_out([
+      'ok'   => true,
+      'html' => view_message_actions($email, $uid, $folder, (string)$me, $moveOptions, false, own_identity_addresses(send_as_identities((string)$me)))
+        . view_message_body($email, $uid, $folder, $opts + ['no_title' => true]),
+    ]);
+  }
+
+  render_read($email, $uid, $folder, (string)$me, $opts);
+  // The \Seen flag goes out after the page: the user is not waiting on it, and
+  // a connection that fails now must not redirect into a sent response.
+  if ($needsSeen) {
+    $redirectOnFail = false;
+    if (function_exists('fastcgi_finish_request')) {
+      fastcgi_finish_request();
+    }
+    $conn = $getImap();
+    if ($conn) $conn->markAsReadByUid($uid);
+  }
 }
 
-// Open a conversation. Its cached members are gathered across their own folders,
-// the newest THREAD_MAX_MESSAGES are loaded, every unread member is marked read
-// in one batch per folder, and the thread renders oldest-first.
+// Open a conversation. Its cached members are gathered across their own folders.
+// Only the newest (the one that opens) is fetched; the others render from the
+// body cache when they are there, else from their header row with a lazy hook
+// (see view_thread). Every unread member is marked read in one batch per folder.
 function handle_thread(): void
 {
   require_login();
@@ -5619,32 +6018,47 @@ function handle_thread(): void
     redirect('?page=folder&folder=' . urlencode($folder));
   }
 
-  $imap     = imap_for_session();
-  $imagesOn = user_setting('show_remote_images', DEFAULT_SHOW_REMOTE_IMAGES) === '1';
+  $imagesOn  = user_setting('show_remote_images', DEFAULT_SHOW_REMOTE_IMAGES) === '1';
   $whitelist = (string)user_setting('image_whitelist', '');
-  $showOnce = !empty($_GET['images']);
+  $showOnce  = !empty($_GET['images']);
+  $bodyKey   = body_cache_key();
 
-  // Only the newest cap is fetched, so a 300-message conversation cannot cost
-  // 300 bodies. The rest are still marked read below, one command per folder.
+  // Only the newest cap is rendered; the rest are still marked read below.
   $omitted = max(0, count($stored) - THREAD_MAX_MESSAGES);
-  $fetch   = $omitted > 0 ? array_slice($stored, -THREAD_MAX_MESSAGES) : $stored;
+  $shown   = $omitted > 0 ? array_slice($stored, -THREAD_MAX_MESSAGES) : $stored;
+  $newest  = $shown[count($shown) - 1];
+
+  // One connection for the whole page, opened only when something needs it,
+  // straight onto the newest member's folder.
+  $imap = null;
+  $getImap = function () use (&$imap, $newest) {
+    if ($imap === null) {
+      $imap = imap_for_session(true, (string)$newest['folder']);
+    }
+    return $imap;
+  };
 
   $messages = [];
-  $unreadByFolder = [];
-  $current = null;
-  foreach ($fetch as $row) {
-    $mf = (string)$row['folder'];
-    if (!imap_folder_name_is_safe($mf)) continue;
-    if ($mf !== $current) {
-      if (!$imap->selectFolder($mf)) {
-        $current = null;
-        continue;
-      }
-      $current = $mf;
-    }
+  foreach ($shown as $row) {
+    $mf  = (string)$row['folder'];
     $uid = (int)$row['uid'];
-    $email = $imap->getEmailByUid($uid);
-    if (!$email) continue;
+    if (!imap_folder_name_is_safe($mf)) continue;
+    $isNewest = $row === $newest;
+    $email = $isNewest
+      ? message_read_through($getImap, $me, $mf, $uid, $bodyKey, false)
+      : body_cache_get($me, $mf, $uid, $bodyKey);
+    if ($email === null) {
+      if ($isNewest) continue;
+      // Summary only; the client loads the rest on toggle.
+      $messages[] = [
+        'email'  => cache_rows_to_view([$row])[0],
+        'uid'    => $uid,
+        'folder' => $mf,
+        'lazy'   => true,
+        'block_images' => false,
+      ];
+      continue;
+    }
     $sender = ($email['from_address'] ?? '') ?: ($email['from'] ?? '');
     $messages[] = [
       'email'        => $email,
@@ -5652,18 +6066,22 @@ function handle_thread(): void
       'folder'       => $mf,
       'block_images' => !$showOnce && !images_allowed($sender, $imagesOn, $whitelist),
     ];
-    db_set_message_snippet($me, $mf, $uid, mb_substr(trim(strip_tags((string)($email['body_text'] ?? ''))), 0, 500));
+    if ($isNewest) {
+      db_set_message_snippet($me, $mf, $uid, message_snippet($email));
+    }
   }
 
-  // Mark every unread member read (not only the fetched ones), and keep the
+  // Mark every unread member read (not only the shown ones), and keep the
   // cache in step so the conversation's listing row is not still bold on return.
+  $unreadByFolder = [];
   foreach ($stored as $row) {
     if (!empty($row['unread'])) $unreadByFolder[(string)$row['folder']][] = (int)$row['uid'];
   }
   foreach ($unreadByFolder as $mf => $uids) {
     if (!imap_folder_name_is_safe((string)$mf)) continue;
-    if (!$imap->selectFolder((string)$mf)) continue;
-    $imap->markManyAsRead($uids, true);
+    $conn = $getImap();
+    if (!$conn || !$conn->selectFolder((string)$mf)) continue;
+    $conn->markManyAsRead($uids, true);
     foreach ($uids as $uid) cache_mark_read($me, (string)$mf, $uid, true);
   }
 
@@ -5769,13 +6187,20 @@ function render_reply_form(bool $all): void
   if (!$uid) {
     redirect('?page=inbox');
   }
-  $imap = imap_for_session();
-  $imap->selectFolder($folder);
-  $email = $imap->getEmailByUid($uid);
+  // Through the body cache: a message just read costs no connection to answer.
+  // A miss fetches both text parts, so the quote has the plain one.
+  $me = (string)current_user();
+  $email = message_read_through(
+    fn() => imap_for_session(true, $folder),
+    $me,
+    $folder,
+    $uid,
+    body_cache_key(),
+    true
+  );
   if (!$email) {
     redirect('?page=inbox');
   }
-  $me = (string)current_user();
   $identities = send_as_identities($me);
   render_compose(reply_form_data($email, $me, $all, $identities) + [
     'identities' => $identities,
@@ -5790,13 +6215,18 @@ function handle_forward(): void
   if (!$uid) {
     redirect('?page=inbox');
   }
-  $imap = imap_for_session();
-  $imap->selectFolder($folder);
-  $email = $imap->getEmailByUid($uid);
+  $me = (string)current_user();
+  $email = message_read_through(
+    fn() => imap_for_session(true, $folder),
+    $me,
+    $folder,
+    $uid,
+    body_cache_key(),
+    true
+  );
   if (!$email) {
     redirect('?page=inbox');
   }
-  $me = (string)current_user();
   $sigPrefix = signature_prefix($me, $me);
   $quote = forward_quote($email);
   $subject = (stripos($email['subject'], 'Fwd:') === 0) ? $email['subject'] : 'Fwd: ' . $email['subject'];
@@ -5968,7 +6398,7 @@ function handle_send(): void
   $composeId = is_string($_POST['compose_id'] ?? null) ? $_POST['compose_id'] : '';
   if ($composeId !== '' && isset($_SESSION['sent_compose_ids'][$composeId])) {
     flash_set('error', 'This message was already sent or queued.');
-    redirect('?page=folder&folder=' . urlencode(imap_for_session()->findSentFolder() ?: 'INBOX'));
+    redirect('?page=inbox');
   }
 
   $identities = send_as_identities($me);
@@ -6026,7 +6456,8 @@ function handle_send(): void
       'draft_uid'   => (int)($_POST['draft_uid'] ?? 0),
     ];
     compose_mark_sent($composeId);
-    redirect('?page=folder&folder=' . urlencode($imap->findSentFolder() ?: 'INBOX'));
+    // Back to the Inbox, not Sent: sending is done, reading is what comes next.
+    redirect('?page=inbox');
   }
 
   // Build + send via SMTP.
@@ -6082,7 +6513,7 @@ function handle_send(): void
   } else {
     flash_set('success', 'Message sent successfully.');
   }
-  redirect('?page=folder&folder=' . urlencode($sent ?: 'INBOX'));
+  redirect('?page=inbox');
 }
 
 // Remember a composer that was sent or queued, so handle_send() refuses it a
@@ -6268,7 +6699,7 @@ function handle_delete(): void
   if (empty($uids)) {
     respond_mutation(true, 'No messages given.', $folder, 0);
   }
-  $imap = imap_for_session();
+  $imap = imap_for_session(true, $folder);
   // A UID delete against the wrong mailbox would destroy someone else's mail.
   if (!$imap->selectFolder($folder)) {
     respond_mutation(false, 'Could not open the folder.', $folder);
@@ -6320,7 +6751,7 @@ function handle_move(): void
   if (empty($uids)) {
     respond_mutation(true, 'No messages given.', $folder, 0);
   }
-  $imap = imap_for_session();
+  $imap = imap_for_session(true, $folder);
   // A UID move against the wrong mailbox would file someone else's mail.
   if (!$imap->selectFolder($folder)) {
     respond_mutation(false, 'Could not open the folder.', $folder);
@@ -6361,7 +6792,7 @@ function handle_spam(): void
   if (empty($uids)) {
     respond_mutation(true, 'No messages given.', $folder, 0);
   }
-  $imap = imap_for_session();
+  $imap = imap_for_session(true, $folder);
   // A UID move against the wrong mailbox would file someone else's mail.
   if (!$imap->selectFolder($folder)) {
     respond_mutation(false, 'Could not open the folder.', $folder);
@@ -6515,7 +6946,7 @@ function handle_download(): void
   if (!$uid || !preg_match('/^\d+(\.\d+)*$/', $part)) {
     redirect('?page=inbox');
   }
-  $imap = imap_for_session();
+  $imap = imap_for_session(true, $folder);
   $imap->selectFolder($folder);
   $att = $imap->getAttachmentByUid($uid, $part);
   if (!$att || strlen($att['data']) === 0) {
@@ -6582,7 +7013,7 @@ function handle_mark_read(bool $read): void
   if (empty($uids)) {
     json_out(['success' => true, 'count' => 0]);
   }
-  $imap = imap_for_session();
+  $imap = imap_for_session(true, $folder);
   if (!$imap->selectFolder($folder)) {
     http_response_code(409);
     json_out(['success' => false, 'error' => 'Could not open the folder.']);
@@ -6621,6 +7052,7 @@ function handle_sync(): void
   // or two would otherwise block every other tab -- including the navigation the
   // user is about to make. Nothing below writes to the session.
   $folderMap = json_decode((string)user_setting('protected_folders', '{}'), true) ?: null;
+  $bodyKey = body_cache_key();
   $creds = [
     'email' => $_SESSION['email'] ?? '',
     'pass'  => $_SESSION['pass'] ?? '',
@@ -6657,6 +7089,8 @@ function handle_sync(): void
     'full_interval' => SYNC_FULL_INTERVAL_SECONDS,
     'backfill'      => SYNC_BACKFILL_BATCH,
     'min_interval'  => SYNC_MIN_INTERVAL_SECONDS,
+    'prefetch'      => SYNC_BODY_PREFETCH,
+    'body_key'      => $bodyKey,
   ];
   // A non-listing page (the reader, compose, settings) has no .sync chip, so the
   // client names INBOX itself and this syncs it once. A listing names its own
@@ -6868,6 +7302,8 @@ function handle_settings(): void
     'cached_messages' => $storage['mode'] === 'cache'
       ? (int)$storage['cached']
       : db_count_cached_messages($me),
+    'cached_bodies'   => db_body_stats($me)['count'],
+    'cached_body_bytes' => db_body_stats($me)['bytes'],
     'storage' => $storage,
     'csrf'            => csrf_page_token(),
   ]);
@@ -7020,7 +7456,7 @@ function render_page(string $title, string $content, bool $authenticated): void
   // wrong palette. Falls through to the OS preference when nothing is stored.
   echo '<script>(function(){try{var t=localStorage.getItem("emmmail-theme");'
     . 'if(t==="dark"||t==="light"){document.documentElement.setAttribute("data-theme",t);}}catch(e){}})();</script>';
-  echo css_inline();
+  echo '<link rel="stylesheet" href="?page=asset&amp;k=css&amp;v=' . asset_version() . '">';
   echo '</head><body' . ($authed ? '' : ' class="auth"')
     . ($kbMap === [] ? '' : ' data-kb-map="' . h(json_encode($kbMap)) . '"') . '>';
   echo tabler_sprite();
@@ -7121,9 +7557,9 @@ function render_page(string $title, string $content, bool $authenticated): void
       . '</div></dialog>';
     echo view_kb_help_dialog();
   }
-  echo '<script>' . js_inline() . '</script>';
+  echo '<script src="?page=asset&amp;k=js&amp;v=' . asset_version() . '"></script>';
   if ($onboardingPending) {
-    // Must run after js_inline(): it depends on the $ toolkit and $.ready. The
+    // Must run after the toolkit script: it depends on the $ toolkit and $.ready. The
     // flag is set on window, not `win`: `win` is an IIFE-local inside
     // js_inline(), so a top-level script referencing it would throw.
     echo '<script>$.ready(function(){ window.__openOnboarding = true; });</script>';
@@ -7135,6 +7571,56 @@ function render_login(): void
 {
   // Flash is consumed and rendered as a toast by render_page().
   render_page('Login', view_login(csrf_page_token()), false);
+}
+
+// --- Static assets ---
+//
+// The stylesheet and the toolkit are linked from every page, not inlined: a
+// message open is a full navigation, and ~190 KB of CSS+JS that can never be
+// cached was most of what it transferred and parsed. The hash in the URL is the
+// cache key, so a deploy changes it and an unchanged file is never re-fetched.
+
+function asset_version(): string
+{
+  static $v = null;
+  if ($v === null) {
+    $v = substr(md5(css_inline() . js_inline()), 0, 12);
+  }
+  return $v;
+}
+
+// The body for one asset kind, or null for an unknown kind. css_inline() carries
+// its <style> wrapper for the page; a stylesheet response must not.
+function asset_body(string $kind): ?string
+{
+  if ($kind === 'js') {
+    return js_inline();
+  }
+  if ($kind === 'css') {
+    $css = css_inline();
+    $css = preg_replace('/^\s*<style>\s*/', '', $css);
+    return preg_replace('/\s*<\/style>\s*$/', "\n", $css);
+  }
+  return null;
+}
+
+// No login: the login page links both. A wrong kind is a 404, not a page.
+function handle_asset(): void
+{
+  $kind = (string)($_GET['k'] ?? '');
+  $body = asset_body($kind);
+  if ($body === null) {
+    http_response_code(404);
+    exit;
+  }
+  if (!headers_sent() && extension_loaded('zlib')) {
+    @ini_set('zlib.output_compression', '1');
+  }
+  header('Content-Type: ' . ($kind === 'js' ? 'application/javascript' : 'text/css') . '; charset=UTF-8');
+  // Immutable: the URL carries the content hash, so this copy is right for ever.
+  header('Cache-Control: public, max-age=31536000, immutable');
+  echo $body;
+  exit;
 }
 
 function render_inbox(array $d): void
@@ -8755,8 +9241,28 @@ function js_inline(): string
   // may never fire. Window load is the backstop.
   $(win).on('load', fitSrcdoc);
   // Opening a collapsed message in a conversation gives its iframe a real box,
-  // so its height has to be measured again.
-  $('details.thread-msg').on('toggle', function(){ if (this.hasAttribute('open')) fitSrcdoc(); });
+  // so its height has to be measured again. A member that was not on hand when
+  // the page rendered carries data-lazy instead of a body: load it now, once.
+  function loadThreadMessage(details){
+    var slot = details.querySelector('.thread-msg-body');
+    if (!slot || !slot.hasAttribute('data-lazy')) return;
+    var url = slot.getAttribute('data-lazy');
+    slot.removeAttribute('data-lazy');
+    $.get(url).then(function(d){
+      if (!d || d.ok === false || typeof d.html !== 'string') throw new Error('bad reply');
+      slot.innerHTML = d.html;
+      var frames = slot.querySelectorAll('iframe.srcdoc');
+      for (var i = 0; i < frames.length; i++) frames[i].addEventListener('load', fitSrcdoc);
+      fitSrcdoc();
+    }).catch(function(){
+      slot.innerHTML = '<div class="hint thread-loading">Could not load this message.</div>';
+    });
+  }
+  $('details.thread-msg').on('toggle', function(){
+    if (!this.hasAttribute('open')) return;
+    loadThreadMessage(this);
+    fitSrcdoc();
+  });
   fitSrcdoc();
 
   // Navigation in flight. The row that was clicked marks itself, and this reports
@@ -9909,11 +10415,22 @@ JS
     if (m && parseInt(m[1], 10) > 1) return false;
     return true;
   }
-  // The current URL, not a rebuilt ?page=folder&folder=X: a reload keeps the
-  // pagination, the sort and anything else the URL carries.
+  // Swap the listing in place through the same partial a folder switch uses,
+  // and only fall back to a reload when that cannot be done (a search page, or
+  // a reply that is not a listing). A reload re-ships the chrome and re-runs
+  // this script; the swap moves only the rows that changed.
   function syncSwap(){
     syncStale = false;
-    win.location.href = win.location.href;
+    var qs = win.location.search || String(win.location.href || '').replace(/^[^?]*/, '');
+    var m = /[?&]page=(\w+)/.exec(qs);
+    var page = m ? m[1] : '';
+    var target = page === 'inbox' ? '?page=folder&folder=INBOX' : (page === 'folder' ? qs : '');
+    if (!target) { win.location.href = win.location.href; return; }
+    loadMailbox(target, {}).then(function(ok){
+      if (!ok) win.location.href = win.location.href;
+    }).catch(function(){
+      win.location.href = win.location.href;
+    });
   }
 
   // The chip, on the pages that have one. Every call is guarded, because the
@@ -12250,11 +12767,15 @@ function view_thread(array $messages, string $folder, string $subject, string $m
       . '<span class="thread-msg-from">' . h($email['from'] ?? '') . '</span>'
       . '<span class="thread-msg-date">' . h($email['date'] ?? '') . '</span>'
       . '</summary>'
-      . '<div class="thread-msg-body">'
-      // Actions lead, like the single-message reader: the bar sits above the
-      // message it acts on.
-      . view_message_actions($email, $uid, $mfolder, $me, $moveOptions, false, $opts['own_addresses'] ?? [])
-      . view_message_body($email, $uid, $mfolder, ['block_images' => !empty($m['block_images']), 'no_title' => true])
+      . '<div class="thread-msg-body"' . (!empty($m['lazy'])
+        // Not on hand: the client loads actions + body on toggle, through the
+        // same reader route the single-message page uses, as a partial.
+        ? ' data-lazy="?page=read&amp;uid=' . $uid . '&amp;folder=' . $threadUrl . '&amp;ajax=1"><div class="hint thread-loading">Loading…</div>'
+        : '>'
+        // Actions lead, like the single-message reader: the bar sits above the
+        // message it acts on.
+        . view_message_actions($email, $uid, $mfolder, $me, $moveOptions, false, $opts['own_addresses'] ?? [])
+        . view_message_body($email, $uid, $mfolder, ['block_images' => !empty($m['block_images']), 'no_title' => true]))
       . '</div></details>';
   }
   $h .= '</div>';
@@ -12641,8 +13162,10 @@ function view_settings(array $d): string
     . '<div class="cache-row">'
     . '<div class="cache-info"><h2 class="settings-sub">Local cache</h2>'
     . '<div class="settings-note">Message headers are stored on this server so that '
-    . 'folders open without contacting your mail provider. Bodies are never stored. '
-    . 'Currently holding ' . (int)$d['cached_messages'] . ' cached message headers.</div></div>'
+    . 'folders open without contacting your mail provider. Bodies you open, and new arrivals, '
+    . 'are stored encrypted with a key derived from your password, so they open without a connection too. '
+    . 'Currently holding ' . (int)$d['cached_messages'] . ' cached message headers and '
+    . (int)($d['cached_bodies'] ?? 0) . ' bodies (' . h(format_bytes((int)($d['cached_body_bytes'] ?? 0))) . ').</div></div>'
     . '<div class="cache-action"><form method="POST" action="?page=settings" onsubmit="confirmClearCache(); return false;">'
     . '<input type="hidden" name="csrf_token" value="' . h($d['csrf']) . '">'
     . '<input type="hidden" name="clear_cache" value="1">'
@@ -12735,6 +13258,9 @@ switch ($page) {
     break;
   case 'download':
     handle_download();
+    break;
+  case 'asset':
+    handle_asset();
     break;
   case 'markRead':
     handle_mark_read(true);

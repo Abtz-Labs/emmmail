@@ -426,7 +426,7 @@ Each account configures its own copy of these (Settings page, stored per user):
   the sync button. The interval is fixed, and a server-side throttle stops a
   burst of clicks from becoming a burst of IMAP work
 - Undo send: hold sent messages for a short window so a send can be recalled.
-  Send closes the composer and goes to Sent; a countdown bar with Undo shows on
+  Send closes the composer and returns to the Inbox; a countdown bar with Undo shows on
   every page until the message goes. Undo opens it again as a draft (Drafts
   folder needed). A message whose countdown ended while the tab was closed is
   sent at the next page load. The queue lives in the session: logging out
@@ -460,20 +460,26 @@ ending the session.
 Routing is `index.php?page=<page>`:
 
 - `login`, `logout`
-- `inbox`, `folder`, `read`, `thread` (one conversation)
+- `inbox`, `folder`, `read`, `thread` (one conversation). `read` and `folder`
+  answer a partial with `ajax=1`: a collapsed conversation member loads through
+  the former, and a folder switch or a post-sync refresh swaps the mailbox
+  section through the latter
 - `compose`, `reply`, `replyAll`, `forward`, `saveDraft`
 - `createFolder`, `deleteFolder`
 - `delete`, `restore`, `spam` (move to the Junk mailbox)
 - `move` (file into any folder), `emptyFolder` (wipe Trash or Spam only)
 - `download`, `markRead`, `markUnread`
+- `asset` (the stylesheet and the script, `k=css|js`, immutable-cached under a
+  content hash `v=`; no login)
 - `search`, `settings`, `contacts` (JSON autocomplete), `trustSender`
 - `saveOnboarding` (JSON; first-access folder-map onboarding save)
 - `sync` (JSON; background header sync, called by the client every minute, when
-  the tab becomes visible, and when the sync chip is clicked)
+  the tab becomes visible, and when the sync chip is clicked. A full flag
+  reconcile runs at most every five minutes; the rest is one `STATUS`)
 
 ## Database
 
-`emmmail.sqlite` holds eight tables. The schema is versioned with SQLite's
+`emmmail.sqlite` holds nine tables. The schema is versioned with SQLite's
 `PRAGMA user_version` and migrated forward automatically on first open; there is
 no down path.
 
@@ -485,16 +491,30 @@ no down path.
 - `messages` — cached message **headers** (subject, sender, date, flags,
   attachment presence, a short body snippet for messages you have opened, and
   `thread_key`, the conversation root a row groups by)
+- `message_bodies` — message **bodies**, encrypted (see below)
 - `folder_state` — per-folder sync bookkeeping (UIDVALIDITY, UIDNEXT, counts)
 - `folder_list_cache` — the folder list, so the sidebar needs no IMAP round trip.
   The folder listings re-read it every 15 minutes; every other page renders the
   last copy whatever its age, because they have no way to refresh it.
 - `folder_counts` — the sidebar counters (unseen and total per folder)
 
-Message **bodies** are not stored; they are always read live from IMAP. Headers
-*are* cached on disk so that list views render without contacting the server, and
-opening a message stores a short plain-text snippet to make local search useful.
-That cached metadata survives logout, exactly as a desktop mail client's would.
+Headers are cached on disk so that list views render without contacting the
+server, and opening a message stores a short plain-text snippet to make local
+search useful. That cached metadata survives logout, exactly as a desktop mail
+client's would.
+
+Message **bodies** are cached too, so that a message opens without a connection,
+but only **encrypted at rest**: the key is derived from your mail password at
+login (Argon2id) and lives in the session like the password does. A copied
+database is unreadable without the password; after logout the rows are opaque
+until you sign in again; a changed password turns the old rows into misses. The
+body of every message you open is stored, and the background sync stores the
+newest ten arrivals of each folder it syncs on the connection it already holds.
+At most 300 bodies or 50 MB per account are kept (oldest fetched evicted first);
+a body over 1 MB is shown but not stored; attachments are never stored, only
+their names and sizes. A body row is deleted with its header row, and **Clear
+local cache** in Settings removes them all. Without the `sodium` extension there
+is no body cache at all — never a plain one.
 
 Because of this, put the database outside your document root
 (`EMMMAIL_DB_PATH`) — see Security below.
@@ -549,6 +569,8 @@ suite skips gracefully when no credentials are provided.
   `strict-origin` referrer policy, and HSTS when served over HTTPS
 - HTML message bodies are sanitized with an allowlist and rendered in a
   sandboxed iframe
+- Cached message bodies are encrypted at rest with a per-account key derived
+  from the mail password (Argon2id + XSalsa20-Poly1305), held only in the session
 - State-changing requests require a per-request CSRF token
 - Session hardening: HTTP-only, SameSite=Strict, secure flag over HTTPS,
   strict mode, and IP binding

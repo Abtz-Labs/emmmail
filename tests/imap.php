@@ -573,6 +573,40 @@ assert_eq(40, db_count_messages($U, 'Big'), 'the whole window is cached');
 assert_true($n <= 12, "a 40-message cold sync costs at most 12 commands (got $n)");
 assert_eq(0, count(db_pending_structure_uids($U, 'Big', 100)), 'no structures left pending');
 
+group('sync_folder() prefetches the newest bodies into the cache');
+
+// The poll already holds a selected connection when new mail lands, so it reads
+// the newest arrivals' bodies then and there; the first open is a cache hit.
+if (!function_exists('sodium_crypto_pwhash')) {
+    skip('libsodium missing: prefetch test skipped');
+} else {
+    $bodyKey = body_key_derive('p', $U);
+    db_delete_messages($U, 'Pre');
+    scenario(['messages' => 6, 'uidvalidity' => 5, 'uidbase' => 9000]);
+    $imap = connect();
+    resetLog();
+    $r = sync_folder($imap, $U, 'Pre', ['full_interval' => 0, 'backfill' => 0, 'now' => 1700000760,
+        'prefetch' => 3, 'body_key' => $bodyKey]);
+    $bodies = array_values(array_filter(cmds(), fn($c) => preg_match('/BODY\.PEEK\[(TEXT|\d)/i', $c)));
+    assert_eq(3, count($bodies), 'exactly the prefetch budget of bodies is fetched (' . count($bodies) . ')');
+    assert_true(body_cache_get($U, 'Pre', 9006, $bodyKey) !== null, 'the newest body is cached');
+    assert_true(body_cache_get($U, 'Pre', 9004, $bodyKey) !== null, 'and the third newest');
+    assert_eq(null, body_cache_get($U, 'Pre', 9003, $bodyKey), 'the fourth is not');
+    assert_eq(6, $r['changed'], 'prefetch is not counted as a change');
+
+    // Without a key (no sodium, old session) or on the render path (0), nothing.
+    db_delete_messages($U, 'Pre');
+    $imap = connect();
+    resetLog();
+    sync_folder($imap, $U, 'Pre', ['full_interval' => 0, 'backfill' => 0, 'now' => 1700000770, 'prefetch' => 3]);
+    assert_eq(0, count(array_filter(cmds(), fn($c) => preg_match('/BODY\.PEEK\[(TEXT|\d)/i', $c))), 'no key, no body fetch');
+    db_delete_messages($U, 'Pre');
+    $imap = connect();
+    resetLog();
+    sync_folder($imap, $U, 'Pre', ['full_interval' => 0, 'backfill' => 0, 'now' => 1700000780, 'body_key' => $bodyKey]);
+    assert_eq(0, count(array_filter(cmds(), fn($c) => preg_match('/BODY\.PEEK\[(TEXT|\d)/i', $c))), 'no budget, no body fetch');
+}
+
 // The bounded backfill still exists for rows cached before this change.
 db_delete_messages($U, 'Legacy');
 db_upsert_messages($U, 'Legacy', [
@@ -977,6 +1011,72 @@ $imap->selectFolder('INBOX');
 $msg2 = $imap->getEmailByUid(1002);
 $form2 = reply_form_data($msg2, 'me@example.com', false);
 assert_contains('s1002@example.com', $form2['to'], 'without Reply-To the reply goes to the sender');
+
+// ========================================================= read round trips ==
+group('getEmailByUid() costs three commands on a selected mailbox');
+
+// imap_headerinfo() before imap_fetchstructure() made c-client fetch the
+// envelope alone and then BODYSTRUCTURE on its own. Asking for the structure
+// first folds both into one FETCH: uid->msgno, envelope+structure, body.
+scenario(['messages' => 5, 'uidvalidity' => 99]);
+$imap = connect();
+$imap->selectFolder('INBOX');
+resetLog();
+$msg = $imap->getEmailByUid(1003);
+assert_true(is_array($msg), 'the message is read');
+$n = count(billable());
+assert_true($n <= 3, "a single-part message costs at most 3 commands (got $n)");
+$structures = array_values(array_filter(cmds(), fn($c) => stripos($c, 'BODYSTRUCTURE') !== false));
+assert_eq(1, count($structures), 'the structure rides the envelope FETCH');
+
+// A multipart/alternative message has two text parts. Display needs one of
+// them (HTML preferred); only reply/forward/draft editing want both.
+scenario(['messages' => 5, 'uidvalidity' => 99, 'alternative_uids' => [1003]]);
+$imap = connect();
+$imap->selectFolder('INBOX');
+resetLog();
+$msg = $imap->getEmailByUid(1003, false);
+$bodies = array_values(array_filter(cmds(), fn($c) => preg_match('/BODY\.PEEK\[\d/i', $c)));
+assert_eq(1, count($bodies), 'display-only fetches exactly one text part (' . implode(' | ', $bodies) . ')');
+assert_true(strpos($bodies[0] ?? '', '[2]') !== false, 'and it is the HTML part');
+assert_true($msg['body_html'] !== '', 'the HTML body is present');
+assert_eq('', $msg['body_text'], 'the plain part was not fetched');
+
+// c-client caches fetched sections per connection, so a fresh one is needed to
+// see what the default asks for.
+$imap = connect();
+$imap->selectFolder('INBOX');
+resetLog();
+$full = $imap->getEmailByUid(1003);
+$bodies = array_values(array_filter(cmds(), fn($c) => preg_match('/BODY\.PEEK\[\d/i', $c)));
+assert_eq(2, count($bodies), 'the default still fetches both parts, for quoting and drafts');
+assert_true($full['body_text'] !== '' && $full['body_html'] !== '', 'both bodies are present');
+
+group('MailImap opens straight onto the folder it is asked for');
+
+// Half-open on INBOX and then imap_reopen() costs NOOP + SELECT on every read,
+// reply and mutation. The folder is known before the connection is built.
+scenario(['messages' => 5, 'uidvalidity' => 99]);
+if ($liveImap instanceof MailImap) { $liveImap->disconnect(); }
+resetLog();
+$liveImap = new MailImap('127.0.0.1', $stubPort, 'u@example.com', 'p', 'notls', 'INBOX');
+assert_true($liveImap->isConnected(), 'connected with a mailbox');
+assert_eq(0, count(array_filter(cmds(), fn($c) => stripos($c, 'NOOP') === 0)), 'no NOOP');
+assert_eq(1, count(array_filter(cmds(), fn($c) => stripos($c, 'SELECT') === 0)), 'one SELECT, at open');
+resetLog();
+assert_true($liveImap->selectFolder('INBOX'), 'the folder is already selected');
+assert_eq(0, count(cmds()), 'so selecting it again is free');
+
+// A mailbox the server refuses must not read as "unable to connect": the
+// caller would log the user out over a bad ?folder=. Fall back to half-open.
+scenario(['messages' => 5, 'uidvalidity' => 99, 'select_fail' => true]);
+$liveImap->disconnect();
+$liveImap = new MailImap('127.0.0.1', $stubPort, 'u@example.com', 'p', 'notls', 'Nope');
+assert_true($liveImap->isConnected(), 'a refused mailbox still yields a connection');
+assert_eq(false, $liveImap->selectFolder('Nope'), 'and the refused folder is not memoised as selected');
+scenario(['messages' => 5, 'uidvalidity' => 99]);
+$imap = connect();
+$imap->selectFolder('INBOX');
 
 // imap_msgno() throws a ValueError below 1 on PHP 8, and '@' does not stop it.
 // handle_read() only checks !$uid, so ?uid=-1 reached it and crashed the page.

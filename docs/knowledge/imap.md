@@ -8,6 +8,51 @@ ignores `default_socket_timeout` for TCP connect, so no ini setting helps. Hence
 It costs an extra handshake (~40ms) and renders identically. **Do not remove it** without a
 live test against an unreachable host — there is no other way to bound that connect.
 
+The constructor takes an optional **mailbox**. Given one, the open is `LOGIN` + `SELECT` and
+`selectFolder()` is then free; the half-open costs `NOOP` + `SELECT` on the first select. A
+mailbox the server refuses falls back to the half-open, because `imap_for_session()` logs the
+user out on a failed connection and a bad `?folder=` must read as "not found", not as that.
+The memo is set only when `imap_errors()` is empty after the open (same trap as `imap_reopen`).
+
+## Reading one message
+- **`imap_fetchstructure()` before `imap_headerinfo()`.** c-client then puts BODYSTRUCTURE in
+  the envelope FETCH. The other order is one command more. Pinned by `tests/imap.php`.
+- `getEmailByUid($uid, $allParts)`: `false` walks the fetched structure and fetches **one** text
+  part (HTML preferred) — what the reader shows. The default fetches every alternative, which
+  reply/forward and draft editing want for the plain text. Measured on multipart/alternative:
+  `UID FETCH n UID`, one envelope+structure FETCH, one `BODY.PEEK[k]` — 3 commands.
+- c-client **caches fetched sections per connection**, so a test that counts body fetches after
+  an earlier read on the same connection sees fewer than the code asks for.
+
+## Bodies are cached, encrypted (schema v5)
+`message_bodies` holds the JSON message array under `sodium_crypto_secretbox`, key from
+`body_key_derive($password, $email)` at login (`sodium_crypto_pwhash`, Argon2id, interactive
+limits, salt from the address), kept in `$_SESSION['body_key']` through `session_encrypt()`.
+No sodium → `body_cache_key()` is null → no cache, never a plain one. A wrong key is a miss.
+
+- **The stored copy is the decoded raw message**, not the sanitized output: `sanitize_html` and
+  the remote-image policy run at render exactly as for a live fetch.
+- `message_read_through($getImap, …)` is the one reader: hit → no factory call; miss → fetch,
+  `body_cache_put`, return. `handle_read`, `handle_thread` (newest member) and the reply/forward
+  forms go through it. Draft editing does not: it needs the server's plain text.
+- `body_cache_put` refuses a blob over `BODY_CACHE_MAX_BYTES` and trims to `BODY_CACHE_MAX_ROWS`
+  / `BODY_CACHE_MAX_TOTAL` per user, oldest `fetched_at` first. A body row **dies with its
+  header row**: `db_delete_messages()` cascades, so the UIDVALIDITY purge, `cache_apply_move()`
+  and Clear local cache all clear bodies.
+- **The poll prefetches** the newest `SYNC_BODY_PREFETCH` rows of `$new` in `sync_folder()` when
+  `opts['prefetch'] > 0` and `opts['body_key']` is set. The render-path cold sync passes neither,
+  like `backfill => 0`. Not counted in `changed`. `handle_sync` reads the key **before**
+  `session_write_close()`.
+- The `\Seen` STORE on a cache hit is skipped when the cached row already says read, else sent
+  after the response (`fastcgi_finish_request()` where available), with `redirectOnFail` off:
+  a redirect into a sent response is a header error.
+
+## A conversation fetches one body
+`handle_thread()` reads only the **newest** member (the one `view_thread()` opens). Other members
+come from the body cache when there, else render as a summary from their header row with
+`data-lazy="?page=read&uid=…&folder=…&ajax=1"`, which `handle_read` answers as a partial
+(action bar + body). Ten members used to cost 37 commands; it is now one read.
+
 ## Search
 - `imap_search` returns **`false` for "no matches"**, indistinguishable from a failure.
   Normalising it to `[]` inside a reconcile is a mass delete. It must be `?array`.
@@ -97,6 +142,13 @@ makes the feature look absent, never broken.
 because special-folder detection needs to see the tree.
 
 ## Sync and reconcile
+- **`SYNC_FULL_INTERVAL_SECONDS` (300) must stay several poll periods long.** At 60 it equalled
+  `SYNC_CLIENT_MIN_PERIOD`, so the STATUS-only path (2 commands) never won and every poll paid
+  `SELECT` + five `UID SEARCH`. STATUS already carries MESSAGES, UIDNEXT and UNSEEN, so
+  arrivals, expunges and reads elsewhere are caught without the reconcile; only `\Flagged` /
+  `\Answered` changes from another client wait for it. Unit-guarded.
+- `db_set_message_flags()` is one autocommit per row; `sync_folder()` wraps the batch in a
+  transaction. `db_open()` sets `PRAGMA synchronous=NORMAL` (safe under WAL).
 - Sync invariant: `count(UNDELETED) + count(DELETED) === MESSAGES`. Guards: an unknown set
   deletes nothing; a count mismatch refuses; a large delta is capped at `max(50, 20%)`.
 - **"No cached rows" is not "nothing cached."** Cold is
