@@ -11,7 +11,7 @@
 // [1] Config + session -------------------------------------------------------
 
 define('APP_NAME', 'Emmmail');
-define('APP_VERSION', '0.2.0');
+define('APP_VERSION', '0.2.1');
 define('APP_DEBUG', (getenv('EMMMAIL_DEBUG') ?: '0') === '1');
 
 // Tabler icons (current-color outline set), embedded inline so the UI needs
