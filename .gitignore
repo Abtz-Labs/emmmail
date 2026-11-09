@@ -1,22 +1,24 @@
-# Database
+# Development database
 *.db
 *.sqlite
 *.sqlite3
 *.sqlite-*
 *.bak
 
-# Attachments
+# Local attachments
 attachments/
 
 # Environment
 .env
 
-# Deploy config (holds the production encryption key)
+# Deploy config wit Bare Deploy
 bare.config.json
+package.json
 
 # Misc
 *.pid
 .DS_Store
 
 # Docs and Plans
-# docs/plans/*.md (uncomment later)
+docs/plans/
+docs/memory
