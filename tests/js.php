@@ -3311,6 +3311,23 @@ async function main() {
       clock.restore();
     }
 
+    {
+      // Scrolled is how a reader usually is, and the sync chip is sticky. A
+      // refresh must still happen; loadMailbox keeps the reader's place.
+      const doc = makeDoc(); buildPollPage(doc, 'INBOX', 60);
+      const win = makeWin();
+      win.location.href = '?page=folder&folder=INBOX';
+      win.scrollY = 400;
+      const before = win._hrefs;
+      const calls = [];
+      const clock = fakeTimers(win);
+      boot(doc, win, () => syncReply({ body: { ok: true, synced: '1 new', changed: 1, arrivals: 0 } }), calls);
+      await clock.tick(60000);
+      eq('S63 a scrolled listing still fetches the partial', calls[1] && calls[1].url, '?page=folder&folder=INBOX&ajax=1');
+      eq('S63 and the stub fallback reloads instead of deferring', win._hrefs, before + 1);
+      clock.restore();
+    }
+
     // b) each state where a refresh would lose something. The tick is deferred
     // instead, and the next tick swaps even when it has nothing new to report.
     // Each entry returns the step that puts the page back, so the retry is
@@ -3331,10 +3348,6 @@ async function main() {
       ['a row is opening', d => {
         const r = d.createElement('div'); r.className = 'opening'; d.add(r);
         return () => r.classList.remove('opening');
-      }],
-      ['the list is scrolled', null, w => {
-        w.scrollY = 400;
-        return () => { w.scrollY = 0; };
       }],
 ['page 2 is open', null, w => {
         w.location.search = '?page=folder&folder=INBOX&p=2';

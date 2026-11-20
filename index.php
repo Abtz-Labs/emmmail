@@ -11,7 +11,7 @@
 // [1] Config + session -------------------------------------------------------
 
 define('APP_NAME', 'Emmmail');
-define('APP_VERSION', '0.2.1');
+define('APP_VERSION', '0.2.2');
 define('APP_DEBUG', (getenv('EMMMAIL_DEBUG') ?: '0') === '1');
 
 // Tabler icons (current-color outline set), embedded inline so the UI needs
@@ -10062,6 +10062,26 @@ JS
       wrap.innerHTML = d.html;
       var fresh = wrap.querySelector('.mailbox');
       if (!fresh) return false;
+      // A sync refresh must not move the reader. Record where they are and how
+      // tall the document is before the swap, then restore the offset plus any
+      // height the new rows added above it. A folder switch keeps the old
+      // behaviour and starts at the top.
+      var keepY = opts.keepScroll ? (win.scrollY || 0) : 0;
+      var beforeHeight = opts.keepScroll && doc.documentElement ? doc.documentElement.scrollHeight : 0;
+      // Anchor on the first visible row: a page that keeps its height but gains
+      // a row at the top must still show the same message in the same place.
+      var anchor = null;
+      if (opts.keepScroll) {
+        var rows = doc.querySelectorAll('.mail[data-uid]');
+        for (var i = 0; i < rows.length; i++) {
+          if (!rows[i].getBoundingClientRect) continue;
+          var rect = rows[i].getBoundingClientRect();
+          if (rect.bottom > 0) {
+            anchor = { uid: rows[i].getAttribute('data-uid'), top: rect.top };
+            break;
+          }
+        }
+      }
       box.parentNode.replaceChild(fresh, box);
       if (d.title) { doc.title = d.title; syncTitle(); }
       // The sidebar marks the folder you are looking at. A pagination href is
@@ -10073,8 +10093,29 @@ JS
       if (d.error) win.toast(d.error, 'error');
       if (opts.push) { try { win.history.pushState({ emmmail: true }, '', href); } catch (e) {} }
       // A real navigation starts at the top; match it rather than dropping the
-      // user into the middle of the new folder.
-      if (win.scrollTo) win.scrollTo(0, 0);
+      // user into the middle of the new folder. A sync refresh keeps their place.
+      if (win.scrollTo) {
+        if (opts.keepScroll) {
+          var delta = 0;
+          if (anchor) {
+            var same = null;
+            var freshRows = fresh.querySelectorAll('.mail[data-uid]');
+            for (var j = 0; j < freshRows.length; j++) {
+              if (freshRows[j].getAttribute('data-uid') === anchor.uid) { same = freshRows[j]; break; }
+            }
+            if (same && same.getBoundingClientRect) {
+              delta = same.getBoundingClientRect().top - anchor.top;
+            }
+          }
+          if (!delta) {
+            var afterHeight = doc.documentElement ? doc.documentElement.scrollHeight : 0;
+            delta = Math.max(0, afterHeight - beforeHeight);
+          }
+          win.scrollTo(0, Math.max(0, keepY + delta));
+        } else {
+          win.scrollTo(0, 0);
+        }
+      }
       wireMailbox();
       // A pagination swap keeps the keyboard cursor where it was; a folder
       // switch starts clean. `opts.cursor` is the index of the row that was
@@ -10409,7 +10450,6 @@ JS
     // swaps even if that sync reports nothing new -- so the page reloads up to
     // SYNC_CLIENT_MIN_PERIOD after the selection clears.
     if (pickCount() > 0) return false;
-    if ((win.scrollY || 0) !== 0) return false;
     // Page 1 only: reloading a later page would throw the earlier ones away.
     var m = /[?&]p=(\d+)/.exec(win.location.search || '');
     if (m && parseInt(m[1], 10) > 1) return false;
@@ -10418,7 +10458,8 @@ JS
   // Swap the listing in place through the same partial a folder switch uses,
   // and only fall back to a reload when that cannot be done (a search page, or
   // a reply that is not a listing). A reload re-ships the chrome and re-runs
-  // this script; the swap moves only the rows that changed.
+  // this script; the swap moves only the rows that changed. The reader's scroll
+  // position is kept: a sync is not a navigation.
   function syncSwap(){
     syncStale = false;
     var qs = win.location.search || String(win.location.href || '').replace(/^[^?]*/, '');
@@ -10426,7 +10467,7 @@ JS
     var page = m ? m[1] : '';
     var target = page === 'inbox' ? '?page=folder&folder=INBOX' : (page === 'folder' ? qs : '');
     if (!target) { win.location.href = win.location.href; return; }
-    loadMailbox(target, {}).then(function(ok){
+    loadMailbox(target, { keepScroll: true }).then(function(ok){
       if (!ok) win.location.href = win.location.href;
     }).catch(function(){
       win.location.href = win.location.href;

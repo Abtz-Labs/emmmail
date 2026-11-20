@@ -2206,6 +2206,12 @@ assert_contains('var syncTimer = null;', $js, 'js: one timer for the page');
 assert_contains('var syncBusy = false;', $js, 'js: one in-flight guard for the page');
 assert_contains('var syncStale = false;', $js, 'js: one stale mark for the page');
 assert_contains('var POLL_IDLE_STOP_SECONDS', $js, 'js: the idle stop is declared');
+// A sync refresh is not a navigation: it may run while the reader is scrolled,
+// and keeps their place instead of deferring until they scroll back to the top.
+assert_contains('loadMailbox(target, { keepScroll: true })', $js, 'js: a sync refresh keeps the scroll position');
+assert_contains('var anchor = null;', $js, 'js: a sync refresh anchors the visible row');
+assert_contains('keepY + delta', $js, 'js: a sync refresh restores the anchored offset');
+assert_not_contains("if ((win.scrollY || 0) !== 0) return false;", $js, 'js: scroll offset no longer blocks a sync refresh');
 // The interval is the server's, and only the server's: a second copy of "a
 // minute" in the client is a second place for it to go stale.
 assert_not_contains('SYNC_MIN_PERIOD', $js, 'js: no second copy of the interval');

@@ -69,10 +69,10 @@ That's the whole stack.
   zero
 - A background poll on every signed-in page, not only the folder listings: it
   syncs the Inbox, and the open folder too when you are looking at one. Once a
-  minute, which is not a setting. New mail refreshes the open
-  list only when you are not in the middle of something; otherwise it waits for
-  a later tick. A tab you have not touched for two hours stops asking, and the
-  next click or keystroke starts it again
+  minute, which is not a setting. New mail refreshes the open list in place and
+  keeps your scroll position; it waits for a later tick only when a dialog, a
+  selection or an action is in progress. A tab you have not touched for two
+  hours stops asking, and the next click or keystroke starts it again
 - Optional browser notifications (Settings → Notifications), per browser and off
   by default: a count of new Inbox messages and nothing else, only while the tab
   is hidden or the window is not focused, replaced rather than stacked, and

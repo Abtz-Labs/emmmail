@@ -219,11 +219,18 @@ re-ships the chrome and re-runs the script; the swap moves only the rows. The js
 parse `innerHTML`, so every swap there *fails* and the S63 rows assert the fetched partial URL
 plus the fallback href assignment. It happens only when `syncCanSwap()`: a `.sync` chip is present (so there is an open
 listing at all), and no `dialog[open]`, no `.row-gone`/`.busy`/`.opening`, `kbCursor < 0`,
-`pickCount() === 0`, `scrollY === 0`, page 1. The chip check is the one that saves a draft: the reader, compose and
+`pickCount() === 0`, page 1. The chip check is the one that saves a draft: the reader, compose and
 settings have no chip, `changed` there is the Inbox's, and reloading the composer would throw
 away the message being written. Otherwise `syncStale` remembers it and a later tick refreshes
 even when that sync reports nothing new. There is no `reloaded` flag any more: that was the
 one-refresh-per-page-load guard, and a poll loop needs to keep refreshing.
+
+**A sync refresh keeps the reader's place.** `syncSwap()` calls
+`loadMailbox(target, { keepScroll: true })`: the first visible row is anchored to its
+viewport offset, so a poll never jumps to the top or throws the scroll position away,
+even when new rows arrive above it. If that row is gone, the offset is adjusted by the
+document height difference. Scrolling is therefore not a reason to defer; a folder
+switch still starts at the top.
 
 `pickCount()` is in that list for the same reason `kbCursor < 0` is: a swap throws
 the selection away, and the batch about to act on it goes with it. A blocked swap
